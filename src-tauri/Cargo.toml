@@ -1,0 +1,19 @@
+[package]
+name = "copilot-sessions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Thin Tauri shell for the Copilot Sessions daemon"
+
+[lib]
+name = "copilot_sessions_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde.workspace = true
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+
