@@ -5,6 +5,7 @@ import "@xterm/xterm/css/xterm.css";
 import { ChevronDown, Link2, LockKeyhole, Power, Unlink, Users, X } from "lucide-react";
 import { daemonClientId, daemonWebSocketUrl } from "../lib/daemon";
 import type { TerminalServerMessage } from "../lib/types";
+import { normalizeTypography, terminalTypography, type TypographySettings } from "../lib/typography";
 
 interface TerminalPaneProps {
   sessionId: string;
@@ -13,6 +14,7 @@ interface TerminalPaneProps {
   onFollowCwdChange: (value: boolean) => void;
   onCwdChange: (cwd: string) => void;
   onClose: () => void;
+  typography?: TypographySettings;
 }
 
 export function TerminalPane({
@@ -22,10 +24,15 @@ export function TerminalPane({
   onFollowCwdChange,
   onCwdChange,
   onClose,
+  typography,
 }: TerminalPaneProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
+  const terminalRef = useRef<Terminal | null>(null);
+  const fontOptions = terminalTypography(normalizeTypography(typography));
+  const fontOptionsRef = useRef(fontOptions);
+  fontOptionsRef.current = fontOptions;
   const replayingRef = useRef(false);
   const followCwdRef = useRef(followCwd);
   const onCwdChangeRef = useRef(onCwdChange);
@@ -48,11 +55,10 @@ export function TerminalPane({
     const terminal = new Terminal({
       cursorBlink: true,
       convertEol: true,
-      fontFamily: "'Cascadia Code', 'SFMono-Regular', Consolas, monospace",
-      fontSize: 13,
-      lineHeight: 1.18,
+      ...fontOptionsRef.current,
       theme: terminalTheme(),
     });
+    terminalRef.current = terminal;
     const fit = new FitAddon();
     fitRef.current = fit;
     terminal.loadAddon(fit);
@@ -135,8 +141,25 @@ export function TerminalPane({
       socket.close();
       terminal.dispose();
       socketRef.current = null;
+      terminalRef.current = null;
+      fitRef.current = null;
     };
   }, [sessionId]);
+
+  // Font changes resize the existing terminal; they never recreate the socket or PTY.
+  useEffect(() => {
+    const terminal = terminalRef.current;
+    if (!terminal) return;
+    if (terminal.options.fontFamily !== fontOptions.fontFamily) terminal.options.fontFamily = fontOptions.fontFamily;
+    if (terminal.options.fontSize !== fontOptions.fontSize) terminal.options.fontSize = fontOptions.fontSize;
+    if (terminal.options.lineHeight !== fontOptions.lineHeight) terminal.options.lineHeight = fontOptions.lineHeight;
+    const frame = requestAnimationFrame(() => {
+      if (terminalRef.current !== terminal) return;
+      fitRef.current?.fit();
+      terminal.refresh(0, terminal.rows - 1);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [sessionId, fontOptions.fontFamily, fontOptions.fontSize, fontOptions.lineHeight]);
 
   return (
     <section className="terminal-pane" aria-label="Terminal">

@@ -1,0 +1,505 @@
+import { test, expect, type Page } from "@playwright/test";
+
+const session = (id: string) => ({
+  sessionId: id, title: `Session ${id}`, isActive: true, isRemote: false, pinned: false, tags: [],
+  startTime: "", modifiedTime: "", cwd: "Q:\\example", model: "parent-model",
+});
+const task = (id: string, name: string, status: string) => ({
+  id, name, status, agentType: "task", toolCallId: `tool-${id}`, model: "child-model",
+  canMessage: status === "running" || status === "idle", unavailableReason: status === "completed" ? "This agent has completed." : undefined,
+});
+const event = (id: string, type: string, content: string, agentId?: string) => ({
+  id, type, timestamp: "2026-09-14T22:00:00Z", agentId, data: { content, messageId: id },
+});
+
+async function setup(page: Page) {
+  const sent: Record<string, unknown>[] = [];
+  const requests: { command: string; sessionId: string }[] = [];
+  const tasks: Record<string, ReturnType<typeof task>[]> = {
+    a: [task("shared-id", "Builder", "running"), task("idle", "Reviewer", "idle"), task("done", "Old agent", "completed")],
+    b: [task("shared-id", "Builder", "idle")],
+  };
+  let rejectSend = false;
+  await page.addInitScript(() => {
+    class TestEventSource extends EventTarget {
+      onopen: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      listener = (event: Event) => {
+        if (event instanceof CustomEvent) this.dispatchEvent(new MessageEvent("session-event", { data: JSON.stringify(event.detail) }));
+      };
+      constructor() {
+        super();
+        window.addEventListener("test-daemon", this.listener);
+        setTimeout(() => this.onopen?.(), 0);
+      }
+      close() { window.removeEventListener("test-daemon", this.listener); }
+    }
+    Object.defineProperty(window, "EventSource", { value: TestEventSource });
+  });
+  await page.route("**/api/**", async (route) => {
+    const command = new URL(route.request().url()).pathname.split("/").at(-1)!;
+    const args = route.request().postDataJSON() ?? {};
+    requests.push({ command, sessionId: args.sessionId });
+    let result: unknown;
+    switch (command) {
+      case "list_sessions": result = [session("a"), session("b")]; break;
+      case "resume_session": result = session(args.sessionId); break;
+      case "runtime_status": result = { connected: true, acceptingWork: true, activeSessions: 2 }; break;
+      case "session_state": result = { sessionId: args.sessionId, mode: "interactive", processing: false }; break;
+      case "pending_permissions":
+      case "pending_interactions":
+      case "subagent_context": result = []; break;
+      case "queue_items": result = { items: [], steeringMessages: [] }; break;
+      case "delete_session": result = null; break;
+      case "session_references": result = { commands: {}, skills: {}, mcp: {}, mcpTools: {}, tools: {}, instructions: {}, contextAttribution: {}, tasks: {} }; break;
+      case "context_attribution": result = { contextAttribution: null }; break;
+      case "git_repository": result = { isRepository: true, repoRoot: "Q:\\example" }; break;
+      case "session_history_window": result = {
+        events: [event("root", "user.message", "Parent conversation")], hasMore: false, cursor: "",
+        loadedPages: 1, humanMessages: 1,
+      }; break;
+      case "agent_tasks": result = { sessionId: args.sessionId, tasks: tasks[args.sessionId] }; break;
+      case "agent_history": result = {
+        sessionId: args.sessionId, taskId: args.taskId, agentId: `agent-${args.sessionId}-${args.taskId}`,
+        events: [event("child-answer", "assistant.message", `Hello from ${args.sessionId}/${args.taskId}`, `agent-${args.sessionId}-${args.taskId}`)],
+        cursor: null, hasMore: false,
+      }; break;
+      case "send_agent_message":
+        sent.push(args);
+        result = rejectSend ? { sent: false, error: "Agent is no longer accepting messages" } : { sent: true };
+        break;
+      default: return route.fulfill({ status: 404, json: { error: `Unexpected command ${command}` } });
+    }
+    await route.fulfill({ json: result });
+  });
+  await page.goto("/?session=a");
+  await expect(page.locator(".parent-session-view .composer textarea")).toBeEnabled();
+  return { sent, requests, tasks, reject: () => { rejectSend = true; } };
+}
+
+async function expand(page: Page, id: string) {
+  await page.getByRole("button", { name: `Subagents for Session ${id}`, exact: true }).click();
+  return page.locator(`#subagents-${id}`);
+}
+
+test("each session expands only its own active agents, with finished agents opt-in", async ({ page }) => {
+  const state = await setup(page);
+  expect(state.requests.filter((request) => request.command === "agent_tasks")).toHaveLength(0);
+  const a = await expand(page, "a");
+  await expect(a.getByRole("button", { name: /Builder/ })).toBeVisible();
+  await expect(a.getByRole("button", { name: /Reviewer/ })).toBeVisible();
+  await expect(a.getByRole("button", { name: /Old agent/ })).toHaveCount(0);
+  const b = await expand(page, "b");
+  await expect(b.getByRole("button", { name: /Builder/ })).toBeVisible();
+  await expect(b.getByRole("button", { name: /Reviewer/ })).toHaveCount(0);
+  await a.getByLabel("Show finished").check();
+  await expect(a.getByRole("button", { name: /Old agent/ })).toBeVisible();
+  await page.getByRole("button", { name: "Subagents for Session a", exact: true }).click();
+  await expect(a).toBeHidden();
+  await expect(b).toBeVisible();
+});
+
+test("child navigation preserves the parent draft and routes direct messages by parent and task", async ({ page }) => {
+  const state = await setup(page);
+  await page.locator(".parent-session-view .composer textarea").fill("Keep the parent draft");
+  const a = await expand(page, "a");
+  await a.getByRole("button", { name: /Builder/ }).click();
+  await expect(page.getByRole("heading", { name: "Builder", exact: true })).toBeVisible();
+  await expect(page.locator(".agent-conversation .message.assistant")).toContainText("Hello from a/shared-id");
+  await page.getByRole("textbox", { name: "Message Builder", exact: true }).fill("Guidance only for A");
+  await page.getByRole("textbox", { name: "Message Builder", exact: true }).press("Enter");
+  await expect.poll(() => state.sent.length).toBe(1);
+  expect(state.sent[0]).toEqual({ sessionId: "a", taskId: "shared-id", message: "Guidance only for A" });
+  expect(state.requests.filter((request) => request.command === "send_message")).toHaveLength(0);
+  await page.getByRole("button", { name: "Back to parent" }).click();
+  await expect(page.locator(".parent-session-view .composer textarea")).toHaveValue("Keep the parent draft");
+  const b = await expand(page, "b");
+  await b.getByRole("button", { name: /Builder/ }).click();
+  await expect(page.locator(".agent-conversation .message.assistant")).toContainText("Hello from b/shared-id");
+  await page.getByRole("textbox", { name: "Message Builder", exact: true }).fill("Guidance only for B");
+  await page.getByRole("textbox", { name: "Message Builder", exact: true }).press("Enter");
+  await expect.poll(() => state.sent.length).toBe(2);
+  expect(state.sent[1].sessionId).toBe("b");
+});
+
+test("live child events exclude parent/sibling output and failed sends keep drafts", async ({ page }) => {
+  const state = await setup(page);
+  const a = await expand(page, "a");
+  await a.getByRole("button", { name: /Builder/ }).click();
+  await expect(page.locator(".agent-conversation .message.assistant")).toBeVisible();
+  for (const [agentId, content] of [[undefined, "Root secret"], ["sibling", "Sibling secret"], ["agent-a-shared-id", "Actual child stream"]] as const) {
+    await page.evaluate((event) => window.dispatchEvent(new CustomEvent("test-daemon", { detail: {
+      type: "session_event", sessionId: "a", event,
+    } })), event(`delta-${content}`, "assistant.message_delta", content, agentId));
+  }
+  await expect(page.locator(".agent-conversation")).toContainText("Actual child stream");
+  await expect(page.locator(".agent-conversation")).not.toContainText("Root secret");
+  await expect(page.locator(".agent-conversation")).not.toContainText("Sibling secret");
+  state.reject();
+  const prompt = page.getByRole("textbox", { name: "Message Builder", exact: true });
+  await prompt.fill("Preserve failed guidance");
+  await prompt.press("Enter");
+  await expect(prompt).toHaveValue("Preserve failed guidance");
+  await expect(page.locator(".agent-conversation [role=alert]")).toContainText("no longer accepting");
+  await a.getByLabel("Show finished").check();
+  await a.getByRole("button", { name: /Old agent/ }).click();
+  await expect(page.getByRole("textbox", { name: "Message Old agent", exact: true })).toBeDisabled();
+});
+
+test("agent and parent keyboard commands cannot accidentally submit or modify the parent", async ({ page }) => {
+  const state = await setup(page);
+  const a = await expand(page, "a");
+  await a.getByRole("button", { name: /Builder/ }).click();
+  const prompt = page.getByRole("textbox", { name: "Message Builder", exact: true });
+  await prompt.fill("Child-only draft");
+  await prompt.press("Alt+2");
+  await prompt.press("Control+q");
+  await prompt.press("Control+.");
+  await page.getByRole("button", { name: "Subagents for Session a", exact: true }).click();
+  await expect(page.locator(".agent-conversation")).toBeVisible();
+  await prompt.press("Control+Enter");
+  await expect.poll(() => state.sent.length).toBe(1);
+  expect(state.requests.filter((request) => ["set_session_mode", "send_message", "abort_session"].includes(request.command))).toHaveLength(0);
+  await page.getByRole("button", { name: "Back to parent" }).click();
+  await expect(page.locator(".parent-session-view .composer textarea")).toBeFocused();
+});
+
+test("deleting the parent while viewing a child restores the empty main workspace", async ({ page }) => {
+  await setup(page);
+  const a = await expand(page, "a");
+  await a.getByRole("button", { name: /Builder/ }).click();
+  await expect(page.locator(".agent-conversation")).toBeVisible();
+  page.on("dialog", (dialog) => dialog.accept());
+  await page.locator('[data-session-id="a"]').hover();
+  await page.getByRole("button", { name: "Delete Session a", exact: true }).click();
+  await expect(page.locator(".agent-conversation")).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Choose a session", exact: true })).toBeVisible();
+});
+
+test("missing tool metadata shows an honest catalog instead of a failed drawer", async ({ page }) => {
+  await setup(page);
+  await page.route("**/api/tool_controls", (route) => route.fulfill({ json: {
+    tools: [{ id: "builtin:glob", name: "glob", description: "Known catalog tool", source: "builtin", enabled: false }],
+    servers: [{ name: "example", status: "connected" }],
+    excludedTools: [], filterOwnership: "unknown", canEditTools: false, requiresAdoption: true,
+    filterStateKnown: false, metadataAvailable: false, metadataLoading: true, warnings: [],
+  } }));
+  await page.getByTitle("Browse commands, tools, skills, MCP, and instructions").click();
+  await page.getByRole("tab", { name: "Tools", exact: true }).click();
+  await expect(page.locator(".ct-tool-list")).toContainText("glob");
+  await expect(page.locator(".ct-inventory")).toContainText("runtime availability unknown");
+  await expect(page.locator(".ct-tool-list").getByRole("switch")).toBeDisabled();
+  await expect(page.getByRole("switch", { name: "Enable MCP server example for this session" })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Manage this session’s tool selection" })).toBeDisabled();
+  await expect(page.getByText("Could not read session tools.", { exact: true })).toHaveCount(0);
+});
+
+test("event-only ask_user shows a visible answer form without an SDK callback", async ({ page }) => {
+  const state = await setup(page);
+  const question = {
+    sessionId: "a", requestId: "native-question", kind: "user_input",
+    data: { question: "Which diagram should change?", choices: ["Simplify 03", "Keep 03 unchanged"], allowFreeform: true },
+  };
+  let pending = false;
+  const responses: unknown[] = [];
+  await page.route("**/api/pending_interactions", (route) => route.fulfill({ json: pending ? [question] : [] }));
+  await page.route("**/api/respond_interaction", (route) => {
+    responses.push(route.request().postDataJSON());
+    pending = false;
+    return route.fulfill({ json: { success: true } });
+  });
+  await page.locator(".parent-session-view .composer textarea").fill("Keep my unrelated draft");
+  pending = true;
+  await page.evaluate((data) => window.dispatchEvent(new CustomEvent("test-daemon", { detail: {
+    type: "session_event", sessionId: "a",
+    event: { id: "requested", type: "user_input.requested", timestamp: "2026-09-14T22:00:00Z", data },
+  } })), { ...question.data, requestId: "native-question" });
+  const panel = page.locator(".interaction-dock .interaction-panel");
+  await expect(panel).toHaveCount(1);
+  await expect(panel).toBeInViewport();
+  await expect(panel.getByText("Which diagram should change?", { exact: true })).toBeVisible();
+  await panel.getByRole("radio", { name: "Simplify 03", exact: true }).check();
+  await panel.getByRole("button", { name: "Submit answer" }).click();
+  await expect(panel).toHaveCount(0);
+  expect(responses).toEqual([{
+    sessionId: "a", requestId: "native-question", kind: "user_input",
+    response: { answer: "Simplify 03", wasFreeform: false },
+  }]);
+  await expect(page.locator(".parent-session-view .composer textarea")).toHaveValue("Keep my unrelated draft");
+  expect(state.requests.filter((request) => request.command === "send_message")).toHaveLength(0);
+});
+
+test("pending questions remain accessible in a child view and dismiss on external completion", async ({ page }) => {
+  await setup(page);
+  const question = {
+    sessionId: "a", requestId: "native-question", kind: "user_input",
+    data: { question: "Continue this task?", choices: ["Yes", "No"], allowFreeform: false },
+  };
+  let pending = true;
+  await page.route("**/api/pending_interactions", (route) => route.fulfill({ json: pending ? [question] : [] }));
+  const a = await expand(page, "a");
+  await a.getByRole("button", { name: /Builder/ }).click();
+  await page.evaluate((interaction) => window.dispatchEvent(new CustomEvent("test-daemon", {
+    detail: { type: "interaction_requested", interaction },
+  })), question);
+  await expect(page.locator(".agent-conversation")).toBeVisible();
+  await expect(page.locator(".interaction-dock")).toBeVisible();
+  await expect(page.locator(".interaction-dock").getByRole("radio", { name: "Yes", exact: true })).toBeInViewport();
+  pending = false;
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent("test-daemon", { detail: {
+    type: "session_event", sessionId: "a",
+    event: { id: "completed", type: "user_input.completed", timestamp: "2026-09-14T22:00:01Z", data: { requestId: "native-question" } },
+  } })));
+  await expect(page.locator(".interaction-dock")).toHaveCount(0);
+});
+
+test("a stale pending-request read cannot resurrect an externally completed question", async ({ page }) => {
+  await setup(page);
+  const question = {
+    sessionId: "a", requestId: "native-question", kind: "user_input",
+    data: { question: "An already answered question", choices: ["Yes", "No"] },
+  };
+  let first: import("@playwright/test").Route | undefined;
+  let requests = 0;
+  await page.route("**/api/pending_interactions", (route) => {
+    requests++;
+    if (requests === 1) { first = route; return; }
+    return route.fulfill({ json: [] });
+  });
+  await page.evaluate((interaction) => window.dispatchEvent(new CustomEvent("test-daemon", {
+    detail: { type: "interaction_requested", interaction },
+  })), question);
+  await expect.poll(() => !!first).toBe(true);
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent("test-daemon", { detail: {
+    type: "interaction_resolved", sessionId: "a", requestId: "native-question",
+  } })));
+  await first!.fulfill({ json: [question] });
+  await expect.poll(() => requests).toBeGreaterThan(1);
+  await expect(page.locator(".interaction-dock")).toHaveCount(0);
+});
+
+test("user message formatting preserves blank lines and indentation while long text wraps", async ({ page }) => {
+  await setup(page);
+  const content = "First line\n\n  Indented point\nNext line\n" + "long-unbroken-text".repeat(100);
+  await page.route("**/api/session_history_window", (route) => route.fulfill({ json: {
+    events: [event("formatted-user", "user.message", content), event("reply", "assistant.message", "**Assistant Markdown**")],
+    hasMore: false, cursor: "", loadedPages: 1, humanMessages: 1,
+  } }));
+  await page.reload();
+  const message = page.locator(".message.user .user-message-text");
+  await expect(message).toBeVisible();
+  expect(await message.textContent()).toBe(content);
+  const layout = await message.evaluate((element) => {
+    const text = element.firstChild!;
+    const value = text.textContent!;
+    const position = (offset: number) => {
+      const range = document.createRange();
+      range.setStart(text, offset);
+      range.setEnd(text, offset + 1);
+      const rect = range.getBoundingClientRect();
+      return { x: rect.x, y: rect.y };
+    };
+    const style = getComputedStyle(element);
+    return {
+      first: position(0), indented: position(value.indexOf("Indented")), next: position(value.indexOf("Next")),
+      lineHeight: parseFloat(style.lineHeight), whiteSpace: style.whiteSpace,
+      fits: element.scrollWidth <= element.clientWidth + 1,
+    };
+  });
+
+  expect(layout.whiteSpace).toBe("pre-wrap");
+  expect(layout.indented.y - layout.first.y).toBeGreaterThanOrEqual(layout.lineHeight * 1.9);
+  expect(layout.next.y - layout.indented.y).toBeGreaterThanOrEqual(layout.lineHeight * .9);
+  expect(layout.indented.x).toBeGreaterThan(layout.first.x);
+  expect(layout.fits).toBe(true);
+  await expect(page.locator(".message.assistant strong")).toHaveText("Assistant Markdown");
+  await page.setViewportSize({ width: 440, height: 900 });
+  expect(await message.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+});
+
+test("session names can be edited without submitting a chat or losing its draft", async ({ page }) => {
+    const state = await setup(page);
+    const renames: unknown[] = [];
+    await page.route("**/api/rename_session", (route) => {
+      const args = route.request().postDataJSON();
+      renames.push(args);
+      return route.fulfill({ json: { ...session(args.sessionId), title: args.name } });
+    });
+    await page.locator(".parent-session-view .composer textarea").fill("An unsent draft");
+    await page.getByRole("button", { name: "Rename session", exact: true }).click();
+    const dialog = page.getByRole("dialog", { name: "Rename session", exact: true });
+    await dialog.getByLabel("Session name").fill("Datapath questions");
+    await dialog.getByRole("button", { name: "Save name" }).click();
+    await expect(dialog).toBeHidden();
+    await expect(page.getByRole("heading", { name: "Datapath questions", exact: true })).toBeVisible();
+    await expect(page.locator('[data-session-id="a"]')).toContainText("Datapath questions");
+    await expect(page.locator(".parent-session-view .composer textarea")).toHaveValue("An unsent draft");
+    expect(renames).toEqual([{ sessionId: "a", name: "Datapath questions" }]);
+    expect(state.requests.some((request) => request.command === "send_message")).toBe(false);
+});
+
+test("terminal defaults above chat and can move to every position without reconnecting", async ({ page }) => {
+    let connections = 0;
+    await page.routeWebSocket("**/api/terminal**", (socket) => {
+      connections++;
+      socket.send(JSON.stringify({ type: "ready", shell: "Test shell", cwd: "Q:\\example", restored: false, hasControl: true, viewers: 1 }));
+      socket.send(JSON.stringify({ type: "output", data: "PRESERVED_TERMINAL\r\n" }));
+    });
+    await setup(page);
+    await page.getByTitle("Open terminal").click();
+    await expect(page.locator(".terminal-pane")).toBeVisible();
+    await expect.poll(() => connections).toBe(1);
+    await expect(page.getByRole("button", { name: "Terminal above chat", exact: true })).toHaveAttribute("aria-pressed", "true");
+    const separator = page.getByRole("separator", { name: "Resize terminal" });
+    await expect(separator).toHaveAttribute("aria-orientation", "horizontal");
+    const top = await page.locator(".terminal-pane").boundingBox();
+    const topChat = await page.locator(".workspace").boundingBox();
+    expect(topChat!.y).toBeGreaterThanOrEqual(top!.y + top!.height);
+    expect(top!.x).toBe(topChat!.x);
+    const topSize = Number(await separator.getAttribute("aria-valuenow"));
+    await separator.focus();
+    await separator.press("ArrowDown");
+    await expect(separator).toHaveAttribute("aria-valuenow", String(topSize + 10));
+    const divider = await separator.boundingBox();
+    await page.mouse.move(divider!.x + divider!.width / 2, divider!.y + divider!.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(divider!.x + divider!.width / 2, divider!.y + divider!.height / 2 + 25);
+    await page.mouse.up();
+    await expect(separator).toHaveAttribute("aria-valuenow", String(topSize + 35));
+    await page.getByRole("button", { name: "Terminal below chat", exact: true }).click();
+    await expect(separator).toHaveAttribute("aria-orientation", "horizontal");
+    const chat = await page.locator(".workspace").boundingBox();
+    const terminal = await page.locator(".terminal-pane").boundingBox();
+    expect(terminal!.y).toBeGreaterThanOrEqual(chat!.y + chat!.height);
+    expect(terminal!.x).toBe(chat!.x);
+    const before = Number(await separator.getAttribute("aria-valuenow"));
+    await separator.focus();
+    await separator.press("ArrowUp");
+    await expect(separator).toHaveAttribute("aria-valuenow", String(before + 10));
+    await page.getByRole("button", { name: "Terminal beside chat", exact: true }).click();
+    await expect(separator).toHaveAttribute("aria-orientation", "vertical");
+    const right = await page.locator(".terminal-pane").boundingBox();
+    const workspace = await page.locator(".workspace").boundingBox();
+    expect(right!.x).toBeGreaterThanOrEqual(workspace!.x + workspace!.width);
+    expect(connections).toBe(1);
+    await expect.poll(() => page.evaluate(() => JSON.parse(localStorage.getItem("copilot-sessions.terminal-layout") ?? "{}").dock)).toBe("right");
+    await page.reload();
+    await expect(page.locator(".parent-session-view .composer textarea")).toBeEnabled();
+    await page.getByTitle("Open terminal").click();
+    await expect(page.getByRole("button", { name: "Terminal beside chat", exact: true })).toHaveAttribute("aria-pressed", "true");
+    await page.getByRole("button", { name: "Terminal above chat", exact: true }).click();
+    await expect.poll(() => page.evaluate(() => JSON.parse(localStorage.getItem("copilot-sessions.terminal-layout") ?? "{}").dock)).toBe("top");
+    expect(connections).toBe(2);
+});
+
+test("forking opens an independent session and preserves the parent's unsent draft", async ({ page }) => {
+  const state = await setup(page);
+  const forks: unknown[] = [];
+  let name = "";
+  await page.route("**/api/fork_session", (route) => {
+    const args = route.request().postDataJSON();
+    forks.push(args);
+    name = args.name;
+    return route.fulfill({ json: { ...session("fork"), title: name } });
+  });
+  await page.route("**/api/resume_session", (route) => {
+    const args = route.request().postDataJSON();
+    return route.fulfill({ json: { ...session(args.sessionId), ...(args.sessionId === "fork" ? { title: name } : {}) } });
+  });
+  await page.locator(".parent-session-view .composer textarea").fill("Parent draft stays here");
+  await page.getByRole("button", { name: "Fork conversation", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Fork conversation" });
+  await dialog.getByLabel("New session name").fill("Alternative approach");
+  await dialog.getByRole("button", { name: "Create fork" }).click();
+  await expect(page.getByRole("heading", { name: "Alternative approach", exact: true })).toBeVisible();
+  expect(forks).toEqual([{ sessionId: "a", name: "Alternative approach" }]);
+  await expect(page.locator(".parent-session-view .composer textarea")).toHaveValue("");
+  await page.locator('[data-session-id="a"] .session-open').click();
+  await expect(page.locator(".parent-session-view .composer textarea")).toHaveValue("Parent draft stays here");
+  expect(state.requests.some((request) => request.command === "send_message")).toBe(false);
+});
+
+test("CLI-like typography is opt-in, persists locally, and updates the terminal without reconnecting", async ({ page }) => {
+  let connections = 0;
+  let resizes = 0;
+  await page.routeWebSocket("**/api/terminal**", (socket) => {
+    connections++;
+    socket.send(JSON.stringify({ type: "ready", shell: "Test shell", cwd: "Q:\\example", restored: false, hasControl: true, viewers: 1 }));
+    socket.onMessage((message) => { if (JSON.parse(String(message)).type === "resize") resizes++; });
+  });
+  await setup(page);
+  const text = page.locator(".message.user .user-message-text");
+  expect(await text.evaluate((element) => getComputedStyle(element).fontFamily)).not.toContain("Cascadia");
+  await page.getByTitle("Open terminal").click();
+  await expect.poll(() => connections).toBe(1);
+  await page.locator(".daemon-state").click();
+  await page.getByRole("button", { name: /CLI-like/ }).click();
+  expect(await text.evaluate((element) => getComputedStyle(element).fontFamily)).toContain("Cascadia");
+  const slider = page.getByRole("slider", { name: "Terminal font size", exact: true });
+  await slider.focus();
+  const before = resizes;
+  await slider.press("ArrowRight");
+  await expect.poll(() => resizes).toBeGreaterThan(before);
+  expect(connections).toBe(1);
+  await page.getByRole("button", { name: "Close settings" }).click();
+  await page.reload();
+  await expect(text).toBeVisible();
+  expect(await text.evaluate((element) => getComputedStyle(element).fontFamily)).toContain("Cascadia");
+  await page.locator(".daemon-state").click();
+  await page.getByRole("button", { name: "Reset font & spacing", exact: true }).click();
+  expect(await text.evaluate((element) => getComputedStyle(element).fontFamily)).not.toContain("Cascadia");
+});
+
+test("/ask submits to the transient API rather than sending a chat message or slash command", async ({ page }) => {
+  const state = await setup(page);
+  const asks: unknown[] = [];
+  await page.route("**/api/ask_session", (route) => {
+    const args = route.request().postDataJSON();
+    asks.push(args);
+    return route.fulfill({ json: { sessionId: args.sessionId, answer: "Transient **answer**." } });
+  });
+  const prompt = page.locator(".parent-session-view .composer textarea");
+  await prompt.fill("/ask Why did we choose this approach?");
+  await prompt.press("Enter");
+  const dialog = page.getByRole("dialog", { name: "Ask about conversation", exact: true });
+  await expect(dialog.getByRole("article", { name: "Transient answer" })).toContainText("Transient answer.");
+  expect(asks).toEqual([{ sessionId: "a", question: "Why did we choose this approach?" }]);
+  expect(state.requests.some((request) => ["send_message", "execute_command"].includes(request.command))).toBe(false);
+  await dialog.getByRole("button", { name: "Close", exact: true }).click();
+  await expect(prompt).toBeFocused();
+  await expect(page.locator(".parent-session-view .message.user")).not.toContainText("Why did we choose");
+});
+
+test("Git review comments open an explicit transient question draft without sending or touching Git", async ({ page }) => {
+  await setup(page);
+  const workspace = {
+    state: "repository", repoRoot: "Q:\\example", branch: "feature", head: "a".repeat(40),
+    upstream: null, base: null, baseCommit: null, mergeBase: null, detached: false, unborn: false,
+    refs: [], staged: [], untracked: [], compare: [], compareUnavailableReason: "Choose a target", warnings: [],
+    unstaged: [{ path: "file.rs", originalPath: null, status: "M", kind: "file", added: 1, deleted: 1, binary: false }],
+  };
+  const requests: string[] = [];
+  await page.route("**/api/git_workspace", (route) => { requests.push("git_workspace"); return route.fulfill({ json: workspace }); });
+  await page.route("**/api/git_diff", (route) => { requests.push("git_diff"); return route.fulfill({ json: {
+    repoRoot: "Q:\\example", path: "file.rs", originalPath: null, view: "unstaged",
+    head: workspace.head, base: null, baseCommit: null, mergeBase: null, contentId: "version-one",
+    patch: "diff --git a/file.rs b/file.rs\n--- a/file.rs\n+++ b/file.rs\n@@ -1 +1 @@\n-old\n+new\n",
+    truncated: false, binary: false, kind: "file", added: 1, deleted: 1, unavailableReason: null, warnings: [],
+  } }); });
+  let asked = false;
+  await page.route("**/api/ask_session", (route) => { asked = true; return route.fulfill({ json: { sessionId: "a", answer: "Review answer" } }); });
+  await page.getByRole("button", { name: "Open Git workspace" }).click();
+  const git = page.getByRole("dialog", { name: "Git workspace" });
+  await git.getByRole("button", { name: /file\.rs/ }).click();
+  await git.getByRole("checkbox", { name: "Select added line new:1", exact: true }).check();
+  await git.getByLabel("Local review comment").fill("Why was this changed?");
+  await git.getByRole("button", { name: "Save local comment" }).click();
+  await git.getByRole("button", { name: "Ask about comment" }).click();
+  const ask = page.getByRole("dialog", { name: "Ask about conversation" });
+  await expect(ask.getByLabel("Question", { exact: true })).toHaveValue(/Why was this changed\?/);
+  expect(asked).toBe(false);
+  expect(requests).toEqual(["git_workspace", "git_diff"]);
+  await ask.getByRole("button", { name: "Ask", exact: true }).click();
+  await expect(ask.getByRole("article", { name: "Transient answer" })).toContainText("Review answer");
+  expect(asked).toBe(true);
+});

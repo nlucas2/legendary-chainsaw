@@ -27,6 +27,7 @@ export function RuntimePanel({ onClose, onStatusChange }: RuntimePanelProps) {
   const [blockedAction, setBlockedAction] = useState<"drain" | "prepare" | null>(
     null,
   );
+  const [runtimeInfo, setRuntimeInfo] = useState<Record<string, unknown> | null>(null);
 
   async function refresh() {
     const next = await daemonInvoke<RuntimeStatus>("runtime_status");
@@ -36,6 +37,9 @@ export function RuntimePanel({ onClose, onStatusChange }: RuntimePanelProps) {
 
   useEffect(() => {
     void refresh().catch((error) => setMessage(String(error)));
+    void daemonInvoke<Record<string, unknown>>("runtime_info")
+      .then(setRuntimeInfo)
+      .catch((error) => setMessage(`Runtime provenance unavailable: ${String(error)}`));
   }, []);
 
   async function run(name: string, action: () => Promise<void>) {
@@ -120,6 +124,12 @@ export function RuntimePanel({ onClose, onStatusChange }: RuntimePanelProps) {
         </div>
 
         <div className="runtime-actions">
+          {runtimeInfo && (
+            <details className="runtime-provenance">
+              <summary>Runtime version and startup timings</summary>
+              <pre>{JSON.stringify(runtimeInfo, null, 2)}</pre>
+            </details>
+          )}
           <button
             disabled={!!busy || !status?.connected}
             onClick={() =>

@@ -1,0 +1,55 @@
+.interaction-panel {
+  width: min(920px, calc(100% - 56px));
+  margin: 16px auto;
+  padding: 16px;
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  color: var(--text);
+  background: var(--surface-1);
+}
+.interaction-panel form, .interaction-panel label { display: grid; gap: 8px; }
+.interaction-panel form { gap: 12px; }
+.interaction-panel small { color: var(--muted); }
+.interaction-panel input:not([type="checkbox"]):not([type="radio"]), .interaction-panel select, .interaction-panel textarea {
+  width: 100%; padding: 9px; border-radius: 6px; border: 1px solid var(--line);
+  color: var(--text); background: var(--surface-0); font: inherit;
+}
+.interaction-panel [role="alert"] { color: var(--danger); }
+.interaction-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+.interaction-dock { flex-shrink: 0; min-height: 0; max-height: 45vh; overflow: auto; border-bottom: 1px solid var(--accent); background: var(--surface-1); }
+.interaction-dock-heading { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; padding: 10px 20px 0; }
+.interaction-dock-heading span { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.interaction-dock .interaction-panel { margin: 10px auto; }
+.interaction-choices { display: grid; gap: 6px; margin: 0; padding: 0; border: 0; min-width: 0; }
+.interaction-choices legend { margin-bottom: 6px; color: var(--muted); }
+.interaction-panel .interaction-choices label { display: flex; align-items: flex-start; gap: 9px; min-height: 36px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; cursor: pointer; }
+.interaction-choices input { flex-shrink: 0; margin-top: 3px; accent-color: var(--accent); }
+.interaction-choices span { overflow-wrap: anywhere; }
+.interaction-choices label:has(input:checked) { border-color: var(--accent); background: var(--surface-0); }
+.plan-preview { max-height: 45vh; overflow: auto; padding: 12px; background: var(--surface-0); }
+.composer-attachments { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 12px 0; }
+.saved-chat-draft { margin: 8px 12px; padding: 10px; border: 1px solid var(--line); border-radius: 6px; font-size: 13px; }
+.saved-chat-draft p { margin: 6px 0; max-height: 80px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.saved-chat-draft button { margin: 6px 8px 0 0; padding: 6px 10px; min-height: 32px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface-0); color: var(--text); font: inherit; cursor: pointer; }
+.composer > [role="alert"], .saved-chat-draft [role="alert"] { color: var(--danger); padding: 0 12px; font-size: 13px; }
+.composer-footer { flex-wrap: wrap; }
+.composer-footer select { max-width: 155px; padding: 5px; border-radius: 5px; border: 1px solid var(--line); color: var(--text); background: var(--surface-0); font-size: 11px; }
+.composer-footer .agent-mode-switcher button:disabled { cursor: progress; opacity: .65; }
+.mode-notice { padding: 8px 12px 0; margin: 0; color: var(--muted); font-size: 12px; }
+.attachment-chip { display: flex; gap: 5px; align-items: center; padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; font-size: 12px; max-width: 100%; }
+.attachment-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attachment-chip button, .composer-attach { border: 0; background: transparent; color: var(--text); cursor: pointer; min-width: 32px; min-height: 32px; }
+.queue-actions { display: flex; flex-wrap: wrap; align-items: center; }
+.queue-actions button { width: auto; min-height: 32px; min-width: 32px; font-size: 11px; }
+.queue-edit { width: 100%; min-width: 0; color: var(--text); background: var(--surface-0); border: 1px solid var(--line); border-radius: 4px; padding: 5px; }
+.composer-status { flex-wrap: wrap; }
+.composer-status .timing-detail { flex-basis: 100%; white-space: normal; font-size: 11px; color: var(--muted); }
+.raw-diagnostics { max-height: 45vh; overflow: auto; margin: 12px auto; width: min(920px, calc(100% - 56px)); }
+.raw-diagnostics pre { max-height: 200px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.runtime-provenance { color: var(--text); padding: 10px; }
+.runtime-provenance pre { max-height: 250px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
+:where(button, a, input, textarea, select):focus-visible { outline: 2px solid var(--accent-bright); outline-offset: 3px; }
+@media (max-width: 700px) {
+  .interaction-panel { width: calc(100% - 24px); padding: 12px; }
+  .composer-attach, .queue-actions button, .attachment-chip button, .saved-chat-draft button { min-height: 44px; min-width: 44px; }
+}

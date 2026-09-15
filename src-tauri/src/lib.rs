@@ -2,7 +2,7 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use tauri::Manager;
 
@@ -55,9 +55,19 @@ fn daemon_running() -> bool {
         && response.contains("copilot-sessionsd")
 }
 
+fn daemon_port_open() -> bool {
+    let Ok(addr) = DAEMON_ADDR.parse::<SocketAddr>() else {
+        return false;
+    };
+    TcpStream::connect_timeout(&addr, Duration::from_millis(350)).is_ok()
+}
+
 fn ensure(app: &tauri::AppHandle) -> Result<(), String> {
     if daemon_running() {
         return Ok(());
+    }
+    if daemon_port_open() {
+        return wait_for_daemon(None);
     }
     let executable = resolve_daemon(app)?;
     let ui_dir = resolve_ui_dir(app);
@@ -87,16 +97,44 @@ fn ensure(app: &tauri::AppHandle) -> Result<(), String> {
     if let Some(ui_dir) = ui_dir {
         command.env("COPILOT_SESSIONS_UI_DIR", ui_dir);
     }
-    command
+    let mut child = command
         .spawn()
         .map_err(|e| format!("could not start {}: {e}", executable.display()))?;
+    wait_for_daemon(Some(&mut child))
+}
 
+fn wait_for_daemon(mut child: Option<&mut Child>) -> Result<(), String> {
     let started = Instant::now();
     while started.elapsed() < START_TIMEOUT {
         if daemon_running() {
             return Ok(());
         }
+        let exited = if let Some(process) = child.as_deref_mut() {
+            process
+                .try_wait()
+                .map_err(|error| format!("could not inspect copilot-sessionsd: {error}"))?
+        } else {
+            None
+        };
+        if let Some(status) = exited {
+            child = None;
+            if !daemon_port_open() {
+                return Err(format!(
+                    "copilot-sessionsd exited before becoming ready: {status}"
+                ));
+            }
+        }
         std::thread::sleep(Duration::from_millis(150));
+    }
+    if let Some(process) = child {
+        if process
+            .try_wait()
+            .map_err(|error| format!("could not inspect copilot-sessionsd: {error}"))?
+            .is_none()
+        {
+            let _ = process.kill();
+            let _ = process.wait();
+        }
     }
     Err("copilot-sessionsd did not become ready within 60 seconds".to_string())
 }
@@ -117,6 +155,14 @@ fn resolve_daemon(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     } else {
         "copilot-sessionsd"
     };
+    if cfg!(debug_assertions) {
+        if let Ok(current) = std::env::current_exe() {
+            let sibling = current.with_file_name(filename);
+            if sibling.is_file() {
+                return Ok(sibling);
+            }
+        }
+    }
     if let Ok(resource_dir) = app.path().resource_dir() {
         let bundled = resource_dir.join("bin").join(filename);
         if bundled.is_file() {
@@ -165,10 +211,6 @@ fn find_on_path(filename: &str) -> Option<PathBuf> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .setup(|app| {
-            ensure(app.handle())?;
-            Ok(())
-        })
         .invoke_handler(tauri::generate_handler![daemon_status, ensure_daemon])
         .run(tauri::generate_context!())
         .expect("error while running Copilot Sessions");

@@ -529,6 +529,36 @@ button {
   background: transparent;
 }
 
+.session-activity {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.session-activity b {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #64748b;
+}
+
+.session-activity.idle b {
+  background: #34d399;
+}
+
+.session-activity.working b,
+.session-activity.syncing b {
+  background: var(--accent-bright);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+.session-activity.offline b {
+  background: var(--danger);
+}
+
 .header-actions {
   display: flex;
   align-items: center;
@@ -574,7 +604,7 @@ button {
 }
 
 .transcript {
-  width: min(760px, calc(100% - 48px));
+  width: min(920px, calc(100% - 56px));
   margin: 0 auto;
   padding: 30px 0 20px;
 }
@@ -694,26 +724,65 @@ button {
   background: #151d27;
 }
 
+.message-avatar.placeholder {
+  visibility: hidden;
+}
+
 .message.assistant .message-avatar {
   border-color: rgba(56, 189, 248, 0.25);
   color: #7dd3fc;
   background: rgba(56, 189, 248, 0.08);
 }
 
+.reasoning-row {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr);
+  gap: 13px;
+  margin: -10px 0 18px;
+}
+
+.reasoning-row .message-avatar {
+  border-color: rgba(56, 189, 248, 0.25);
+  color: #7dd3fc;
+  background: rgba(56, 189, 248, 0.08);
+}
+
+.reasoning-turn-content {
+  min-width: 0;
+}
+
+.reasoning-turn-content .message-role {
+  margin-top: 3px;
+}
+
+.reasoning-row .reasoning-card {
+  margin: 0;
+}
+
 .message-role {
   margin: 3px 0 8px;
   color: #93a4b8;
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.07em;
   text-transform: uppercase;
 }
 
+.message-role em {
+  margin-left: 6px;
+  color: var(--muted);
+  font-size: 0.9em;
+  font-style: italic;
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
 .message-content {
   min-width: 0;
-  color: #c7d2df;
-  font-size: 13px;
-  line-height: 1.65;
+  color: var(--text);
+  font-size: 15px;
+  line-height: 1.7;
 }
 
 .message-content p {
@@ -722,6 +791,11 @@ button {
 
 .message-content p:last-child {
   margin-bottom: 0;
+}
+
+.user-message-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .streaming-caret {
@@ -786,7 +860,7 @@ button {
 .reasoning-card,
 .command-result,
 .raw-event-log {
-  margin: -12px 0 22px 42px;
+  margin: -10px 0 18px 42px;
   border: 1px solid #253243;
   border-radius: 7px;
   color: #7f90a5;
@@ -800,13 +874,13 @@ button {
 .timeline-disclosure {
   display: flex;
   width: 100%;
-  min-height: 34px;
+  min-height: 32px;
   align-items: center;
   gap: 7px;
   padding: 7px 10px;
   list-style: none;
   cursor: pointer;
-  font-size: 10px;
+  font-size: 11px;
 }
 
 .timeline-disclosure {
@@ -866,6 +940,11 @@ details[open] > summary .details-chevron {
 .reasoning-content {
   padding: 4px 12px 12px;
   border-top: 1px solid #202b38;
+}
+
+.tool-details {
+  max-height: 320px;
+  overflow: auto;
 }
 
 .tool-call-id {
@@ -1160,11 +1239,11 @@ details[open] > summary .details-chevron {
 }
 
 .reasoning-content {
-  max-height: 420px;
-  overflow: auto;
-  color: #9daabd;
-  font-size: 11px;
-  line-height: 1.58;
+  max-height: none;
+  overflow: visible;
+  color: color-mix(in srgb, var(--text) 86%, var(--muted));
+  font-size: 14px;
+  line-height: 1.68;
 }
 
 .reasoning-content p {
@@ -1176,7 +1255,7 @@ details[open] > summary .details-chevron {
   align-items: center;
   gap: 4px;
   color: #a78bfa;
-  font-size: 8px;
+  font-size: 10px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
@@ -1328,6 +1407,64 @@ details[open] > summary .details-chevron {
   line-height: 1.6;
 }
 
+.composer-status {
+  display: flex;
+  width: min(780px, calc(100% - 44px));
+  min-height: 27px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 0 auto 6px;
+  padding: 4px 8px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.composer-status > span {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+}
+
+.composer-status strong {
+  color: var(--text);
+  font-size: 11px;
+}
+
+.composer-status small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-status i {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #34d399;
+}
+
+.composer-status.working {
+  color: var(--accent-bright);
+}
+
+.composer-status > button {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 7px;
+  border: 1px solid color-mix(in srgb, var(--danger) 50%, var(--line));
+  border-radius: 5px;
+  color: var(--danger);
+  background: transparent;
+  cursor: pointer;
+  font-size: 8px;
+}
+
 .composer {
   position: relative;
   width: min(780px, calc(100% - 44px));
@@ -1337,6 +1474,92 @@ details[open] > summary .details-chevron {
   border-radius: 11px;
   background: #131b25;
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.22);
+}
+
+.message-queue {
+  width: min(780px, calc(100% - 44px));
+  max-height: 170px;
+  flex: 0 0 auto;
+  margin: 0 auto 7px;
+  overflow-y: auto;
+}
+
+.message-queue:empty {
+  display: none;
+}
+
+.message-queue-heading,
+.message-queue-item {
+  display: flex;
+  align-items: center;
+}
+
+.message-queue-heading {
+  justify-content: space-between;
+  padding: 0 4px 5px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.message-queue-heading strong {
+  color: var(--accent-bright);
+}
+
+.message-queue-item {
+  gap: 9px;
+  margin-top: 4px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-1);
+}
+
+.message-queue-item > span {
+  color: var(--accent-bright);
+  font: 11px "Cascadia Code", Consolas, monospace;
+}
+
+.message-queue-item > div {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.message-queue-item strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 550;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.message-queue-item small {
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.message-queue-item button {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border: 0;
+  border-radius: 5px;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+}
+
+.message-queue-item button:hover:not(:disabled) {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+
+.message-queue-item button:disabled {
+  opacity: 0.35;
 }
 
 .command-palette {
@@ -1674,7 +1897,7 @@ details[open] > summary .details-chevron {
   outline: 0;
   color: var(--text);
   background: transparent;
-  font-size: 13px;
+  font-size: 15px;
   line-height: 1.5;
 }
 
@@ -1692,7 +1915,43 @@ details[open] > summary .details-chevron {
   justify-content: space-between;
   padding: 6px 8px 8px 14px;
   color: #5f6f82;
-  font-size: 9px;
+  gap: 10px;
+  font-size: 10px;
+}
+
+.agent-mode-switcher {
+  display: inline-flex;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-0);
+}
+
+.agent-mode-switcher button {
+  padding: 3px 7px;
+  border: 0;
+  border-radius: 5px;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+  font-size: 10px;
+}
+
+.agent-mode-switcher button.active {
+  color: var(--strong);
+  background: var(--surface-2);
+}
+
+.environment-loading {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 0 0 22px 42px;
+  padding: 9px 11px;
+  border-left: 2px solid var(--accent);
+  color: var(--accent-bright);
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  font: 12px/1.45 "Cascadia Code", Consolas, monospace;
 }
 
 .send-button {
@@ -1743,6 +2002,57 @@ details[open] > summary .details-chevron {
   background: transparent;
   cursor: pointer;
   font-size: 8px;
+}
+
+.sync-banner {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 18px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  background: color-mix(in srgb, var(--panel) 82%, transparent);
+  font-size: 9px;
+}
+
+.sync-banner span {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sync-banner > button {
+  flex: 0 0 auto;
+  padding: 3px 7px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--muted);
+  background: var(--surface-0);
+  cursor: pointer;
+  font-size: 8px;
+}
+
+.sync-banner > button:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.sync-banner strong {
+  color: var(--text);
+}
+
+.sync-banner.working {
+  color: var(--accent-bright);
+  background: var(--accent-soft);
+}
+
+.sync-banner.complete > svg {
+  color: #34d399;
 }
 
 .error-banner button {
@@ -1889,6 +2199,73 @@ details[open] > summary .details-chevron {
   box-shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
 }
 
+.shortcut-modal {
+  width: min(560px, 100%);
+  padding: 20px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: var(--text);
+  background: var(--panel);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
+}
+
+.shortcut-modal header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  margin-bottom: 18px;
+}
+
+.shortcut-modal header span {
+  color: var(--accent-bright);
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.shortcut-modal h2 {
+  margin: 4px 0 0;
+  color: var(--strong);
+  font-size: 20px;
+}
+
+.shortcut-modal header button {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+}
+
+.shortcut-grid {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  align-items: center;
+  gap: 8px 16px;
+}
+
+.shortcut-grid kbd {
+  min-width: 78px;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  color: var(--strong);
+  background: var(--surface-0);
+  font: 11px "Cascadia Code", Consolas, monospace;
+  text-align: center;
+}
+
+.shortcut-grid span {
+  color: var(--text);
+  font-size: 13px;
+}
+
 .new-session-modal header {
   display: flex;
   align-items: flex-start;
@@ -1957,6 +2334,16 @@ details[open] > summary .details-chevron {
   justify-content: flex-end;
   gap: 8px;
   margin-top: 22px;
+}
+
+.new-session-configuration {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+}
+
+.new-session-configuration label {
+  margin-bottom: 0;
 }
 
 .login-screen {
@@ -2633,7 +3020,7 @@ details[open] > summary .details-chevron {
 
 .model-configuration {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 9px;
   padding: 11px 14px;
   border-top: 1px solid var(--line);
@@ -3120,6 +3507,10 @@ details[open] > summary .details-chevron {
   .composer {
     width: calc(100% - 20px);
     margin-bottom: max(10px, env(safe-area-inset-bottom));
+  }
+
+  .composer-status {
+    width: calc(100% - 20px);
   }
 
   .desktop-label {

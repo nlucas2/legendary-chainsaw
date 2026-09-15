@@ -1,0 +1,206 @@
+/* Opt-in only: the original stylesheet remains authoritative until customized. */
+:root[data-typography="custom"] .message-content,
+:root[data-typography="custom"] .reasoning-content,
+:root[data-typography="custom"] .composer textarea,
+:root[data-typography="custom"] .ask-panel textarea,
+:root[data-typography="custom"] .ask-panel-answer {
+  font-family: var(--chat-font-family);
+  font-size: var(--chat-font-size);
+  line-height: var(--chat-line-height);
+}
+
+:root[data-typography="custom"] .message-content pre,
+:root[data-typography="custom"] .reasoning-content pre {
+  font-family: var(--chat-code-font-family);
+  font-size: var(--chat-font-size);
+  line-height: var(--chat-line-height);
+}
+
+:root[data-typography="custom"] .message-content code,
+:root[data-typography="custom"] .reasoning-content code {
+  font-family: var(--chat-code-font-family);
+  font-size: 0.95em;
+}
+
+:root[data-typography="custom"] .message-content pre code,
+:root[data-typography="custom"] .reasoning-content pre code {
+  font-size: inherit;
+}
+
+:root[data-typography="custom"] .message-content :is(p, ul, ol, pre, blockquote),
+:root[data-typography="custom"] .reasoning-content :is(p, ul, ol, pre, blockquote) {
+  margin-top: 0;
+  margin-bottom: var(--chat-paragraph-spacing);
+}
+
+:root[data-typography="custom"] .message-content > :last-child,
+:root[data-typography="custom"] .reasoning-content > :last-child {
+  margin-bottom: 0;
+}
+
+:root[data-typography="custom"] .message,
+:root[data-typography="custom"] .subagent-message {
+  margin-bottom: var(--chat-turn-spacing);
+}
+
+.typography-settings {
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.typography-presets {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.typography-settings :is(button, select, input[type="text"]) {
+  min-width: 0;
+  min-height: 44px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--text);
+  background: var(--panel);
+  font: inherit;
+}
+
+.typography-settings button {
+  cursor: pointer;
+}
+
+.typography-settings button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.typography-presets button {
+  text-align: left;
+}
+
+.typography-presets button[aria-pressed="true"] {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.typography-presets small {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.typography-settings :is(button, input, select):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.typography-settings fieldset {
+  min-width: 0;
+  margin: 16px 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.typography-settings legend {
+  padding: 0 5px;
+  font-weight: 650;
+}
+
+.typography-field,
+.typography-custom-font {
+  display: grid;
+  gap: 6px;
+}
+
+.typography-field select {
+  width: 100%;
+}
+
+.typography-custom-font {
+  margin-top: 12px;
+}
+
+.typography-custom-font > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.typography-custom-font input {
+  flex: 1 1 160px;
+}
+
+.typography-slider {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0 8px;
+  margin-top: 12px;
+}
+
+.typography-slider output {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.typography-slider input[type="range"] {
+  grid-column: 1 / -1;
+  width: 100%;
+  min-width: 0;
+  height: 44px;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.typography-hint,
+.typography-error {
+  margin: 8px 0 0;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.typography-hint {
+  color: var(--muted);
+}
+
+.typography-error {
+  color: var(--danger);
+}
+
+.typography-preview {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+}
+
+.typography-preview > strong {
+  display: block;
+  margin-bottom: 12px;
+}
+
+.typography-chat-preview {
+  overflow-wrap: anywhere;
+}
+
+.typography-terminal-preview {
+  margin: 12px 0 0;
+  padding-top: 12px;
+  overflow: auto;
+  border-top: 1px solid var(--line);
+}
+
+.typography-settings .typography-reset {
+  margin-top: 12px;
+}
+
+@media (max-width: 420px) {
+  .typography-presets {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

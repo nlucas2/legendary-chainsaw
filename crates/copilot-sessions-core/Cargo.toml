@@ -9,6 +9,7 @@ async-trait.workspace = true
 dirs.workspace = true
 futures-util.workspace = true
 github-copilot-sdk.workspace = true
+jsonschema = { version = "0.53.0", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

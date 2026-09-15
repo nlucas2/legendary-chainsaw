@@ -1,0 +1,107 @@
+{
+  "cases": [
+    {
+      "name": "required boolean, integer bounds, Unicode string length",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "agree": { "type": "boolean" },
+          "count": { "type": "integer", "minimum": 0, "maximum": 3 },
+          "label": { "type": "string", "minLength": 2, "maxLength": 4 }
+        },
+        "required": ["agree", "count", "label"]
+      },
+      "valid": [
+        { "agree": false, "count": 0, "label": "ab" },
+        { "agree": true, "count": 3, "label": "😀😀" }
+      ],
+      "invalid": [
+        { "count": 1, "label": "ab" },
+        { "agree": "false", "count": 1, "label": "ab" },
+        { "agree": false, "count": "1", "label": "ab" },
+        { "agree": false, "count": 1.5, "label": "ab" },
+        { "agree": false, "count": -1, "label": "ab" },
+        { "agree": false, "count": 4, "label": "ab" },
+        { "agree": false, "count": 1, "label": "a" },
+        { "agree": false, "count": 1, "label": "😀😀😀😀😀" },
+        { "agree": false, "count": 1, "label": "ab", "extra": { "hidden": true } },
+        null,
+        []
+      ]
+    },
+    {
+      "name": "decimal inclusive bounds",
+      "schema": { "type": "object", "properties": { "amount": { "type": "number", "minimum": 1.25, "maximum": 2.75 } }, "required": ["amount"] },
+      "valid": [{ "amount": 1.25 }, { "amount": 2.75 }],
+      "invalid": [{ "amount": 1.249 }, { "amount": 2.751 }, { "amount": "2" }, { "amount": false }, {}]
+    },
+    {
+      "name": "legacy titled string enum",
+      "schema": { "type": "object", "properties": { "color": { "type": "string", "enum": ["red", "blue"], "enumNames": ["Red", "Blue"], "default": "blue" } }, "required": ["color"] },
+      "valid": [{ "color": "red" }, { "color": "blue" }],
+      "invalid": [{ "color": "green" }, { "color": 1 }, { "color": null }, {}]
+    },
+    {
+      "name": "titled single select and bounded enum array",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "choice": { "type": "string", "oneOf": [{ "const": "r", "title": "Red" }, { "const": "", "title": "Empty" }] },
+          "tags": { "type": "array", "minItems": 1, "maxItems": 2, "items": { "type": "string", "enum": ["a", "b"] } }
+        },
+        "required": ["choice", "tags"]
+      },
+      "valid": [{ "choice": "r", "tags": ["a"] }, { "choice": "", "tags": ["a", "b"] }],
+      "invalid": [{ "choice": "other", "tags": ["a"] }, { "choice": "r", "tags": [] }, { "choice": "r", "tags": ["a", "b", "a"] }, { "choice": "r", "tags": ["c"] }, { "choice": "r", "tags": [1] }, { "choice": "r", "tags": "a" }]
+    },
+    {
+      "name": "titled multiselect supports an empty required array",
+      "schema": { "type": "object", "properties": { "tags": { "type": "array", "minItems": 0, "maxItems": 2, "items": { "anyOf": [{ "const": "x", "title": "X" }, { "const": "y", "title": "Y" }] } } }, "required": ["tags"] },
+      "valid": [{ "tags": [] }, { "tags": ["x", "y"] }],
+      "invalid": [{ "tags": ["z"] }, { "tags": [false] }, { "tags": ["x", "y", "x"] }, {}]
+    },
+    {
+      "name": "email format",
+      "schema": { "type": "object", "properties": { "value": { "type": "string", "format": "email" } }, "required": ["value"] },
+      "valid": [{ "value": "person@example.com" }],
+      "invalid": [{ "value": "not-an-email" }, { "value": 123 }]
+    },
+    {
+      "name": "URI format is not limited to HTTP",
+      "schema": { "type": "object", "properties": { "value": { "type": "string", "format": "uri" } }, "required": ["value"] },
+      "valid": [{ "value": "https://example.com/path" }, { "value": "urn:example:thing" }],
+      "invalid": [{ "value": "not a URI" }, { "value": "/relative/path" }]
+    },
+    {
+      "name": "calendar date format",
+      "schema": { "type": "object", "properties": { "value": { "type": "string", "format": "date" } }, "required": ["value"] },
+      "valid": [{ "value": "2024-02-29" }],
+      "invalid": [{ "value": "2023-02-29" }, { "value": "2024-13-01" }]
+    },
+    {
+      "name": "RFC3339 date-time requires a timezone",
+      "schema": { "type": "object", "properties": { "value": { "type": "string", "format": "date-time" } }, "required": ["value"] },
+      "valid": [{ "value": "2024-02-29T12:30:45Z" }, { "value": "2024-02-29T12:30:45+02:00" }],
+      "invalid": [{ "value": "2024-02-29T12:30:45" }, { "value": "2023-02-29T12:30:45Z" }, { "value": "yesterday" }]
+    },
+    {
+      "name": "JSON Schema patterns use search semantics",
+      "schema": { "type": "object", "properties": { "value": { "type": "string", "pattern": "[A-Z]{2}" } }, "required": ["value"] },
+      "valid": [{ "value": "prefix AB suffix" }],
+      "invalid": [{ "value": "abc" }]
+    }
+  ],
+  "unsupported": [
+    { "name": "nested objects", "schema": { "type": "object", "properties": { "child": { "type": "object", "properties": {} } } } },
+    { "name": "external references", "schema": { "type": "object", "properties": { "child": { "$ref": "https://example.invalid/private-schema" } } } },
+    { "name": "unknown format", "schema": { "type": "object", "properties": { "value": { "type": "string", "format": "unknown-format" } } } },
+    { "name": "unknown keyword", "schema": { "type": "object", "properties": { "value": { "type": "string", "customConstraint": true } } } },
+    { "name": "non-enum arrays", "schema": { "type": "object", "properties": { "value": { "type": "array", "items": { "type": "number" } } } } },
+    { "name": "required undeclared field", "schema": { "type": "object", "properties": {}, "required": ["missing"] } },
+    { "name": "malformed numeric bound", "schema": { "type": "object", "properties": { "value": { "type": "number", "minimum": "0" } } } },
+    { "name": "malformed string bound", "schema": { "type": "object", "properties": { "value": { "type": "string", "minLength": -1 } } } },
+    { "name": "mismatched enum labels", "schema": { "type": "object", "properties": { "value": { "type": "string", "enum": ["a", "b"], "enumNames": ["A"] } } } },
+    { "name": "unsupported dialect", "schema": { "$schema": "https://example.invalid/dialect", "type": "object", "properties": {} } },
+    { "name": "untyped additional fields", "schema": { "type": "object", "properties": {}, "additionalProperties": true } }
+  ]
+}

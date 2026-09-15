@@ -1,0 +1,48 @@
+.message-content .transcript-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.transcript-attachment {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: min(280px, 100%);
+  min-width: 0;
+  padding: 5px 8px;
+  border: 1px solid color-mix(in srgb, currentColor 20%, transparent);
+  border-radius: 7px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.transcript-attachment > svg {
+  flex: none;
+}
+
+.transcript-attachment-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.transcript-attachment-thumbnail {
+  display: grid;
+  width: 40px;
+  height: 40px;
+  flex: none;
+  place-items: center;
+  overflow: hidden;
+  border-radius: 4px;
+}
+
+.transcript-attachment-thumbnail img {
+  display: block;
+  width: 40px;
+  height: 40px;
+  object-fit: contain;
+}

@@ -5,22 +5,28 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use copilot_sessions_core::{
-    NewSession, OrganizationUpdate, PermissionDecision, ServiceError, SessionService,
+    AdoptToolControls, AgentHistoryRequest, AgentTasksRequest, InteractionResponse, NewSession,
+    OrganizationUpdate, PermissionDecision, QueueAction, SendAgentMessageRequest,
+    SendMessageRequest, ServiceError, SessionService, SetMcpEnabled, SetSessionMode,
+    SetToolEnabled, project_app_event,
+    AskSessionRequest, ForkSessionRequest, RenameSessionRequest,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use terminal::TerminalManager;
-use tokio_stream::StreamExt;
-use tokio_stream::wrappers::BroadcastStream;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
+
+// Twelve MiB of decoded attachments expands to sixteen MiB of base64.
+// Leave space for the prompt, filenames, MIME types, and JSON framing.
+const MAX_COMMAND_BODY_BYTES: usize = 18 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
@@ -49,9 +55,13 @@ struct DaemonState {
     access_token: Option<String>,
 }
 
-pub async fn serve(service: Arc<SessionService>, config: DaemonConfig) -> anyhow::Result<()> {
+pub async fn serve(
+    service: Arc<SessionService>,
+    config: DaemonConfig,
+    listener: tokio::net::TcpListener,
+) -> anyhow::Result<()> {
     config.validate()?;
-    let checkpoint_path = SessionService::default_data_dir().join("terminals.json");
+    let checkpoint_path = service.data_dir().join("terminals.json");
     let terminals = TerminalManager::default();
     if let Err(error) = terminals.load_checkpoints(&checkpoint_path) {
         tracing::warn!(%error, "could not load terminal checkpoints");
@@ -83,12 +93,14 @@ pub async fn serve(service: Arc<SessionService>, config: DaemonConfig) -> anyhow
         .route("/api/login", post(login))
         .route("/api/events", get(events))
         .route("/api/terminal", get(terminal))
-        .route("/api/{command}", post(command))
+        .route(
+            "/api/{command}",
+            post(command).layer(DefaultBodyLimit::max(MAX_COMMAND_BODY_BYTES)),
+        )
         .fallback_service(static_files)
         .layer(cors)
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(config.bind).await?;
     tracing::info!(address = %config.bind, "copilot-sessionsd listening");
     axum::serve(listener, app).await?;
     Ok(())
@@ -120,19 +132,45 @@ async fn login(State(state): State<DaemonState>, Json(body): Json<LoginRequest>)
 
 async fn events(
     State(state): State<DaemonState>,
+    Query(query): Query<EventQuery>,
     headers: HeaderMap,
 ) -> Result<
     Sse<impl futures_util::Stream<Item = std::result::Result<Event, axum::Error>>>,
     StatusCode,
 > {
     authorize(&state, &headers, None)?;
-    let stream = BroadcastStream::new(state.service.subscribe()).filter_map(|item| match item {
-        Ok(event) => serde_json::to_string(&event)
-            .ok()
-            .map(|data| Ok(Event::default().event("session-event").data(data))),
-        Err(_) => None,
-    });
+    let after = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .or(query.after);
+    let stream = futures_util::stream::unfold(
+        state.service.subscribe(after),
+        move |mut subscription| async move {
+            loop {
+                let raw = subscription.recv().await?;
+                let Some(event) = project_app_event(raw, query.diagnostics) else {
+                    continue;
+                };
+                let data = serde_json::to_string(&event).ok()?;
+                return Some((
+                    Ok(Event::default()
+                        .event("session-event")
+                        .id(event.sequence.to_string())
+                        .data(data)),
+                    subscription,
+                ));
+            }
+        },
+    );
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+#[derive(Default, Deserialize)]
+struct EventQuery {
+    after: Option<u64>,
+    #[serde(default)]
+    diagnostics: bool,
 }
 
 #[derive(Deserialize)]
@@ -183,9 +221,12 @@ async fn command(
         Ok(value) => Json(value).into_response(),
         Err(error) => {
             let status = match error {
-                ServiceError::SessionNotActive(_) | ServiceError::PermissionNotPending(_) => {
-                    StatusCode::CONFLICT
-                }
+                ServiceError::SessionNotActive(_)
+                | ServiceError::SessionProcessing(_)
+                | ServiceError::PermissionNotPending(_)
+                | ServiceError::InteractionNotPending(_) => StatusCode::CONFLICT,
+                ServiceError::InvalidArgument(_) => StatusCode::BAD_REQUEST,
+                ServiceError::CapabilityUnavailable(_) => StatusCode::NOT_IMPLEMENTED,
                 ServiceError::InvalidWorkingDirectory(_) => StatusCode::BAD_REQUEST,
                 ServiceError::CommandFailed(_) => StatusCode::BAD_REQUEST,
                 ServiceError::CopilotDisconnected | ServiceError::Draining => {
@@ -206,9 +247,37 @@ async fn dispatch(state: &DaemonState, command: &str, body: Value) -> Result<Val
             let request: NewSession = decode(body)?;
             json_result(service.create_session(request).await?)
         }
+        "ask_session" => json_result(service.ask_session(decode::<AskSessionRequest>(body)?).await?),
+        "fork_session" => json_result(service.fork_session(decode::<ForkSessionRequest>(body)?).await?),
+        "rename_session" => json_result(service.rename_session(decode::<RenameSessionRequest>(body)?).await?),
+        "git_repository" | "git_workspace" => {
+            let request = decode::<GitWorkspaceArgs>(body)?;
+            let cwd = service.cwd_for(&request.session_id).await.ok_or_else(|| ServiceError::InvalidArgument(
+                "This session has no working directory.".into(),
+            ))?;
+            if command == "git_repository" {
+                json_result(copilot_sessions_core::git_workspace::repository(&cwd).await.map_err(ServiceError::CommandFailed)?)
+            } else {
+                json_result(copilot_sessions_core::git_workspace::workspace(&cwd, request.base.as_deref()).await.map_err(ServiceError::CommandFailed)?)
+            }
+        }
+        "git_diff" => {
+            let request = decode::<GitDiffArgs>(body)?;
+            let cwd = service.cwd_for(&request.session_id).await.ok_or_else(|| ServiceError::InvalidArgument(
+                "This session has no working directory.".into(),
+            ))?;
+            json_result(copilot_sessions_core::git_workspace::diff(&cwd,
+                copilot_sessions_core::git_workspace::GitDiffRequest {
+                    view: request.view, path: request.path, base: request.base,
+                }).await.map_err(ServiceError::CommandFailed)?)
+        }
         "resume_session" => {
             let session_id = string_arg(&body, "sessionId")?;
             json_result(service.resume_session(session_id).await?)
+        }
+        "refresh_session" => {
+            let session_id = string_arg(&body, "sessionId")?;
+            json_result(service.refresh_session(session_id).await?)
         }
         "session_history" => {
             let session_id = string_arg(&body, "sessionId")?;
@@ -218,14 +287,90 @@ async fn dispatch(state: &DaemonState, command: &str, body: Value) -> Result<Val
                 .map(str::to_owned);
             json_result(service.history(&session_id, cursor).await?)
         }
+        "session_history_window" => {
+            let session_id = string_arg(&body, "sessionId")?;
+            json_result(service.recent_history(&session_id).await?)
+        }
         "subagent_context" => {
             let session_id = string_arg(&body, "sessionId")?;
             json_result(service.subagent_context(&session_id).await?)
         }
+        "agent_tasks" => json_result(
+            service
+                .agent_tasks(decode::<AgentTasksRequest>(body)?)
+                .await?,
+        ),
+        "agent_history" => json_result(
+            service
+                .agent_history(decode::<AgentHistoryRequest>(body)?)
+                .await?,
+        ),
+        "send_agent_message" => json_result(
+            service
+                .send_agent_message(decode::<SendAgentMessageRequest>(body)?)
+                .await?,
+        ),
         "send_message" => {
+            let request = decode::<SendMessageRequest>(body)?;
+            request.validate_browser_attachments()?;
+            json_result(service.submit_message(request).await?)
+        }
+        "session_state" => {
             let session_id = string_arg(&body, "sessionId")?;
-            let content = string_arg(&body, "content")?;
-            json_result(service.send_message(&session_id, content).await?)
+            json_result(service.session_state(&session_id).await?)
+        }
+        "set_session_mode" => json_result(
+            service
+                .set_session_mode(decode::<SetSessionMode>(body)?)
+                .await?,
+        ),
+        "queue_action" => json_result(service.queue_action(decode::<QueueAction>(body)?).await?),
+        "tool_controls" => {
+            let session_id = string_arg(&body, "sessionId")?;
+            if let Some(refresh) = body.get("refreshInventory") {
+                let refresh = refresh.as_bool().ok_or_else(|| {
+                    ServiceError::InvalidArgument("refreshInventory must be a boolean".into())
+                })?;
+                if refresh {
+                    return json_result(service.refresh_tool_inventory(&session_id).await?);
+                }
+            }
+            json_result(service.tool_controls(&session_id).await?)
+        }
+        "adopt_tool_controls" => json_result(
+            service
+                .adopt_tool_controls(decode::<AdoptToolControls>(body)?)
+                .await?,
+        ),
+        "set_tool_enabled" => json_result(
+            service
+                .set_tool_enabled(decode::<SetToolEnabled>(body)?)
+                .await?,
+        ),
+        "set_mcp_enabled" => json_result(
+            service
+                .set_mcp_enabled(decode::<SetMcpEnabled>(body)?)
+                .await?,
+        ),
+        "pending_interactions" => {
+            let session_id = string_arg(&body, "sessionId")?;
+            json_result(service.pending_interactions_async(&session_id).await?)
+        }
+        "respond_interaction" => {
+            service
+                .respond_interaction_async(decode::<InteractionResponse>(body)?)
+                .await?;
+            Ok(json!({"success": true}))
+        }
+        "runtime_info" => service.runtime_info().await,
+        "queue_items" => {
+            let session_id = string_arg(&body, "sessionId")?;
+            json_result(service.queue_items(&session_id).await?)
+        }
+        "remove_queue_item" => {
+            let session_id = string_arg(&body, "sessionId")?;
+            let item_id = string_arg(&body, "itemId")?;
+            json_result(service.remove_queue_item(&session_id, item_id).await?)
         }
         "execute_command" => {
             let session_id = string_arg(&body, "sessionId")?;
@@ -279,13 +424,23 @@ async fn dispatch(state: &DaemonState, command: &str, body: Value) -> Result<Val
                 .get("reasoningEffort")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
+            let reasoning_summary = body
+                .get("reasoningSummary")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             let context_tier = body
                 .get("contextTier")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
             json_result(
                 service
-                    .switch_model(&session_id, model_id, reasoning_effort, context_tier)
+                    .switch_model(
+                        &session_id,
+                        model_id,
+                        reasoning_effort,
+                        reasoning_summary,
+                        context_tier,
+                    )
                     .await?,
             )
         }
@@ -294,6 +449,10 @@ async fn dispatch(state: &DaemonState, command: &str, body: Value) -> Result<Val
             json_result(service.organize_session(update).await?)
         }
         "runtime_status" => json_result(service.runtime_status().await),
+        "session_processing" => {
+            let session_id = string_arg(&body, "sessionId")?;
+            json_result(service.session_processing(&session_id).await?)
+        }
         "connect_copilot" => json_result(service.connect_copilot().await?),
         "cancel_drain" => json_result(service.cancel_drain().await?),
         "drain_copilot" => {
@@ -397,7 +556,23 @@ fn authorize(
 }
 
 fn decode<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, ServiceError> {
-    serde_json::from_value(value).map_err(|e| ServiceError::Persistence(e.to_string()))
+    serde_json::from_value(value).map_err(|e| ServiceError::InvalidArgument(e.to_string()))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GitWorkspaceArgs {
+    session_id: String,
+    base: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GitDiffArgs {
+    session_id: String,
+    view: copilot_sessions_core::git_workspace::GitView,
+    path: String,
+    base: Option<String>,
 }
 
 fn string_arg(value: &Value, name: &str) -> Result<String, ServiceError> {
@@ -405,7 +580,7 @@ fn string_arg(value: &Value, name: &str) -> Result<String, ServiceError> {
         .get(name)
         .and_then(Value::as_str)
         .map(str::to_owned)
-        .ok_or_else(|| ServiceError::Persistence(format!("missing argument {name}")))
+        .ok_or_else(|| ServiceError::InvalidArgument(format!("missing argument {name}")))
 }
 
 fn json_result<T: serde::Serialize>(value: T) -> Result<Value, ServiceError> {
@@ -414,4 +589,53 @@ fn json_result<T: serde::Serialize>(value: T) -> Result<Value, ServiceError> {
 
 pub fn default_bind() -> SocketAddr {
     SocketAddr::new(IpAddr::from([127, 0, 0, 1]), 3847)
+}
+
+#[cfg(test)]
+mod api_contract_tests {
+    use super::*;
+
+    #[test]
+    fn diagnostics_query_is_opt_in_and_preserves_cursor() {
+        let Query(default) =
+            Query::<EventQuery>::try_from_uri(&"/api/events?after=7".parse().unwrap()).unwrap();
+        assert!(!default.diagnostics);
+        assert_eq!(default.after, Some(7));
+        let Query(enabled) = Query::<EventQuery>::try_from_uri(
+            &"/api/events?diagnostics=true&after=7".parse().unwrap(),
+        )
+        .unwrap();
+        assert!(enabled.diagnostics);
+        assert_eq!(enabled.after, Some(7));
+        assert!(
+            Query::<EventQuery>::try_from_uri(&"/api/events?diagnostics=invalid".parse().unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn invalid_delivery_and_missing_queue_arguments_are_bad_requests() {
+        assert!(decode::<AdoptToolControls>(json!({"sessionId":"s"})).is_ok());
+        assert!(
+            decode::<AdoptToolControls>(json!({"sessionId":"s","availableTools":["*"]})).is_err()
+        );
+        assert!(matches!(
+            decode::<SendMessageRequest>(
+                json!({"sessionId":"s","content":"x","deliveryMode":"bad"})
+            ),
+            Err(ServiceError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            decode::<QueueAction>(json!({"sessionId":"s","itemId":"i","action":"update"})),
+            Err(ServiceError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            decode::<SetSessionMode>(json!({"sessionId":"s","mode":"unknown"})),
+            Err(ServiceError::InvalidArgument(_))
+        ));
+        assert!(
+            decode::<SetMcpEnabled>(json!({"sessionId":"s","serverName":"server","enabled":false}))
+                .is_ok()
+        );
+    }
 }

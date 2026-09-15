@@ -1,0 +1,72 @@
+.ask-panel {
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+  max-height: 100%;
+  min-height: 0;
+  padding: 18px;
+  overflow-y: auto;
+  background: var(--panel, #121a24);
+  color: var(--text, #dbe6f3);
+  font-size: var(--body-font-size, 13px);
+  line-height: 1.55;
+}
+
+.ask-panel-header, .ask-panel-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.ask-panel-header h2, .ask-panel-answer h3 { margin: 0; }
+.ask-panel-header h2 { font-size: 18px; }
+.ask-panel-header span, .ask-panel-note, .ask-panel small, .ask-panel footer {
+  color: var(--muted, #a3b1c4);
+  font-size: 12px;
+}
+
+.ask-panel p { margin: 0; }
+.ask-panel form { display: grid; gap: 8px; }
+.ask-panel label { font-weight: 600; }
+.ask-panel textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 86px;
+  resize: vertical;
+  border: 1px solid var(--line, #34465b);
+  border-radius: 6px;
+  padding: 10px;
+  background: var(--background, #0c121b);
+  color: inherit;
+  font: inherit;
+}
+
+.ask-panel button { min-height: 36px; }
+.ask-panel :is(button, textarea, article):focus-visible {
+  outline: 2px solid var(--accent, #7dd3fc);
+  outline-offset: 2px;
+}
+.ask-panel-pending { display: grid; justify-items: start; gap: 8px; }
+.ask-panel-error { color: var(--danger, #fb7185); overflow-wrap: anywhere; }
+.ask-panel-answer {
+  padding-top: 14px;
+  border-top: 1px solid var(--line, #34465b);
+  overflow-wrap: anywhere;
+}
+.ask-panel-answer > * + * { margin-top: 10px; }
+.ask-panel-question { color: var(--muted, #a3b1c4); white-space: pre-wrap; }
+.ask-panel-answer pre, .ask-panel-answer table { max-width: 100%; overflow-x: auto; }
+.ask-panel-answer pre { padding: 10px; background: var(--background, #0c121b); }
+.ask-panel-answer table { display: block; border-collapse: collapse; }
+.ask-panel-answer :is(th, td) { padding: 6px; border: 1px solid var(--line, #34465b); }
+.ask-panel-answer a { color: var(--accent, #7dd3fc); }
+.ask-panel footer { margin-top: auto; padding-top: 8px; }
+
+@media (max-width: 600px) {
+  .ask-panel { padding: 12px; }
+  .ask-panel-actions { flex-wrap: wrap; }
+  .ask-panel button { min-height: 44px; }
+}

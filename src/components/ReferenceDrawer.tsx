@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   BookOpen,
   Braces,
@@ -13,8 +13,12 @@ import {
 } from "lucide-react";
 import type { SessionReferences } from "../lib/types";
 import type { SessionEvent } from "../lib/types";
+import { ContextToolsPanel } from "./ContextToolsPanel";
+import { paginate } from "../lib/context";
 
-interface ReferenceDrawerProps {
+export interface ReferenceDrawerProps {
+  sessionId?: string;
+  revision?: number;
   references: SessionReferences | null;
   loading: boolean;
   onClose: () => void;
@@ -58,16 +62,26 @@ export type ReferenceSectionName =
   | "tasks";
 
 const kindMeta = {
+  context: { label: "Context", icon: Braces },
+  tool: { label: "Tools", icon: Wrench },
+  task: { label: "Tasks", icon: ListTodo },
   command: { label: "Commands", icon: Command },
   skill: { label: "Skills", icon: Puzzle },
   mcp: { label: "MCP", icon: Cable },
-  tool: { label: "Tools", icon: Wrench },
   instruction: { label: "Instructions", icon: FileText },
-  context: { label: "Context", icon: Braces },
-  task: { label: "Tasks", icon: ListTodo },
 } as const;
 
+const directSections: Partial<Record<ReferenceItem["kind"], ReferenceSectionName>> = {
+  command: "commands",
+  skill: "skills",
+  mcp: "mcp",
+  instruction: "instructions",
+  task: "tasks",
+};
+
 export function ReferenceDrawer({
+  sessionId,
+  revision = 0,
   references,
   loading,
   onClose,
@@ -78,8 +92,12 @@ export function ReferenceDrawer({
   subagentEvents,
   onCancelTask,
 }: ReferenceDrawerProps) {
+  const drawer = useRef<HTMLElement>(null);
+  const tabId = useId();
   const [query, setQuery] = useState("");
-  const [filter, setFilter] = useState<ReferenceItem["kind"]>("task");
+  const [filter, setFilter] = useState<ReferenceItem["kind"]>("context");
+  const [limit, setLimit] = useState(30);
+  const [refreshToken, setRefreshToken] = useState(0);
   const items = useMemo(
     () => flattenReferences(references, subagentEvents),
     [references, subagentEvents],
@@ -94,23 +112,22 @@ export function ReferenceDrawer({
           item.description?.toLowerCase().includes(needle)),
     );
   }, [filter, items, query]);
-  const visible = matching.slice(0, 80);
-  const errors = references
-    ? Object.entries(references)
-        .filter(([, section]) => section.error)
-        .map(([name, section]) => `${name}: ${section.error}`)
-    : [];
+  const page = paginate(matching, limit);
+  const visible = page.items;
+  const ownPanel = filter === "context" || filter === "tool";
+  const direct = directSections[filter];
+  const section = direct ? references?.[direct] : undefined;
+  const waiting = loading || Boolean(direct && (!references || (section?.value === undefined && !section?.error) || sectionLoading === direct));
 
   useEffect(() => {
-    const directSections: Partial<
-      Record<ReferenceItem["kind"], ReferenceSectionName>
-    > = {
-      command: "commands",
-      mcp: "mcp",
-      instruction: "instructions",
-      task: "tasks",
-    };
-    const direct = directSections[filter];
+    const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    drawer.current?.querySelector<HTMLButtonElement>("header button")?.focus();
+    return () => { if (previouslyFocused?.isConnected) previouslyFocused.focus(); };
+  }, []);
+
+  useEffect(() => { setLimit(30); }, [query, filter, sessionId]);
+
+  useEffect(() => {
     if (
       direct &&
       references &&
@@ -119,50 +136,21 @@ export function ReferenceDrawer({
       sectionLoading !== direct
     ) {
       onRequestSection(direct);
-      return;
     }
-    if (
-      filter === "skill" &&
-      references &&
-      references.skills.value === undefined &&
-      !references.skills.error &&
-      sectionLoading !== "skills"
-    ) {
-      onRequestSection("skills");
-    }
-    if (
-      filter === "context" &&
-      references &&
-      references.contextAttribution.value === undefined &&
-      !references.contextAttribution.error &&
-      sectionLoading !== "contextAttribution"
-    ) {
-      onRequestSection("contextAttribution");
-    }
-    if (
-      filter === "tool" &&
-      references &&
-      references.tools.value === undefined &&
-      !references.tools.error &&
-      sectionLoading !== "tools"
-    ) {
-      onRequestSection("tools");
-      return;
-    }
-    if (
-      filter === "tool" &&
-      references &&
-      references.tools.value !== undefined &&
-      references.mcpTools.value === undefined &&
-      !references.mcpTools.error &&
-      sectionLoading !== "mcpTools"
-    ) {
-      onRequestSection("mcpTools");
-    }
-  }, [filter, onRequestSection, references, sectionLoading]);
+  }, [direct, onRequestSection, references, sectionLoading]);
 
   return (
-    <aside className="reference-drawer" aria-label="Session context and references">
+    <aside ref={drawer} className="reference-drawer context-drawer" role="dialog" aria-modal="true" aria-label="Session context and references"
+      onKeyDown={(event) => {
+        if (event.key === "Escape") { event.preventDefault(); onClose(); }
+        if (event.key !== "Tab") return;
+        const targets = Array.from(drawer.current?.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), summary, [tabindex="0"]') ?? [])
+          .filter((element) => element.tabIndex >= 0 && element.getClientRects().length > 0);
+        const first = targets[0];
+        const last = targets[targets.length - 1];
+        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+      }}>
       <header className="reference-header">
         <div>
           <span>Session transparency</span>
@@ -173,41 +161,58 @@ export function ReferenceDrawer({
         </button>
       </header>
       <p className="reference-intro">
-        Runtime-visible commands, tasks, skills, tools, MCP servers, and instruction
-        sources. Select an item to reference it in the composer.
+        This session's context budget and tool controls, plus tasks, commands,
+        skills, MCP servers, and instruction sources.
       </p>
       <label className="reference-search">
         <Search size={15} />
         <input
           value={query}
           onChange={(event) => setQuery(event.currentTarget.value)}
-          placeholder="Search session capabilities"
+          aria-label={`Search ${kindMeta[filter].label.toLowerCase()}`}
+          placeholder={`Search ${kindMeta[filter].label.toLowerCase()}`}
         />
       </label>
-      <div className="reference-filters">
+      <div className="reference-filters" role="tablist" aria-label="Session references">
         {(Object.keys(kindMeta) as ReferenceItem["kind"][]).map((kind) => {
           const Icon = kindMeta[kind].icon;
           return (
             <button
               key={kind}
+              type="button"
+              role="tab"
+              id={`${tabId}-${kind}`}
+              aria-controls={`${tabId}-panel`}
+              aria-selected={filter === kind}
+              tabIndex={filter === kind ? 0 : -1}
               className={filter === kind ? "active" : ""}
               onClick={() => setFilter(kind)}
+              onKeyDown={(event) => {
+                const kinds = Object.keys(kindMeta) as ReferenceItem["kind"][];
+                const index = kinds.indexOf(kind);
+                const next = event.key === "ArrowRight" || event.key === "ArrowDown" ? (index + 1) % kinds.length
+                  : event.key === "ArrowLeft" || event.key === "ArrowUp" ? (index - 1 + kinds.length) % kinds.length
+                    : event.key === "Home" ? 0 : event.key === "End" ? kinds.length - 1 : -1;
+                if (next < 0) return;
+                event.preventDefault();
+                setFilter(kinds[next]);
+                document.getElementById(`${tabId}-${kinds[next]}`)?.focus();
+              }}
             >
               <Icon size={13} /> {kindMeta[kind].label}
             </button>
           );
         })}
       </div>
-      <div className="reference-list">
-        {loading && (
-          <div className="reference-placeholder">Reading session capabilities…</div>
-        )}
-        {!loading && sectionLoading && (
-          <div className="reference-placeholder">
-            {sectionLoadingLabel(sectionLoading)}
+      <div className="reference-list" role="tabpanel" id={`${tabId}-panel`} aria-labelledby={`${tabId}-${filter}`}>
+        {ownPanel ? <ContextToolsPanel key={sessionId ?? "no-session"} sessionId={sessionId} revision={revision}
+          tab={filter === "context" ? "context" : "tools"} query={query} refreshToken={refreshToken} /> : <>
+        {waiting && (
+          <div className="reference-placeholder" role="status">
+            {direct ? sectionLoadingLabel(direct) : "Reading session capabilities…"}
           </div>
         )}
-        {!loading &&
+        {
           visible.map((item, index) => {
             const Icon = kindMeta[item.kind].icon;
             return (
@@ -250,24 +255,21 @@ export function ReferenceDrawer({
               </details>
             );
           })}
-        {!loading && visible.length === 0 && (
+        {!waiting && !section?.error && visible.length === 0 && (
           <div className="reference-placeholder">
-            {filter === "task"
+            {filter === "task" && !query.trim()
               ? "No background tasks or subagent runs in this session."
               : "No matching capabilities."}
           </div>
         )}
-        {!loading && matching.length > visible.length && (
-          <div className="reference-placeholder">
-            Showing the first {visible.length} of {matching.length}. Narrow the search
-            or choose a category.
-          </div>
-        )}
-        {errors.map((error) => (
-          <div className="reference-error" key={error}>
-            {error}
-          </div>
-        ))}
+        {page.remaining > 0 && <button className="ct-load-more" onClick={() => setLimit(page.nextLimit)}>
+          Load more ({page.remaining} remaining)
+        </button>}
+        {section?.error && <div className="reference-error" role="alert">
+          Could not read {kindMeta[filter].label.toLowerCase()}: {section.error}
+          <button disabled={waiting} onClick={() => direct && onRequestSection(direct)}>Retry</button>
+        </div>}
+        </>}
       </div>
       <footer>
         <BookOpen size={13} />
@@ -275,7 +277,10 @@ export function ReferenceDrawer({
           The runtime exposes instruction <em>sources</em> and context attribution, not
           the complete assembled provider system prompt.
         </span>
-        <button onClick={onRefresh}>Refresh</button>
+        <button disabled={!ownPanel && waiting} onClick={() => {
+          if (ownPanel) setRefreshToken((current) => current + 1);
+          else onRefresh();
+        }}>Refresh</button>
       </footer>
     </aside>
   );
@@ -321,31 +326,6 @@ function flattenReferences(
       insert: `Using the ${name} MCP server, `,
     });
   }
-  const mcpTools = asRecord(references.mcpTools.value);
-  for (const [server, section] of Object.entries(mcpTools)) {
-    for (const tool of arrayAt(asRecord(section).value, "tools")) {
-      const name = stringAt(tool, "name");
-      if (!name) continue;
-      items.push({
-        kind: "tool",
-        name: `${server}/${name}`,
-        description: stringAt(tool, "description") || "MCP tool",
-        detail: tool,
-        insert: `Use the ${server}/${name} tool to `,
-      });
-    }
-  }
-  for (const tool of arrayAt(references.tools.value, "tools")) {
-    const name = stringAt(tool, "name");
-    if (!name) continue;
-    items.push({
-      kind: "tool",
-      name,
-      description: stringAt(tool, "description"),
-      detail: tool,
-      insert: `Use the ${name} tool to `,
-    });
-  }
   for (const source of arrayAt(references.instructions.value, "sources")) {
     const path = stringAt(source, "sourcePath");
     if (!path) continue;
@@ -355,19 +335,6 @@ function flattenReferences(
       description: stringAt(source, "type") || "Instruction source",
       detail: source,
       insert: `Follow the instructions from ${path} and `,
-    });
-  }
-  const context = references.contextAttribution.value;
-  const entries = arrayAt(context, "entries");
-  for (const entry of entries) {
-    const name =
-      stringAt(entry, "label") || stringAt(entry, "name") || stringAt(entry, "type");
-    if (!name) continue;
-    items.push({
-      kind: "context",
-      name,
-      description: contextDescription(entry),
-      detail: entry,
     });
   }
   for (const task of arrayAt(references.tasks.value, "tasks")) {
@@ -502,11 +469,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function stringAt(value: unknown, key: string): string {
   const item = asRecord(value)[key];
   return typeof item === "string" ? item : "";
-}
-
-function contextDescription(entry: Record<string, unknown>): string {
-  const tokens = entry.tokens ?? entry.tokenCount;
-  return typeof tokens === "number" ? `${tokens.toLocaleString()} tokens` : "Context source";
 }
 
 function ReferenceValue({ value }: { value: unknown }) {

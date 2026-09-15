@@ -2,6 +2,7 @@ import type { DaemonEvent } from "./types";
 
 const LOCAL_DAEMON = "http://127.0.0.1:3847";
 const CLIENT_ID_KEY = "copilot-sessions.client-id";
+const EVENT_SEQUENCE_KEY = "copilot-sessions.event-sequence";
 
 export function daemonClientId(): string {
   try {
@@ -44,11 +45,13 @@ export class DaemonError extends Error {
 export async function daemonInvoke<T>(
   command: string,
   args: Record<string, unknown> = {},
+  signal?: AbortSignal,
 ): Promise<T> {
   const response = await fetch(
     `${daemonBaseUrl()}/api/${encodeURIComponent(command)}`,
     {
       method: "POST",
+      signal,
       credentials: "include",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(args),
@@ -76,20 +79,49 @@ export async function daemonLogin(token: string): Promise<void> {
 export function subscribeToDaemon(
   onEvent: (event: DaemonEvent) => void,
   onConnection: (connected: boolean) => void,
+  diagnostics = false,
 ): () => void {
-  const source = new EventSource(`${daemonBaseUrl()}/api/events`, {
+  const url = new URL(`${daemonBaseUrl()}/api/events`);
+  if (diagnostics) url.searchParams.set("diagnostics", "true");
+  let latestSequence: number | undefined;
+  let persistTimer: ReturnType<typeof setTimeout> | undefined;
+  const persistCursor = () => {
+    persistTimer = undefined;
+    if (latestSequence === undefined) return;
+    try {
+      sessionStorage.setItem(EVENT_SEQUENCE_KEY, String(latestSequence));
+    } catch {
+      // EventSource's Last-Event-ID still resumes an open connection.
+    }
+  };
+  try {
+    const sequence = sessionStorage.getItem(EVENT_SEQUENCE_KEY);
+    if (sequence) url.searchParams.set("after", sequence);
+  } catch {
+    // EventSource still provides in-connection replay through Last-Event-ID.
+  }
+  const source = new EventSource(url, {
     withCredentials: true,
   });
   source.onopen = () => onConnection(true);
   source.onerror = () => onConnection(false);
   source.addEventListener("session-event", (raw) => {
     try {
-      onEvent(JSON.parse((raw as MessageEvent<string>).data) as DaemonEvent);
+      const event = JSON.parse((raw as MessageEvent<string>).data) as DaemonEvent;
+      onEvent(event);
+      if (typeof event.sequence === "number") {
+        latestSequence = event.sequence;
+        persistTimer ??= setTimeout(persistCursor, 250);
+      }
     } catch (error) {
       console.error("Invalid daemon event", error);
     }
   });
-  return () => source.close();
+  return () => {
+    source.close();
+    if (persistTimer !== undefined) clearTimeout(persistTimer);
+    persistCursor();
+  };
 }
 
 export function isTauri(): boolean {

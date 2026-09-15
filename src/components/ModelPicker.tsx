@@ -1,7 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { Brain, Check, Cpu, Maximize2, Search, X } from "lucide-react";
 import { daemonInvoke } from "../lib/daemon";
-import type { ModelInfo } from "../lib/types";
+import {
+  labelModelValue,
+  normalizeModelOptions,
+  type ModelOption,
+} from "../lib/models";
+import type { ModelInfo, ReasoningSummary } from "../lib/types";
 
 interface ModelPickerProps {
   sessionId: string;
@@ -9,21 +14,13 @@ interface ModelPickerProps {
   onChanged: (modelId: string) => void;
 }
 
-interface ModelOption {
-  id: string;
-  name: string;
-  description: string;
-  unavailable: boolean;
-  reasoningEfforts: string[];
-  contextTiers: string[];
-  defaultReasoningEffort?: string;
-}
-
 export function ModelPicker({ sessionId, onClose, onChanged }: ModelPickerProps) {
   const [info, setInfo] = useState<ModelInfo | null>(null);
   const [query, setQuery] = useState("");
   const [selectedModel, setSelectedModel] = useState("");
   const [reasoningEffort, setReasoningEffort] = useState("");
+  const [reasoningSummary, setReasoningSummary] =
+    useState<ReasoningSummary>("detailed");
   const [contextTier, setContextTier] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -34,12 +31,16 @@ export function ModelPicker({ sessionId, onClose, onChanged }: ModelPickerProps)
         setInfo(next);
         setSelectedModel(next.current.modelId ?? "");
         setReasoningEffort(next.current.reasoningEffort ?? "");
+        setReasoningSummary(next.current.reasoningSummary ?? "detailed");
         setContextTier(next.current.contextTier ?? "");
       })
       .catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)));
   }, [sessionId]);
 
-  const options = useMemo(() => normalizeModels(info), [info]);
+  const options = useMemo(
+    () => normalizeModelOptions(info?.available.list),
+    [info],
+  );
   const visible = options.filter((model) => {
     const needle = query.trim().toLowerCase();
     return (
@@ -61,6 +62,7 @@ export function ModelPicker({ sessionId, onClose, onChanged }: ModelPickerProps)
     setContextTier((current) =>
       current && model.contextTiers.includes(current) ? current : "",
     );
+    setReasoningSummary(model.reasoningEfforts.length > 0 ? "detailed" : "none");
   }
 
   async function apply() {
@@ -74,6 +76,7 @@ export function ModelPicker({ sessionId, onClose, onChanged }: ModelPickerProps)
           sessionId,
           modelId: selectedModel,
           reasoningEffort: reasoningEffort || null,
+          reasoningSummary,
           contextTier: contextTier || null,
         },
       );
@@ -152,9 +155,25 @@ export function ModelPicker({ sessionId, onClose, onChanged }: ModelPickerProps)
               <option value="">Model default</option>
               {selectedOption?.reasoningEfforts.map((effort) => (
                 <option value={effort} key={effort}>
-                  {labelValue(effort)}
+                  {labelModelValue(effort)}
                 </option>
               ))}
+            </select>
+          </label>
+          <label>
+            <span>
+              <Brain size={13} /> Visible summary
+            </span>
+            <select
+              value={reasoningSummary}
+              onChange={(event) =>
+                setReasoningSummary(event.currentTarget.value as ReasoningSummary)
+              }
+              disabled={!selectedOption || selectedOption.reasoningEfforts.length === 0}
+            >
+              <option value="detailed">Detailed</option>
+              <option value="concise">Concise</option>
+              <option value="none">Off</option>
             </select>
           </label>
           <label>
@@ -169,7 +188,7 @@ export function ModelPicker({ sessionId, onClose, onChanged }: ModelPickerProps)
               <option value="">Model default</option>
               {selectedOption?.contextTiers.map((tier) => (
                 <option value={tier} key={tier}>
-                  {labelValue(tier)}
+                  {labelModelValue(tier)}
                 </option>
               ))}
             </select>
@@ -196,49 +215,4 @@ export function ModelPicker({ sessionId, onClose, onChanged }: ModelPickerProps)
       </section>
     </div>
   );
-}
-
-function normalizeModels(info: ModelInfo | null): ModelOption[] {
-  if (!info || !Array.isArray(info.available.list)) return [];
-  return info.available.list.flatMap((value) => {
-    if (!value || typeof value !== "object") return [];
-    const model = value as Record<string, unknown>;
-    const id = stringValue(model.id) || stringValue(model.modelId);
-    if (!id) return [];
-    return [
-      {
-        id,
-        name:
-          stringValue(model.displayName) ||
-          stringValue(model.name) ||
-          stringValue(model.modelName) ||
-          id,
-        description:
-          stringValue(model.description) ||
-          stringValue(model.previewLabel) ||
-          "Available to this session",
-        unavailable:
-          model.available === false || model.enabled === false || model.selectable === false,
-        reasoningEfforts: stringArray(model.supportedReasoningEfforts),
-        contextTiers: stringArray(model.supportedContextTiers),
-        defaultReasoningEffort: stringValue(model.defaultReasoningEffort) || undefined,
-      },
-    ];
-  });
-}
-
-function stringValue(value: unknown): string {
-  return typeof value === "string" ? value : "";
-}
-
-function stringArray(value: unknown): string[] {
-  return Array.isArray(value)
-    ? value.filter((item): item is string => typeof item === "string")
-    : [];
-}
-
-function labelValue(value: string): string {
-  return value
-    .replace(/[_-]+/g, " ")
-    .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }

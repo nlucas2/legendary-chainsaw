@@ -25,22 +25,76 @@ Mobile/web browser ──┘                                  │
   pane. Each Copilot session gets its own lazy daemon-owned PTY. Closing the pane detaches it;
   revisiting the session restores the same process, environment, CWD, and up to 2 MiB of scrollback.
   OSC-7 shell updates can move the Copilot session's working directory with **Track CWD** enabled.
+  Desktop layout controls place it above, below, or beside the conversation without recreating the terminal.
+  Above is the default for clients without a saved layout; existing saved placement is preserved.
+  Drag the divider, or focus it and use the arrow keys (Shift for larger steps). Placement and size
+  are saved locally.
 - **Multiple clients** may observe the same session. A terminal grants input control to one tab at a
   time while other attached clients remain read-only; permission and runtime state resolves across
   every open interface.
+- **Catch up** merges recent persisted history into the live transcript without restarting the
+  shared Copilot runtime or detaching other sessions.
+  History is anchored to recent root-user messages rather than arbitrary telemetry pages; the header
+  reports attachment/activity state and the loaded timestamp, turn count, and remaining older history.
+- **Live events** use the SDK's forward event-log cursor and a sequenced replay bus. Model-call
+  boundaries do not mark the whole session idle: session lifecycle events drive the composer status,
+  with a periodic authoritative snapshot for recovery. Accepted, model-started, and first-output
+  timings distinguish runtime/model latency from UI latency. Heavy diagnostic payloads are opt-in.
 - **Models** are resolved from the live session rather than labeled "default." The header opens the
   session-specific model catalog and switches via the Copilot runtime.
+- **Context & Tools** shows runtime token attribution and session-scoped tool availability. Tool
+  filters affect future offered tools, not in-flight execution; disabling an MCP server is separate
+  from changing user-wide MCP configuration. The current tool list does not wait for full MCP
+  catalogs: optional discovery uses a shared cache with bounded background requests and publishes updates
+  through the daemon event bus. Slow or failing servers show warnings without hiding the controls.
+  Reopening the drawer retains its last snapshot while refreshing authoritative state.
+- **Chat while working** supports FIFO queueing and explicit immediate steering. Queued messages can
+  be edited, moved earlier, removed, or sent to the running turn. Selected files and pasted images are
+  sent as SDK attachments only when the message is submitted. Draft text and files stay together
+  per session while the client remains open; failed sends are restored or retained as separate unsent
+  drafts without overwriting newer text. Ctrl+S stashes the complete session draft, including files.
+- **`/ask <question>`** runs a transient, no-tools query against the current conversation without
+  adding a chat turn. The Ask button opens a question draft. Answers live only in the panel.
+  The pinned runtime cannot correlate its broadcast query chunks to a caller, so the panel waits
+  for the request's final answer instead of risking another client's output. Closing it does not
+  stop the parent; cancellation is not exposed by this runtime API.
+- **Fork conversation** (or `/fork`) creates an independent native context copy without changing
+  the parent. Forking requires an idle session. It does not make a Git branch or copy terminal
+  processes, and inherited pending work is never automatically resumed. After an explicit new
+  message is accepted in the fork, recovery of that fork's own subsequent work is enabled.
+- **Subagent navigation** belongs to each session: expand its sidebar row to see running and idle
+  agents, or select **Show finished** to browse completed work. Selecting an agent opens its own
+  conversation and a directly addressed text composer while the parent continues running. Parent
+  and child drafts remain separate, and **Back to parent** restores the parent view. Messaging
+  availability comes from the runtime; completed or unsupported tasks are read-only.
+- **Questions and approvals** are separate from tool argument displays. Pending questions appear in
+  a visible input panel above the conversation, including while viewing a subagent. Choices remain
+  unselected until you answer; free-form replies are available when the runtime permits them.
 - **Organization metadata** is app-owned and non-invasive: sessions can be pinned and assigned a
   folder and tags without modifying the underlying Copilot transcript.
+  The pencil beside the session title (or on its selected sidebar row) edits the session's name.
+- **Git workspace** discovers the repository from the session's current directory. Its read-only
+  views cover staged, unstaged and untracked paths, plus a PR-style **committed** comparison from
+  the selected target's merge base to HEAD. Choose a local target ref; the tracking upstream may
+  not be the intended PR target. There is no fetch, stage, commit, or push action.
+  Diffs load only for a selected file and are bounded. Binary files, untracked contents, conflicts
+  and submodule contents are explicitly unavailable rather than opened unsafely.
+  Select changed lines to save local review comments; **Ask about comment/diff** opens a transient
+  question draft for explicit submission. Notes stay in this client, tied to the exact diff snapshot,
+  and are never posted to GitHub or written into repository files.
 - **Appearance** follows mkb's Auto / Light / Dark model. Auto tracks the OS, and Light uses mkb's
   warm Catppuccin-Latte-inspired paper palette. The preference follows open browser tabs.
+  **Font & spacing** offers an optional CLI-like monospace preset, custom local font families,
+  chat size/line/paragraph spacing, and independent terminal typography. Changes apply immediately;
+  terminal font changes resize the existing terminal instead of restarting it. No CLI settings
+  are inspected and no fonts are downloaded.
 
 ## Process lifecycle and updates
 
 `copilot-sessionsd` is explicitly long-lived and never exits because every UI detached or because it
 was idle. Closing Tauri or a browser does not stop Copilot, MCP servers, or terminal processes.
 
-The **Runtime maintenance** panel provides the only child-process lifecycle controls:
+The **Runtime maintenance** panel provides explicit child-process lifecycle controls:
 
 - **Reload MCP servers** reloads MCP hosts across active sessions without restarting the daemon.
 - **Drain & disconnect Copilot** pauses new prompts, waits for active turns, then disconnects
@@ -56,14 +110,68 @@ continues running. Across a daemon restart, CWD and scrollback are restored but 
 environment and running programs cannot be serialized; native shell history remains available
 through the shell's normal history mechanism.
 
+### One-command Windows update
+
+After saving drafts and terminal work, run this from a **separate Windows Terminal / PowerShell
+window**, not this app's terminal or an agent tool running inside the app:
+
+```powershell
+just update
+```
+
+`just update-check` checks prerequisites and current blockers without building or changing processes.
+Without `just`, use `pwsh -NoProfile -File .\scripts\update-desktop.ps1`.
+
+The updater checks process ancestry and the owner of port 3847, rejects queued/background work and
+visible terminal child programs, prebuilds the frontend/daemon, then requests a **non-forced** drain
+and terminal checkpoint. A blocked drain is cancelled without closing the app. It stops only the
+identified app/daemon processes from this checkout, builds the matching desktop bundle, reopens it,
+and waits for runtime readiness. It does not install dependencies or commit/push changes.
+
+The update closes all desktop windows from this checkout. Unsent drafts and shell variables are
+not preserved; terminal CWD and scrollback are checkpointed into fresh shells. Process checks cannot
+detect all in-process shell work, so finish terminal work first. If a build fails, the command stops
+with the error instead of launching a potentially incomplete update. Fix the error and rerun it.
+If preparation itself errors or times out, no app/daemon process is killed; use **Cancel drain** in
+Runtime maintenance if new prompts remain paused. Authenticated listeners use
+`COPILOT_SESSIONS_TOKEN` from the external terminal's environment.
+
 ## Prerequisites
 
 - Rust 1.94+
-- Node.js 18+
+- Node.js 24+ (including the built-in TypeScript-aware test runner)
 - A GitHub Copilot subscription and authenticated Copilot CLI environment
 - Tauri platform prerequisites for desktop builds
 
 The official Rust Copilot SDK bundles its compatible CLI by default.
+This may differ from the separately installed `copilot` executable. Runtime maintenance exposes
+runtime provenance and startup timings; do not assume a CLI update changes the bundled runtime.
+Plan and Autopilot use native session modes, but a mode transition requiring a compaction
+confirmation is not yet supported. The client displays the limitation instead of guessing a
+confirmation value or starting a follow-up implementation turn automatically.
+
+## Keyboard workflow
+
+The prompt keeps focus while a session runs. Enter submits using the selected delivery mode;
+Shift+Enter inserts a newline. Ctrl+Q explicitly queues; Ctrl+Enter steers the running turn.
+Tab or Shift+Tab cycles agent modes in the composer. Ctrl+S stashes/restores the draft, Ctrl+R
+cycles recent submitted prompts, and F6 / Shift+F6 moves between workspace regions.
+Terminal-focused keystrokes stay with the terminal except its explicit toggle shortcut.
+Press `?` outside text inputs for the shortcut list. Touch controls remain available.
+
+## Regression tests
+
+```powershell
+npm test
+cargo test -p copilot-sessions-core -p copilot-sessionsd
+```
+
+`npm run test:ui` exercises a disposable session against an isolated daemon on
+`127.0.0.1:3848`, using an installed Microsoft Edge browser. Start that daemon with
+`COPILOT_SESSIONS_DATA_DIR` set to a disposable directory and a current web build.
+The browser tests submit a small number of model prompts and delete their own session.
+They refuse to target the normal app port. The data-directory setting isolates app
+metadata and terminal checkpoints, not the SDK's own session store.
 
 ## Development
 
@@ -105,6 +213,7 @@ non-loopback address, the daemon refuses to start unless this token is configure
 | `COPILOT_SESSIONS_BIND` | `127.0.0.1:3847` | Daemon HTTP address |
 | `COPILOT_SESSIONS_TOKEN` | unset | Shared web access token |
 | `COPILOT_SESSIONS_UI_DIR` | `dist` | Built web assets to serve |
+| `COPILOT_SESSIONS_DATA_DIR` | platform local app data | App metadata and terminal checkpoint directory |
 | `COPILOT_SESSIONSD_PATH` | auto-detected | Tauri override for the daemon executable |
 
 ## Build
