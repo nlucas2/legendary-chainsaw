@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mergeHistoryEvents } from "../src/lib/history.ts";
+import { mergeHistoryEvents, reconcileOptimisticUserEvents } from "../src/lib/history.ts";
 
 const event = (id, timestamp = "2026-09-04T01:00:00Z") => ({ id, type: "test", data: {}, timestamp });
 const ids = (events) => events.map((event) => event.id);
@@ -24,4 +24,14 @@ test("ephemeral reasoning stays between shared log anchors", () => {
 test("canonical order wins over a previously misordered shared prefix", () => {
   assert.deepEqual(ids(mergeHistoryEvents([event("a"), event("b"), event("c")],
     [event("b"), event("a"), event("c")])), ["a", "b", "c"]);
+});
+
+test("agent instructions cannot consume a matching optimistic human message", () => {
+  const optimistic = { ...event("optimistic-user-one"), type: "user.message", data: { content: "same text" } };
+  const real = { ...event("real"), type: "user.message", data: { content: "same text" } };
+  for (const source of ["agent-root", "skill-pdf", "custom-producer"]) {
+    assert.deepEqual(reconcileOptimisticUserEvents([optimistic], [{ ...real, data: { ...real.data, source } }]), [optimistic]);
+  }
+  assert.deepEqual(reconcileOptimisticUserEvents([optimistic], [{ ...real, agentId: "child" }]), [optimistic]);
+  assert.deepEqual(reconcileOptimisticUserEvents([optimistic], [real]), []);
 });

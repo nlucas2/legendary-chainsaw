@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   parseUnifiedDiff, diffIdentity, createGitComment, gitAskDraft,
   loadGitComments, saveGitComments, GIT_COMMENTS_KEY, visiblePath, visibleBidi,
+  comparisonTargetGroups, assertGitDiffMatches, gitFilesForView,
 } from "../src/lib/gitWorkspace.ts";
 
 const patch = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,3 +1,3 @@\n context\n-old\n+new\n tail\n@@ -20,0 +21,2 @@\n+++looks like header\n+last\n\\ No newline at end of file\n";
@@ -37,7 +38,7 @@ test("comment identity includes repository, path, view, base, HEAD and content",
   })) assert.notEqual(diffIdentity(diff), diffIdentity({ ...diff, [field]: value }), field);
 });
 
-test("comments persist bounded line locations and reject empty or context-only selection", () => {
+test("comments persist bounded code-line locations and reject empty or metadata selection", () => {
   const lines = parseUnifiedDiff(patch);
   const comment = createGitComment(diff, lines, new Set([5, 6]), " Check this change ");
   assert.deepEqual(comment.locations.map((line) => line.location), ["old:2", "new:2"]);
@@ -45,7 +46,8 @@ test("comments persist bounded line locations and reject empty or context-only s
   const client = storage();
   saveGitComments(client, [comment]);
   assert.deepEqual(loadGitComments(client), [comment]);
-  assert.throws(() => createGitComment(diff, lines, new Set([4]), "context"), /changed line/);
+  assert.deepEqual(createGitComment(diff, lines, new Set([4]), "context").locations.map((line) => line.location), ["old:1 new:1"]);
+  assert.throws(() => createGitComment(diff, lines, new Set([0]), "metadata"), /code line/);
   assert.throws(() => createGitComment(diff, lines, new Set([5]), ""), /Enter a comment/);
   assert.throws(() => createGitComment(diff, lines, new Set([5]), "x".repeat(4001)), /limited/);
   assert.throws(() => saveGitComments(client, Array.from({ length: 101 }, () => comment)), /Invalid local/);
@@ -90,4 +92,61 @@ test("bidirectional formatting controls in filenames are visibly escaped", () =>
   assert.equal(visiblePath("\u2066a\u2067b\u2068c\u2069\u200e\u200f\u061c"),
     "\\u2066a\\u2067b\\u2068c\\u2069\\u200e\\u200f\\u061c");
   assert.equal(visibleBidi("\tcode \u202e literal"), "\tcode \\u202e literal");
+});
+
+test("existing main and remote default refs are prioritized without inventing targets", () => {
+  const refs = ["refs/heads/zeta", "refs/remotes/origin/feature", "refs/heads/main",
+    "refs/remotes/origin/main", "refs/remotes/origin/HEAD", "refs/heads/alpha"]
+    .map((name) => ({ name, commit: "a".repeat(40) }));
+  const original = structuredClone(refs);
+  const groups = comparisonTargetGroups(refs, "refs/remotes/origin/feature");
+  assert.deepEqual(groups.suggested.map((ref) => ref.name), [
+    "refs/remotes/origin/HEAD", "refs/remotes/origin/main", "refs/heads/main", "refs/remotes/origin/feature",
+  ]);
+  assert.deepEqual(groups.other.map((ref) => ref.name), ["refs/heads/alpha", "refs/heads/zeta"]);
+  assert.deepEqual(refs, original);
+  assert.deepEqual(comparisonTargetGroups([], null), { suggested: [], other: [] });
+});
+
+test("full context must be acknowledged by the daemon and comparison snapshots must match", () => {
+  assert.doesNotThrow(() => assertGitDiffMatches(diff, diff, "unstaged", "a", "changes"));
+  assert.throws(() => assertGitDiffMatches(diff, diff, "unstaged", "a", "full"), /does not support/);
+  assert.doesNotThrow(() => assertGitDiffMatches({ ...diff, context: "full" }, diff, "unstaged", "a", "full"));
+  assert.throws(() => assertGitDiffMatches({ ...diff, view: "compare", mergeBase: "changed" }, diff, "compare", "a", "changes"), /comparison target/);
+});
+
+test("unstaged includes untracked rows while preserving each preview's source view", () => {
+  const tracked = { path: "tracked.rs", status: "M", kind: "file" };
+  const added = { path: "new.rs", status: "?", kind: "untracked" };
+  const workspace = {
+    unstaged: [tracked], untracked: [added], staged: [{ ...tracked, status: "A" }], compare: [],
+  };
+  const before = structuredClone(workspace);
+  assert.deepEqual(gitFilesForView(workspace, "unstaged"), [
+    { ...tracked, view: "unstaged" }, { ...added, view: "untracked" },
+  ]);
+  assert.deepEqual(gitFilesForView(workspace, "untracked"), [{ ...added, view: "untracked" }]);
+  assert.deepEqual(gitFilesForView(workspace, "staged"), [{ ...tracked, status: "A", view: "staged" }]);
+  assert.deepEqual(gitFilesForView(workspace, "compare"), []);
+  assert.deepEqual(gitFilesForView(null, "unstaged"), []);
+  assert.deepEqual(workspace, before);
+  workspace.untracked.push({ ...added, path: tracked.path });
+  assert.equal(gitFilesForView(workspace, "unstaged").length, 2);
+  workspace.unstaged = [];
+  assert.equal(gitFilesForView(workspace, "unstaged")[0].view, "untracked");
+});
+
+test("untracked additions support line comments and retain their identity in review drafts", () => {
+  const added = { ...diff, view: "untracked", kind: "untracked", patch: "--- /dev/null\n+++ b/a\n@@ -0,0 +1,3 @@\n+first\n+++header-like content\n+last\n\\ No newline at end of file\n" };
+  const lines = parseUnifiedDiff(added.patch);
+  assert.deepEqual(lines.filter((line) => line.kind === "add").map((line) => line.newLine), [1, 2, 3]);
+  const note = createGitComment(added, lines, new Set([4]), "Question about the new file");
+  const question = gitAskDraft(added, lines, new Set(), note);
+  assert.match(question, /new, untracked file shown as additions/);
+  assert.match(question, /has not been staged/);
+  assert.match(question, /"view":"untracked"/);
+  assert.match(question, /new:2/);
+  assert.match(question, /Question about the new file/);
+  assert.doesNotThrow(() => assertGitDiffMatches(added, diff, "untracked", "a", "changes"));
+  assert.throws(() => assertGitDiffMatches(added, diff, "unstaged", "a", "changes"), /does not match/);
 });

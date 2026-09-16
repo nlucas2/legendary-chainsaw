@@ -5,6 +5,7 @@ import {
   normalizeTypography,
   parseTypographyPreferences,
   readTypographyPreferences,
+  typographyAttributes,
   typographyVariables,
   writeTypographyPreferences,
   type TypographyLoadResult,
@@ -77,17 +78,20 @@ export function useTypography(): TypographyController {
   useEffect(() => {
     const root = document.documentElement;
     const variables = typographyVariables(settings);
-    const previousMode = root.getAttribute("data-typography");
+    const attributes = typographyAttributes(settings);
+    const previousAttributes = Object.keys(attributes).map((key) => [key, root.getAttribute(key)] as const);
     const previous = Object.keys(variables).map((key) => [key, root.style.getPropertyValue(key)] as const);
-    if (settings.preset !== "default") root.setAttribute("data-typography", "custom");
+    for (const [key, value] of Object.entries(attributes)) root.setAttribute(key, value);
     for (const [key, value] of Object.entries(variables)) root.style.setProperty(key, value);
     return () => {
       for (const [key, value] of previous) {
         if (value) root.style.setProperty(key, value);
         else root.style.removeProperty(key);
       }
-      if (previousMode === null) root.removeAttribute("data-typography");
-      else root.setAttribute("data-typography", previousMode);
+      for (const [key, value] of previousAttributes) {
+        if (value === null) root.removeAttribute(key);
+        else root.setAttribute(key, value);
+      }
     };
   }, [settings]);
 

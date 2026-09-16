@@ -1,4 +1,5 @@
 import type { ChatAttachment } from "./types.ts";
+import type { ReviewChatContext } from "./reviewChat.ts";
 
 export const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 export const MAX_ATTACHMENTS = 5;
@@ -7,6 +8,7 @@ export const MAX_TOTAL_ATTACHMENT_BYTES = 12 * 1024 * 1024;
 export interface AttachmentDraft extends ChatAttachment {
   id: string;
   size: number;
+  reviewContext?: ReviewChatContext;
 }
 
 export function validateAttachments(

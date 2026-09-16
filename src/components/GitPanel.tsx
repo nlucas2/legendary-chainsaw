@@ -1,302 +1,294 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { GitBranch, RefreshCw, X } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChevronLeft, ChevronRight, GitBranch, RefreshCw, X } from "lucide-react";
 import { daemonInvoke } from "../lib/daemon";
 import {
-  createGitComment, diffIdentity, gitAskDraft, gitViewLabels, lineLocation,
-  loadGitComments, MAX_COMMENT_LENGTH, MAX_COMMENTS, parseUnifiedDiff,
-  saveGitComments, visiblePath, visibleBidi,
+  comparisonTargetGroups, gitFilesForView, gitViewLabels, loadGitComments, MAX_COMMENTS, GIT_COMMENTS_KEY, saveGitComments, visiblePath,
   type GitComment, type GitDiff, type GitView, type GitWorkspace,
 } from "../lib/gitWorkspace";
+import { createGitDiffLoader } from "../lib/gitDiffLoader";
+import { GitFileReview } from "./GitFileReview";
+import { GitDiffFeed, type GitDiffNavigation } from "./GitDiffFeed";
+import { GitReviewNotes } from "./GitReviewNotes";
+import type { ReviewChatContext } from "../lib/reviewChat";
 import "./git-panel.css";
 
 export interface GitPanelProps {
   sessionId: string;
   cwd: string;
   onClose: () => void;
-  onAsk: (question: string) => void;
-}
-
-function message(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  onAsk: (question: string, context?: ReviewChatContext) => void;
+  onDiscuss: (context: ReviewChatContext) => void;
 }
 
 export function GitPanel(props: GitPanelProps) {
-  // A CWD change is a different inspection scope, even within the same session.
   return <WorkspacePanel key={JSON.stringify([props.sessionId, props.cwd])} {...props} />;
 }
 
-function WorkspacePanel({ sessionId, cwd, onClose, onAsk }: GitPanelProps) {
+function useCompactGit() {
+  const [compact, setCompact] = useState(() => window.matchMedia("(max-width: 760px)").matches);
+  useEffect(() => {
+    const query = window.matchMedia("(max-width: 760px)");
+    const update = () => setCompact(query.matches);
+    update();
+    query.addEventListener("change", update);
+    return () => query.removeEventListener("change", update);
+  }, []);
+  return compact;
+}
+
+function shortRef(name: string) {
+  return visiblePath(name.replace(/^refs\/(?:heads|remotes)\//, ""));
+}
+
+function mobileFileLabel(path: string) {
+  const separator = path.lastIndexOf("/");
+  return separator < 0 ? visiblePath(path)
+    : `${visiblePath(path.slice(separator + 1))} — ${visiblePath(path.slice(0, separator))}`;
+}
+
+function WorkspacePanel({ sessionId, cwd, onClose, onAsk, onDiscuss }: GitPanelProps) {
+  const compact = useCompactGit();
   const [workspace, setWorkspace] = useState<GitWorkspace | null>(null);
   const [base, setBase] = useState("");
   const [revision, setRevision] = useState(0);
   const [view, setView] = useState<GitView>("unstaged");
+  const [layout, setLayout] = useState<"file" | "continuous">("file");
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
-  const [diff, setDiff] = useState<GitDiff | null>(null);
+  const [navigation, setNavigation] = useState<GitDiffNavigation | null>(null);
   const [loading, setLoading] = useState(false);
-  const [diffLoading, setDiffLoading] = useState(false);
   const [error, setError] = useState("");
-  const [diffError, setDiffError] = useState("");
-  const [selected, setSelected] = useState<Set<number>>(new Set());
-  const [commentText, setCommentText] = useState("");
   const [comments, setComments] = useState<GitComment[]>([]);
   const [commentError, setCommentError] = useState("");
-  const [notice, setNotice] = useState("");
+  const [loadDiff] = useState(() => createGitDiffLoader<GitDiff>());
   const panel = useRef<HTMLElement>(null);
+  const fileList = useRef<HTMLDivElement>(null);
+  const options = useRef<HTMLDetailsElement>(null);
 
   useEffect(() => {
     const previous = document.activeElement;
     panel.current?.focus();
     return () => { if (previous instanceof HTMLElement && previous.isConnected) previous.focus(); };
   }, []);
-
   useEffect(() => {
-    try { setComments(loadGitComments(localStorage)); }
-    catch (error) { setCommentError(message(error)); }
+    const read = () => {
+      try { setComments(loadGitComments(localStorage)); setCommentError(""); }
+      catch (cause) { setCommentError(String(cause)); }
+    };
+    const onStorage = (event: StorageEvent) => { if (event.key === null || event.key === GIT_COMMENTS_KEY) read(); };
+    read();
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
   }, []);
-
   useEffect(() => {
     const controller = new AbortController();
-    let active = true;
     setLoading(true);
     setError("");
     setWorkspace(null);
     setSelectedPath(null);
-    setDiff(null);
-    setDiffError("");
-    setSelected(new Set());
-    setNotice("");
+    setNavigation(null);
     void daemonInvoke<GitWorkspace>("git_workspace", { sessionId, ...(base ? { base } : {}) }, controller.signal)
-      .then((result) => { if (active) setWorkspace(result); })
-      .catch((error) => { if (active && !controller.signal.aborted) setError(message(error)); })
-      .finally(() => { if (active) setLoading(false); });
-    return () => { active = false; controller.abort(); };
+      .then((result) => { if (!controller.signal.aborted) setWorkspace(result); })
+      .catch((cause) => { if (!controller.signal.aborted) setError(String(cause)); })
+      .finally(() => { if (!controller.signal.aborted) setLoading(false); });
+    return () => controller.abort();
   }, [sessionId, cwd, base, revision]);
 
+  const fileViews = useMemo(() => ({
+    staged: gitFilesForView(workspace, "staged"),
+    unstaged: gitFilesForView(workspace, "unstaged"),
+    compare: gitFilesForView(workspace, "compare"),
+    untracked: gitFilesForView(workspace, "untracked"),
+  }), [workspace]);
+  const files = fileViews[view];
+  const targets = useMemo(() => comparisonTargetGroups(workspace?.refs ?? [], workspace?.upstream ?? null), [workspace]);
+  const selectedIndex = files.findIndex((file) => file.path === selectedPath);
+  const selectedFile = files[selectedIndex];
+  const onActivePathChange = useCallback((path: string) => setSelectedPath(path), []);
   useEffect(() => {
-    const controller = new AbortController();
-    let active = true;
-    setDiff(null);
-    setDiffError("");
-    setSelected(new Set());
-    setNotice("");
-    if (!selectedPath || !workspace) { setDiffLoading(false); return; }
-    setDiffLoading(true);
-    void daemonInvoke<GitDiff>("git_diff", {
-      sessionId, view, path: selectedPath,
-      ...(workspace.base && workspace.baseCommit ? { base: workspace.base } : {}),
-    }, controller.signal)
-      .then((result) => {
-        if (!active) return;
-        if (result.path !== selectedPath || result.view !== view || result.repoRoot !== workspace.repoRoot) {
-          throw new Error("The Git response does not match this selection. Refresh before reviewing.");
-        }
-        if (view === "compare" && (result.baseCommit !== workspace.baseCommit ||
-            result.mergeBase !== workspace.mergeBase || result.head !== workspace.head)) {
-          throw new Error("The comparison target or HEAD changed after the file list loaded. Refresh the Git workspace before reviewing.");
-        }
-        setDiff(result);
-      })
-      .catch((error) => { if (active && !controller.signal.aborted) setDiffError(message(error)); })
-      .finally(() => { if (active) setDiffLoading(false); });
-    return () => { active = false; controller.abort(); };
-  }, [sessionId, selectedPath, view, workspace]);
-
-  const files = workspace?.[view] ?? [];
-  const lines = useMemo(() => parseUnifiedDiff(diff?.patch ?? ""), [diff]);
-  const identity = diff ? diffIdentity(diff) : "";
-  const currentComments = comments.filter((comment) => comment.identity === identity);
-  const olderComments = diff ? comments.filter((comment) => {
-    try {
-      const parts = JSON.parse(comment.identity);
-      return Array.isArray(parts) && parts[0] === diff.repoRoot && parts[1] === diff.path && comment.identity !== identity;
-    } catch { return false; }
-  }).length : 0;
-  const canAsk = !!diff && !!diff.patch && !diffLoading && !loading;
-
+    if (compact || layout !== "continuous" || !fileList.current) return;
+    const current = fileList.current.querySelector<HTMLElement>("[aria-current='location']");
+    if (!current) return;
+    const listBox = fileList.current.getBoundingClientRect();
+    const currentBox = current.getBoundingClientRect();
+    if (currentBox.top < listBox.top) fileList.current.scrollTop += currentBox.top - listBox.top;
+    else if (currentBox.bottom > listBox.bottom) fileList.current.scrollTop += currentBox.bottom - listBox.bottom;
+  }, [selectedPath, layout, compact]);
+  function selectFile(path: string) {
+    setSelectedPath(path);
+    if (layout === "continuous") setNavigation((previous) => ({ path, sequence: (previous?.sequence ?? 0) + 1 }));
+    else if (compact) panel.current?.scrollTo({ top: 0 });
+  }
   function changeView(next: GitView) {
     setSelectedPath(null);
-    setDiff(null);
+    setNavigation(null);
     setView(next);
-    setCommentText("");
+    if (compact) panel.current?.scrollTo({ top: 0 });
   }
-
-  function storeComment() {
-    if (!diff) return;
-    try {
-      const comment = createGitComment(diff, lines, selected, commentText);
-      const latest = loadGitComments(localStorage);
-      if (latest.length >= MAX_COMMENTS) throw new Error(`This client already has ${MAX_COMMENTS} Git comments. Remove older comments first.`);
-      const next = [...latest, comment];
-      saveGitComments(localStorage, next);
-      setComments(next);
-      setCommentText("");
-      setCommentError("");
-      setNotice("Comment saved in this browser only; nothing was posted or written to the repository.");
-    } catch (error) { setCommentError(message(error)); }
+  function changeLayout(next: "file" | "continuous") {
+    setNavigation(null);
+    setLayout(next);
+    panel.current?.scrollTo({ top: 0 });
   }
-
   function deleteComment(id: string) {
     try {
       const next = loadGitComments(localStorage).filter((comment) => comment.id !== id);
       saveGitComments(localStorage, next);
       setComments(next);
       setCommentError("");
-    } catch (error) { setCommentError(message(error)); }
+    } catch (cause) { setCommentError(String(cause)); }
   }
-
-  function ask(comment?: GitComment) {
-    if (!diff || !canAsk) return;
-    onAsk(gitAskDraft(diff, lines, selected, comment));
-    setNotice("Review question opened as a draft. Nothing was sent.");
-  }
-
-  return (<>
+  const reviewProps = workspace ? { sessionId, workspace, view, comments, onCommentsChange: setComments, onAsk, onDiscuss, load: loadDiff } : null;
+  const comparisonControls = workspace?.state === "repository" && <>
+    <div className="git-panel-metadata">
+      <p><strong>{workspace.detached ? "Detached HEAD" : visiblePath(workspace.branch ?? "No branch")}</strong>
+        {" · "}{workspace.unborn ? "Unborn branch (no commits)" : `HEAD ${workspace.head?.slice(0, 12) ?? "unavailable"}`}
+        <br /><span title={visiblePath(workspace.repoRoot ?? "")}>{visiblePath(workspace.repoRoot ?? "")}</span>
+      </p>
+      <label>Comparison target
+        <select aria-label="Comparison target" value={base} onChange={(event) => {
+          setBase(event.target.value);
+          if (compact && options.current) options.current.open = false;
+        }}>
+          <option value="">{workspace.upstream ? `Upstream: ${compact ? shortRef(workspace.upstream) : visiblePath(workspace.upstream)}` : "Choose a local target (no upstream)"}</option>
+          {targets.suggested.length > 0 && <optgroup label="Likely PR targets">
+            {targets.suggested.map((reference) => <option key={reference.name} value={reference.name}>
+              {compact ? shortRef(reference.name) : visiblePath(reference.name)}{reference.name.endsWith("/HEAD") ? " (remote default)" : ""}
+            </option>)}
+          </optgroup>}
+          {targets.other.length > 0 && <optgroup label="Other local refs">
+            {targets.other.map((reference) => <option key={reference.name} value={reference.name}>{compact ? shortRef(reference.name) : visiblePath(reference.name)}</option>)}
+          </optgroup>}
+        </select>
+      </label>
+    </div>
+    <p className="git-panel-explanation">Tracking upstream is a default, not necessarily your PR target. Main branches and remote defaults are listed first. Only already-local refs are used; no fetch or GitHub request is made.</p>
+  </>;
+  return <>
     <div className="git-panel-backdrop" aria-hidden="true" />
-    <section
-      ref={panel} tabIndex={-1} className="git-panel" role="dialog" aria-label="Git workspace" aria-modal="true"
+    <section ref={panel} tabIndex={-1} className="git-panel" role="dialog" aria-label="Git workspace" aria-modal="true"
       onKeyDown={(event) => {
         event.stopPropagation();
         if (event.key === "Escape") { event.preventDefault(); onClose(); }
         if (event.key === "Tab" && panel.current) {
           const controls = Array.from(panel.current.querySelectorAll<HTMLElement>("button:not(:disabled), select:not(:disabled), textarea:not(:disabled), input:not(:disabled), summary, [tabindex='0']"))
             .filter((element) => element.getClientRects().length > 0);
-          const first = controls[0];
-          const last = controls[controls.length - 1];
+          const first = controls[0], last = controls[controls.length - 1];
           if (event.shiftKey && (document.activeElement === first || document.activeElement === panel.current)) { event.preventDefault(); last?.focus(); }
           if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
         }
-      }}
-    >
+      }}>
       <header className="git-panel-header">
-        <h2><GitBranch size={18} /> Git workspace <span>Read only</span></h2>
-        <div className="git-panel-actions">
-          <button type="button" onClick={() => setRevision((value) => value + 1)} disabled={loading} aria-label="Refresh Git workspace"><RefreshCw size={16} /> Refresh</button>
-          <button type="button" onClick={onClose} aria-label="Close Git workspace"><X size={18} /></button>
+        <div className="git-panel-title-row">
+          <h2><GitBranch size={18} /><span className="git-panel-title">Git workspace</span><span className="git-read-only">Read only</span></h2>
+          <div className="git-panel-actions">
+            <button type="button" onClick={() => setRevision((value) => value + 1)} disabled={loading} aria-label="Refresh Git workspace" title="Refresh Git workspace"><RefreshCw size={16} /><span className="git-refresh-label">Refresh</span></button>
+            <button type="button" onClick={onClose} aria-label="Close Git workspace"><X size={18} /></button>
+          </div>
         </div>
+        {compact && workspace?.state === "repository" && <div className="git-mobile-toolbar">
+          <div className="git-mobile-view-controls">
+            <label>Changes<select aria-label="Git change view" value={view} onChange={(event) => changeView(event.target.value as GitView)}>
+              {(Object.keys(gitViewLabels) as GitView[]).map((tab) => <option key={tab} value={tab}>{gitViewLabels[tab]} ({fileViews[tab].length})</option>)}
+            </select></label>
+            <label>View<select aria-label="Diff layout" value={layout} onChange={(event) => {
+              changeLayout(event.target.value as "file" | "continuous");
+            }}>
+              <option value="file">One file</option><option value="continuous">Continuous diffs</option>
+            </select></label>
+          </div>
+          {files.length > 0 && <div className="git-mobile-file-controls">
+            <label>File{selectedIndex >= 0 ? ` ${selectedIndex + 1} of ${files.length}` : ` (${files.length})`}
+              <select aria-label="Choose file" title={selectedPath ? visiblePath(selectedPath) : undefined}
+                value={selectedPath ?? ""} onChange={(event) => selectFile(event.target.value)}>
+                <option value="" disabled>{layout === "continuous" ? "Jump to a file..." : "Select a file..."}</option>
+                {files.map((file) => <option key={file.path} value={file.path}>{mobileFileLabel(file.path)}{file.view === "untracked" ? " (untracked)" : ""}</option>)}
+              </select>
+            </label>
+            <button type="button" aria-label="Previous file" disabled={selectedIndex <= 0} onClick={() => selectFile(files[selectedIndex - 1].path)}><ChevronLeft size={18} /></button>
+            <button type="button" aria-label="Next file" disabled={selectedIndex < 0 || selectedIndex >= files.length - 1} onClick={() => selectFile(files[selectedIndex + 1].path)}><ChevronRight size={18} /></button>
+          </div>}
+          <details ref={options} className="git-mobile-options">
+            <summary>Comparison &amp; repository <span title={workspace.base ? visiblePath(workspace.base) : undefined}>
+              {workspace.base ? shortRef(workspace.base) : "No target"}
+            </span></summary>
+            <div className="git-mobile-options-body">
+              <p className="git-panel-cwd">Session directory: {visiblePath(cwd)}</p>
+              {comparisonControls}
+            </div>
+          </details>
+        </div>}
       </header>
-      <p className="git-panel-cwd" title={cwd}>Session directory: {visiblePath(cwd)}</p>
-      {loading && <p role="status">Inspecting local Git metadata…</p>}
+      <div className="git-panel-body">
+      {!compact && <p className="git-panel-cwd" title={visiblePath(cwd)}>Session directory: {visiblePath(cwd)}</p>}
+      {loading && <p role="status">Inspecting local Git metadata...</p>}
       {error && <p role="alert" className="git-panel-error">{error}</p>}
       {workspace?.state === "noRepo" && <p className="git-panel-empty">This session is not in a Git working tree.</p>}
       {workspace?.warnings.map((warning, index) => <p className="git-panel-warning" key={index}>{warning}</p>)}
       {workspace?.state === "repository" && <>
-        <div className="git-panel-metadata">
-          <p><strong>{workspace.detached ? "Detached HEAD" : visiblePath(workspace.branch ?? "No branch")}</strong>
-            {" · "}{workspace.unborn ? "Unborn branch (no commits)" : `HEAD ${workspace.head?.slice(0, 12) ?? "unavailable"}`}
-            <br /><span title={workspace.repoRoot ?? ""}>{visiblePath(workspace.repoRoot ?? "")}</span>
-          </p>
-          <label>Comparison target
-            <select aria-label="Comparison target" value={base} onChange={(event) => setBase(event.target.value)}>
-              <option value="">{workspace.upstream ? `Upstream: ${visiblePath(workspace.upstream)}` : "Choose a local target (no upstream)"}</option>
-              {workspace.refs.map((reference) => <option key={reference.name} value={reference.name}>{visiblePath(reference.name)}</option>)}
-            </select>
-          </label>
-        </div>
-        <p className="git-panel-explanation">
-          Tracking upstream is a default, not necessarily your PR target. Select the intended target above.
-          Only already-local refs are used; no fetch or GitHub request is made.
-        </p>
+        <GitReviewNotes workspace={workspace} comments={comments} onCommentsChange={setComments}
+          onDelete={deleteComment} onAsk={onAsk} onDiscuss={onDiscuss} />
+        {!compact && <>
+        {comparisonControls}
         <nav className="git-panel-tabs" aria-label="Git change views">
-          {(Object.keys(gitViewLabels) as GitView[]).map((tab) =>
-            <button type="button" key={tab} aria-pressed={view === tab} onClick={() => changeView(tab)}>
-              {gitViewLabels[tab]} <span>{workspace[tab].length}</span>
-            </button>)}
+          {(Object.keys(gitViewLabels) as GitView[]).map((tab) => <button type="button" key={tab} aria-pressed={view === tab}
+            onClick={() => changeView(tab)}>
+            {gitViewLabels[tab]} <span>{fileViews[tab].length}</span>
+          </button>)}
         </nav>
+        <div className="git-layout-switch" role="group" aria-label="Diff layout">
+          <button type="button" aria-pressed={layout === "file"} onClick={() => changeLayout("file")}>One file</button>
+          <button type="button" aria-pressed={layout === "continuous"} onClick={() => changeLayout("continuous")}>Continuous diffs</button>
+          <span>{layout === "continuous" ? "More files load as you scroll. The file list follows your position; select a filename to jump to its diff." : "Select a file to review."}</span>
+        </div>
+        </>}
         <p className="git-panel-view-description">
-          {view === "compare" ? <>
-            <strong>Committed changes only.</strong> merge-base(target, HEAD)..HEAD. Excludes staged, unstaged and untracked edits.
+          {view === "compare" ? <><strong>Committed changes only.</strong> merge-base(target, HEAD)..HEAD. Excludes staged, unstaged and untracked edits.
             {workspace.mergeBase && <> Merge base: <code>{workspace.mergeBase.slice(0, 12)}</code>.</>}
           </> : view === "staged" ? "Index vs HEAD — changes already staged. The panel cannot stage or commit."
-            : view === "unstaged" ? "Working tree vs index — changes not yet staged."
-              : "Untracked paths only. Their contents are not opened, avoiding symlink traversal and arbitrary file reads."}
+            : view === "unstaged" ? "Working tree changes not yet staged, including new untracked files. Tracked edits compare against the index; untracked text is shown as additions."
+              : "New, untracked files only. Regular text files can be previewed as additions; unsafe paths and unsupported contents remain unavailable."}
         </p>
         {view === "compare" && workspace.compareUnavailableReason && <p className="git-panel-warning">{workspace.compareUnavailableReason}</p>}
-        <div className="git-panel-content">
-          <div className="git-panel-files" aria-label={`${gitViewLabels[view]} files`}>
+        <div className={`git-panel-content${layout === "continuous" ? " continuous" : ""}`}>
+          <div ref={fileList} className="git-panel-files" hidden={compact && (layout === "continuous" || selectedPath !== null)} aria-label={`${gitViewLabels[view]} files`}>
             {!files.length && !(view === "compare" && workspace.compareUnavailableReason) && <p className="git-panel-empty">No files in this view.</p>}
-            {files.map((file) =>
-              <button type="button" className={`git-panel-file ${selectedPath === file.path ? "selected" : ""}`}
-                key={file.path} title={visiblePath(file.path)} aria-pressed={selectedPath === file.path}
-                onClick={() => { if (file.path !== selectedPath) setDiff(null); setSelectedPath(file.path); setCommentText(""); }}>
-                <span className="git-panel-file-status">{file.status}</span>
-                <span className="git-panel-file-path">
-                  {file.originalPath && <small>{visiblePath(file.originalPath)} → </small>}{visiblePath(file.path)}
-                  {file.kind !== "file" && <small> [{file.kind}]</small>}
-                </span>
-                <span className="git-panel-file-counts">{file.binary ? "binary" : <>
-                  {file.added !== null && <span className="git-added">+{file.added}</span>}
-                  {file.deleted !== null && <span className="git-deleted">−{file.deleted}</span>}
-                </>}</span>
-              </button>)}
+            {files.map((file) => <button type="button" className={`git-panel-file ${selectedPath === file.path ? "selected" : ""}`}
+              key={file.path} title={visiblePath(file.path)} aria-pressed={selectedPath === file.path}
+              aria-current={layout === "continuous" && selectedPath === file.path ? "location" : undefined}
+              onClick={() => selectFile(file.path)}>
+              <span className="git-panel-file-status">{file.status}</span>
+              <span className="git-panel-file-path">{file.originalPath && <small>{visiblePath(file.originalPath)} → </small>}{visiblePath(file.path)}
+                {file.view === "untracked" && <small> [untracked]</small>}
+                {file.kind !== "file" && file.kind !== "untracked" && <small> [{file.kind}]</small>}
+              </span>
+              <span className="git-panel-file-counts">{file.binary ? "binary" : <>
+                {file.view === "untracked" && file.added === null && <span className="git-added">new</span>}
+                {file.added !== null && <span className="git-added">+{file.added}</span>}
+                {file.deleted !== null && <span className="git-deleted">−{file.deleted}</span>}
+              </>}</span>
+            </button>)}
           </div>
           <div className="git-panel-review">
-            {!selectedPath && <p className="git-panel-empty">Select a file to load its bounded diff. Repository-wide patches are never loaded.</p>}
-            {diffLoading && <p role="status">Loading selected file diff…</p>}
-            {diffError && <p role="alert" className="git-panel-error">{diffError}</p>}
-            {diff && <>
-              <h3>{visiblePath(diff.path)} {diff.kind !== "file" && <small>({diff.kind})</small>}</h3>
-              {diff.head !== workspace.head && <p className="git-panel-warning">HEAD changed since the file list was loaded. This preview uses HEAD {diff.head?.slice(0, 12)}; refresh the workspace.</p>}
-              {diff.kind === "symlink" && <p className="git-panel-warning">Symlink: the patch shows link metadata/target text, not the target file's contents.</p>}
-              {diff.unavailableReason && <p className="git-panel-warning">{diff.unavailableReason}</p>}
-              {diff.warnings.map((warning, index) => <p className="git-panel-warning" key={index}>{warning}</p>)}
-              {diff.truncated && <p className="git-panel-warning" role="status">Partial preview — this diff was truncated. Omitted code will not be included in the review draft.</p>}
-              {diff.patch && <>
-                <div className="git-panel-diff-actions">
-                  <span>{selected.size} changed line{selected.size === 1 ? "" : "s"} selected</span>
-                  <button type="button" disabled={!selected.size} onClick={() => setSelected(new Set())}>Clear selection</button>
-                  <button type="button" disabled={!canAsk} onClick={() => ask()}>Ask about {selected.size ? "selected lines" : "this diff"}</button>
-                </div>
-                <div className="git-panel-diff" role="region" aria-label="Selected file unified diff" tabIndex={0}>
-                  {lines.map((line) => {
-                    const changed = line.kind === "add" || line.kind === "delete";
-                    return <div key={line.index} className={`git-diff-line ${line.kind} ${selected.has(line.index) ? "selected" : ""}`}>
-                      <span className="git-diff-select">{changed &&
-                        <input type="checkbox" checked={selected.has(line.index)}
-                          aria-label={`Select ${line.kind === "add" ? "added" : "deleted"} line ${lineLocation(line)}`}
-                          onChange={() => setSelected((before) => {
-                            const next = new Set(before);
-                            if (next.has(line.index)) next.delete(line.index); else next.add(line.index);
-                            return next;
-                          })} />}</span>
-                      <span className="git-diff-number" aria-hidden="true">{line.oldLine ?? ""}</span>
-                      <span className="git-diff-number" aria-hidden="true">{line.newLine ?? ""}</span>
-                      <code>{visibleBidi(line.text) || " "}</code>
-                    </div>;
-                  })}
-                </div>
-                <div className="git-panel-comment-editor">
-                  <label htmlFor="git-review-comment">Local review comment</label>
-                  <textarea id="git-review-comment" value={commentText} maxLength={MAX_COMMENT_LENGTH}
-                    placeholder="Select changed lines, then leave a local note…"
-                    onChange={(event) => setCommentText(event.target.value)} />
-                  <button type="button" disabled={!selected.size || !commentText.trim() || selected.size > 40} onClick={storeComment}>Save local comment</button>
-                  <small>{commentText.length}/{MAX_COMMENT_LENGTH} characters · up to 40 selected lines. Stored only in this browser, never posted to GitHub.</small>
-                </div>
-              </>}
-              {olderComments > 0 && <p className="git-panel-warning">{olderComments} older comment(s) belong to a different view, base, HEAD or diff content and are not attached to these lines.</p>}
-              {currentComments.length > 0 && <div className="git-panel-comments" aria-label="Local Git review comments">
-                {currentComments.map((comment) => <article key={comment.id}>
-                  <small>{comment.locations.map((line) => line.location).join(", ")}</small>
-                  <p>{comment.body}</p>
-                  <button type="button" disabled={!canAsk} onClick={() => ask(comment)}>Ask about comment</button>
-                  <button type="button" onClick={() => deleteComment(comment.id)}>Remove local comment</button>
-                </article>)}
-              </div>}
-            </>}
-            {commentError && <p role="alert" className="git-panel-error">Local comments: {commentError}</p>}
-            {notice && <p role="status">{notice}</p>}
+            {reviewProps && (layout === "continuous"
+              ? <GitDiffFeed key={`${view}:${base}:${revision}`} {...reviewProps} files={files} scrollRoot={panel.current}
+                navigation={navigation} onActivePathChange={onActivePathChange} />
+              : selectedFile ? <GitFileReview key={`${selectedFile.view}:${selectedFile.path}`} {...reviewProps} view={selectedFile.view} path={selectedFile.path} />
+                : !compact && files.length > 0 ? <p className="git-panel-empty">Select a file to load its bounded diff. Repository-wide patches are never loaded.</p> : null)}
+            {compact && layout === "continuous" && !files.length && <p className="git-panel-empty">No files in this view.</p>}
           </div>
         </div>
       </>}
+      {commentError && <p role="alert" className="git-panel-error">Local comments: {commentError}</p>}
       {comments.length > 0 && <details className="git-panel-comment-store">
         <summary>Manage this browser's saved Git comments ({comments.length}/{MAX_COMMENTS})</summary>
         <p>Older comments stay stored but are not reattached when the view, base, HEAD or diff content changes.</p>
         {comments.map((comment) => <div key={comment.id}>
-          <span>{comment.body.slice(0, 120)}{comment.body.length > 120 ? "…" : ""}</span>
+          <span>{comment.body.slice(0, 120)}{comment.body.length > 120 ? "..." : ""}</span>
           <button type="button" aria-label={`Delete saved comment ${comment.id}`} onClick={() => deleteComment(comment.id)}>Delete local note</button>
         </div>)}
       </details>}
-      <footer>Read-only local inspection. No staging, commits, resets, pushes, ref changes or repository file writes. Submodule working-tree dirt is not scanned. Ask creates a draft; review it before sending.</footer>
+      <footer>Read-only local inspection. No staging, commits, resets, pushes, ref changes or repository file writes. Submodule working-tree dirt is not scanned. Quick ask is transient; Discuss in chat prepares a normal message with a saved context attachment. Nothing is sent automatically.</footer>
+      </div>
     </section>
-  </>);
+  </>;
 }

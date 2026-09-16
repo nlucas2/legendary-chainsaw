@@ -15,6 +15,9 @@ const PATCH_LINES: usize = 2500;
 const FILE_LIMIT: usize = 4000;
 const TIMEOUT: Duration = Duration::from_secs(15);
 
+#[path = "git_untracked.rs"]
+mod untracked;
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum GitView {
@@ -24,12 +27,22 @@ pub enum GitView {
     Untracked,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum GitDiffContext {
+    #[default]
+    Changes,
+    Full,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GitDiffRequest {
     pub view: GitView,
     pub path: String,
     pub base: Option<String>,
+    #[serde(default)]
+    pub context: GitDiffContext,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -80,6 +93,9 @@ pub struct GitDiff {
     pub path: String,
     pub original_path: Option<String>,
     pub view: GitView,
+    pub context: GitDiffContext,
+    /// True only when full context was requested and uncapped text hunks were returned.
+    pub full_context_complete: bool,
     pub head: Option<String>,
     pub base: Option<String>,
     pub base_commit: Option<String>,
@@ -319,11 +335,37 @@ fn validate_path(value: &str) -> Result<(), String> {
         || Path::new(value)
             .components()
             .any(|part| !matches!(part, Component::Normal(_)))
-        || (cfg!(windows) && (value.contains('\\') || value.contains(':')))
+        || (cfg!(windows)
+            && (value.contains('\\')
+                || value.contains(':')
+                || value.split('/').any(invalid_windows_component)))
     {
         return Err("Invalid repository-relative Git path.".into());
     }
     Ok(())
+}
+
+fn invalid_windows_component(part: &str) -> bool {
+    let stem = part
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end()
+        .to_uppercase();
+    part.ends_with(['.', ' '])
+        || matches!(
+            stem.as_str(),
+            "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+        )
+        || ["COM", "LPT"].iter().any(|prefix| {
+            stem.strip_prefix(prefix).is_some_and(|suffix| {
+                matches!(
+                    suffix,
+                    "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
+            })
+        })
+        || part.eq_ignore_ascii_case("git~1")
 }
 
 async fn metadata(cwd: &str, requested_base: Option<&str>) -> Result<GitWorkspace, String> {
@@ -761,17 +803,26 @@ pub struct GitRepository {
 pub async fn repository(cwd: &str) -> Result<GitRepository, String> {
     let probe = git(cwd, &["rev-parse", "--is-inside-work-tree"], 4096).await?;
     if probe.code != Some(0) && probe.stderr.contains("not a git repository") {
-        return Ok(GitRepository { is_repository: false, repo_root: None });
+        return Ok(GitRepository {
+            is_repository: false,
+            repo_root: None,
+        });
     }
     let probe = checked(probe)?;
     if line(&probe.stdout)? != "true" {
-        return Ok(GitRepository { is_repository: false, repo_root: None });
+        return Ok(GitRepository {
+            is_repository: false,
+            repo_root: None,
+        });
     }
     let root = checked(git(cwd, &["rev-parse", "--show-toplevel"], 16 * 1024).await?)?;
     if root.truncated {
         return Err("Repository root exceeds the inspection limit.".into());
     }
-    Ok(GitRepository { is_repository: true, repo_root: Some(line(&root.stdout)?) })
+    Ok(GitRepository {
+        is_repository: true,
+        repo_root: Some(line(&root.stdout)?),
+    })
 }
 
 pub async fn workspace(cwd: &str, base: Option<&str>) -> Result<GitWorkspace, String> {
@@ -852,8 +903,7 @@ async fn reject_linked_parents(root: &str, path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Return only a currently changed, explicitly selected file. Untracked content is
-/// deliberately not opened: doing so safely across symlink races is platform-specific.
+/// Return only a currently changed, explicitly selected file.
 pub async fn diff(cwd: &str, request: GitDiffRequest) -> Result<GitDiff, String> {
     validate_path(&request.path)?;
     let mut metadata = metadata(cwd, request.base.as_deref()).await?;
@@ -884,22 +934,39 @@ pub async fn diff(cwd: &str, request: GitDiffRequest) -> Result<GitDiff, String>
             _ => untracked,
         }
     };
+    let missing = !files.iter().any(|file| file.path == request.path);
+    if missing && request.view == GitView::Untracked {
+        files.push(GitFile {
+            path: request.path.clone(),
+            original_path: None,
+            status: "?".into(),
+            kind: "untracked".into(),
+            added: None,
+            deleted: None,
+            binary: false,
+        });
+    }
     let file = files
         .iter_mut()
         .find(|file| file.path == request.path)
         .ok_or("This file is no longer changed in the selected view. Refresh the workspace.")?;
-    let unavailable = match file.kind.as_str() {
+    let unavailable = if missing {
+        Some("This path is no longer a Git-listed, nonignored untracked file. Refresh the workspace.".into())
+    } else {
+        match file.kind.as_str() {
         "submodule" => Some("Submodule change: nested repository content is not inspected.".to_owned()),
         "conflict" => Some("Unmerged file: resolve the conflict outside this read-only panel to view a normal diff.".to_owned()),
-        "untracked" => Some("Untracked file: listed only. Content is not opened, avoiding symlink traversal and arbitrary file reads.".to_owned()),
         "untrackedDirectory" => Some("Untracked directory or nested repository: contents are not inspected.".to_owned()),
         _ => None,
+    }
     };
     let mut result = GitDiff {
         repo_root: root.clone(),
         path: file.path.clone(),
         original_path: file.original_path.clone(),
         view: request.view,
+        context: request.context,
+        full_context_complete: false,
         head: metadata.head.clone(),
         base: metadata.base.clone(),
         base_commit: metadata.base_commit.clone(),
@@ -914,14 +981,25 @@ pub async fn diff(cwd: &str, request: GitDiffRequest) -> Result<GitDiff, String>
         unavailable_reason: unavailable,
         warnings: vec![],
     };
-    if result.unavailable_reason.is_none() {
+    if result.unavailable_reason.is_none() && request.view == GitView::Untracked {
+        match untracked_preview(&root, &request.path, &mut warnings).await {
+            Ok(snapshot) => snapshot.render(&mut result),
+            Err(reason) => result.unavailable_reason = Some(reason),
+        }
+    } else if result.unavailable_reason.is_none() {
         if request.view == GitView::Unstaged {
             reject_linked_parents(&root, &request.path).await?;
         }
         let mut args = diff_args(request.view, &metadata)?;
+        // Git's maximum signed context includes the file without separate blob/worktree
+        // reads; the existing output byte/line caps and process timeout still apply.
+        let unified = match request.context {
+            GitDiffContext::Changes => "--unified=3",
+            GitDiffContext::Full => "--unified=2147483647",
+        };
         args.extend([
             "--patch".into(),
-            "--unified=3".into(),
+            unified.into(),
             "--src-prefix=a/".into(),
             "--dst-prefix=b/".into(),
             "--".into(),
@@ -976,8 +1054,10 @@ pub async fn diff(cwd: &str, request: GitDiffRequest) -> Result<GitDiff, String>
                 if let Some(end) = result.patch.rfind('\n') {
                     result.patch.truncate(end + 1);
                 }
-                warnings.push("Diff preview truncated at 192 KiB or 2500 lines. The rest is not loaded or sent to the model.".into());
             }
+        }
+        if result.truncated {
+            warnings.push("Diff preview truncated at 192 KiB or 2500 lines. The rest is not loaded or sent to the model.".into());
         }
         let mut stat_args = diff_args(request.view, &metadata)?;
         stat_args.extend(["--numstat".into(), "-z".into(), "--".into()]);
@@ -995,6 +1075,16 @@ pub async fn diff(cwd: &str, request: GitDiffRequest) -> Result<GitDiff, String>
         result.added = file.added;
         result.deleted = file.deleted;
         result.binary |= file.binary;
+        if request.context == GitDiffContext::Full
+            && !result.truncated
+            && !result.binary
+            && result.unavailable_reason.is_none()
+        {
+            result.full_context_complete = result.patch.lines().any(|line| line.starts_with("@@ "));
+            if !result.full_context_complete {
+                warnings.push("Git emitted no text hunks (for example, a pure rename, mode-only change, or empty file); full-file contents are not displayed.".into());
+            }
+        }
     }
     // Content identity invalidates local line comments when index/worktree text changes,
     // even when HEAD and the selected base remain unchanged. Not a security hash.
@@ -1003,6 +1093,7 @@ pub async fn diff(cwd: &str, request: GitDiffRequest) -> Result<GitDiff, String>
         .patch
         .bytes()
         .chain(result.unavailable_reason.as_deref().unwrap_or("").bytes())
+        .chain(result.content_id.bytes())
     {
         identity = (identity ^ u64::from(byte)).wrapping_mul(0x100000001b3);
     }
@@ -1012,8 +1103,50 @@ pub async fn diff(cwd: &str, request: GitDiffRequest) -> Result<GitDiff, String>
     metadata
         .warnings
         .retain(|warning| seen.insert(warning.clone()));
-    result.warnings = metadata.warnings;
+    result.warnings.extend(metadata.warnings);
     Ok(result)
+}
+
+async fn untracked_preview(
+    root: &str,
+    path: &str,
+    warnings: &mut Vec<String>,
+) -> Result<untracked::Snapshot, String> {
+    let owned_root = root.to_owned();
+    let owned_path = path.to_owned();
+    let snapshot =
+        tokio::task::spawn_blocking(move || untracked::Snapshot::read(owned_root, owned_path))
+            .await
+            .map_err(|error| format!("Cannot read untracked snapshot: {error}"))??;
+    // Revalidate the exact literal path after reading as well: it may have been
+    // staged, ignored, removed, or replaced by a nested repository meanwhile.
+    let status = listing(
+        root,
+        &[
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=dirty",
+            "--",
+            path,
+        ],
+        warnings,
+    )
+    .await?;
+    let (_, _, files) = parse_status(&status)?;
+    if !files
+        .iter()
+        .any(|file| file.path == path && file.kind == "untracked")
+    {
+        return Err("This path is no longer a Git-listed, nonignored untracked file. Refresh the workspace.".into());
+    }
+    tokio::task::spawn_blocking(move || {
+        snapshot.validate()?;
+        Ok(snapshot)
+    })
+    .await
+    .map_err(|error| format!("Cannot validate untracked snapshot: {error}"))?
 }
 
 #[cfg(test)]

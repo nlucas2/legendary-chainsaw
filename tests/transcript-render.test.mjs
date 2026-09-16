@@ -97,6 +97,33 @@ test("child reasoning uses the subagent label/model and child users are not root
   assert.match(html, /<em>\(child-model\)<\/em>/);
   assert.equal((html.match(/<span>Copilot<\/span>/g) ?? []).length, 1);
   assert.equal((html.match(/data-root-human/g) ?? []).length, 1);
+  assert.match(html, />Instruction<\/span>/);
+});
+
+test("agent and skill inputs have their own labels and are not human scroll anchors", () => {
+  const html = render([
+    event("user.message", { content: "Human message" }),
+    event("user.message", { content: "Only four files move.", source: "agent-primary" }),
+    event("user.message", { content: "Load this skill", source: "skill-pdf" }),
+    event("user.message", { content: "Unknown producer", source: "other-<script>" }),
+  ]);
+  assert.match(html, />You<\/span>/);
+  assert.match(html, />Agent instruction<\/span>/);
+  assert.match(html, />Skill instructions<\/span>/);
+  assert.match(html, />Input<\/span>/);
+  assert.match(html, /data-message-origin="agent"/);
+  assert.equal((html.match(/data-root-human/g) ?? []).length, 1);
+  assert.doesNotMatch(html, /<script>/);
+});
+
+test("focused subagent input without sender metadata is not claimed as You", () => {
+  const html = render([
+    event("user.message", { content: "Legacy instruction" }),
+    event("user.message", { content: "Typed by a person", source: "user" }),
+  ], { subagentConversation: true });
+  assert.match(html, />Instruction<\/span>/);
+  assert.match(html, />You<\/span>/);
+  assert.doesNotMatch(html, /data-root-human/);
 });
 
 test("current picker does not label unknown historical answers", () => {
@@ -155,4 +182,15 @@ test("child user messages use the same whitespace-preserving text renderer", () 
   ]);
   assert.match(html, /class="user-message-text">Child prompt\n\n  Indented detail<\/p>/);
   assert.match(html, /<strong>Still Markdown<\/strong>/);
+});
+
+test("Markdown tables retain semantic cells and alignment inside a focusable overflow region", () => {
+  const html = render([event("assistant.message", {
+    content: "| Location | Finding |\n| :--- | ---: |\n| [file.rs:3](https://example.com/file) | **Important** detail |\n",
+  })]);
+  assert.match(html, /class="markdown-body"/);
+  assert.match(html, /class="markdown-table-scroll" role="region" aria-label="Table" tabindex="0"><table>/);
+  assert.match(html, /<th style="text-align:right">Finding<\/th>/);
+  assert.match(html, /<a href="https:\/\/example.com\/file" target="_blank" rel="noopener noreferrer">file.rs:3<\/a>/);
+  assert.match(html, /<strong>Important<\/strong>/);
 });

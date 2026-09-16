@@ -93,6 +93,10 @@ impl MockRuntime {
                     let id = params["sessionId"].as_str().unwrap_or("");
                     let result = match method {
                         "session.create" | "session.resume" => Some(json!({"sessionId":id})),
+                        "session.list" => Some(json!({"sessions":[
+                            {"sessionId":"a","summary":"Native a","isRemote":false},
+                            {"sessionId":"b","summary":"Native b","isRemote":false}
+                        ]})),
                         "session.metadata.isProcessing" => {
                             Some(json!({"processing":replies.processing}))
                         }
@@ -158,6 +162,7 @@ impl MockRuntime {
                         reasoning_effort: Some("low".into()),
                         context_tier: Some("long_context".into()),
                         pinned: true,
+                        archived: false,
                         folder: Some("Folder".into()),
                         tags: vec!["tag".into()],
                         tool_controls_created: true,
@@ -192,6 +197,7 @@ impl MockRuntime {
                         is_active: true,
                         is_remote: false,
                         pinned: true,
+                        archived: false,
                         folder: Some("Folder".into()),
                         tags: vec!["tag".into()],
                     })
@@ -411,8 +417,72 @@ async fn session_actions_ask_malformed_reply_and_drain_do_not_succeed_or_send() 
 }
 
 #[tokio::test]
+async fn session_actions_archive_running_session_never_calls_runtime_or_touches_lifecycle() {
+    let runtime = MockRuntime::new().await;
+    runtime.replies.lock().unwrap().processing = true;
+    let original = runtime.service.active.read().await["a"].clone();
+    let turn_gate = runtime.service.turn_gate("a").await;
+    let _turn = turn_gate.lock().await;
+    let _lifecycle = runtime.service.lifecycle_gate.write().await;
+    runtime.service.accepting_work.store(false, Ordering::Relaxed);
+    runtime.service.warmed.write().await.insert("a".into());
+    let submitted = tokio::time::Instant::now();
+    runtime.service.last_submissions.write().await.insert("a".into(), submitted);
+    let (sender, _receiver) = oneshot::channel();
+    runtime.service.approvals.pending.lock().unwrap().insert("pending".into(), PendingApproval {
+        sender,
+        session_id: "a".into(),
+        request: serde_json::from_value(json!({"kind":"shell"})).unwrap(),
+    });
+    for archived in [true, false] {
+        let summary = tokio::time::timeout(Duration::from_secs(1),
+            runtime.service.set_session_archived(SetSessionArchived {
+                session_id: "a".into(), archived,
+            })
+        ).await.unwrap().unwrap();
+        assert_eq!(summary.archived, archived);
+        assert!(summary.is_active);
+    }
+    assert!(runtime.calls.lock().unwrap().is_empty(), "archive must issue zero SDK RPCs");
+    assert!(Arc::ptr_eq(&original, &runtime.service.active.read().await["a"]));
+    assert_eq!(runtime.service.active.read().await.len(), 2);
+    assert!(runtime.service.warmed.read().await.contains("a"));
+    assert_eq!(runtime.service.last_submissions.read().await["a"], submitted);
+    assert_eq!(runtime.service.approvals.pending.lock().unwrap().len(), 1);
+    assert_eq!(runtime.service.events.state.lock().unwrap().history.len(), 2);
+}
+
+#[tokio::test]
+async fn session_actions_archive_unopened_session_is_listed_and_preserved_on_explicit_resume() {
+    let runtime = MockRuntime::new().await;
+    runtime.service.active.write().await.remove("a");
+    runtime.service.session_cache.write().await[0].is_active = false;
+    let summary = runtime.service.set_session_archived(SetSessionArchived {
+        session_id: "a".into(), archived: true,
+    }).await.unwrap();
+    assert!(summary.archived);
+    assert!(!summary.is_active);
+    assert!(runtime.calls.lock().unwrap().is_empty());
+    assert!(!runtime.service.active.read().await.contains_key("a"));
+    let listed = runtime.service.list_sessions().await.unwrap();
+    assert_eq!(listed.len(), 2);
+    assert!(listed.iter().find(|summary| summary.session_id == "a").unwrap().archived);
+    assert_eq!(runtime.calls("session.list").len(), 1);
+    assert!(runtime.calls("session.resume").is_empty());
+    let resumed = runtime.service.resume_session("a".into()).await.unwrap();
+    assert!(resumed.archived);
+    assert!(resumed.is_active);
+    assert!(resumed.pinned);
+    assert_eq!(resumed.folder.as_deref(), Some("Folder"));
+    assert_eq!(resumed.tags, ["tag"]);
+}
+
+#[tokio::test]
 async fn session_actions_fork_uses_native_full_context_and_never_replays_pending_work_or_filters() {
     let runtime = MockRuntime::new().await;
+    runtime.service.set_session_archived(SetSessionArchived {
+        session_id: "a".into(), archived: true,
+    }).await.unwrap();
     let parent_meta =
         serde_json::to_value(runtime.service.metadata.read().await.get("a").unwrap()).unwrap();
     let parent_summary =
@@ -428,6 +498,7 @@ async fn session_actions_fork_uses_native_full_context_and_never_replays_pending
     assert_eq!(fork.session_id, "fork-child");
     assert_eq!(fork.title, "New fork");
     assert!(fork.is_active);
+    assert!(!fork.archived);
     assert_eq!(
         runtime.calls("sessions.fork")[0]["params"],
         json!({"sessionId":"a","name":"New fork"})
@@ -452,6 +523,8 @@ async fn session_actions_fork_uses_native_full_context_and_never_replays_pending
     let stored = load_metadata(&runtime.service.metadata_path);
     assert_eq!(stored["fork-child"].title.as_deref(), Some("New fork"));
     assert!(!stored["fork-child"].tool_controls_created);
+    assert!(!stored["fork-child"].archived);
+    assert!(stored["a"].archived);
     assert!(!stored["fork-child"].tool_controls_managed);
     assert!(stored["fork-child"].prevent_pending_work);
     runtime.service.active.write().await.remove("fork-child");
@@ -577,6 +650,9 @@ async fn session_actions_fork_rejects_busy_invalid_names_and_parent_id_results()
 #[tokio::test]
 async fn session_actions_rename_native_readback_cache_and_metadata_preserve_other_fields() {
     let runtime = MockRuntime::new().await;
+    runtime.service.set_session_archived(SetSessionArchived {
+        session_id: "a".into(), archived: true,
+    }).await.unwrap();
     let mut before =
         serde_json::to_value(runtime.service.metadata.read().await.get("a").unwrap()).unwrap();
     let name = "A title; $(not a shell command)";
@@ -589,6 +665,7 @@ async fn session_actions_rename_native_readback_cache_and_metadata_preserve_othe
         .await
         .unwrap();
     assert_eq!(renamed.title, name);
+    assert!(renamed.archived);
     assert!(renamed.pinned);
     assert_eq!(renamed.folder.as_deref(), Some("Folder"));
     assert_eq!(renamed.tags, vec!["tag"]);

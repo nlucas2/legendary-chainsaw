@@ -268,3 +268,151 @@ test("terminal font changes update options and resize without reconnecting or di
     assert.equal(env.sockets.length, 1);
   } finally { env.close(); }
 });
+
+test("independent reasoning applies with original chat, preserves saved choices when disabled, and resets", () => {
+  const env = environment();
+  try {
+    let controller = env.render(useTypography);
+    env.commit();
+    controller.setSettings((current) => ({
+      ...current, reasoningCustom: true, reasoningFontFamily: "custom", reasoningCustomFontFamily: "Georgia",
+      reasoningFontSize: 18, reasoningLineHeight: 1.9, reasoningParagraphSpacing: 16,
+      reasoningItalic: true, reasoningTone: "muted",
+    }));
+    controller = env.render(useTypography);
+    env.commit();
+    assert.equal(env.attributes.get("data-typography"), undefined);
+    assert.equal(env.attributes.get("data-reasoning-typography"), "custom");
+    assert.equal(env.attributes.get("data-reasoning-tone"), "muted");
+    assert.equal(env.variables.get("--reasoning-font-size"), "18px");
+    assert.equal(env.variables.get("--reasoning-font-style"), "italic");
+    assert.ok([...env.variables.keys()].every((key) => key.startsWith("--reasoning-")));
+    assert.equal(controller.settings.preset, "default");
+    assert.equal(controller.settings.fontSize, 15);
+    assert.equal(controller.settings.terminalFontSize, 13);
+    assert.equal(JSON.parse(env.storage.getItem(TYPOGRAPHY_STORAGE_KEY)).reasoningCustom, true);
+    controller.setSettings((current) => ({ ...current, reasoningCustom: false }));
+    controller = env.render(useTypography);
+    env.commit();
+    assert.equal(env.variables.size, 0);
+    assert.equal(env.attributes.size, 0);
+    assert.equal(controller.settings.reasoningCustomFontFamily, "Georgia");
+    controller.setSettings((current) => ({ ...current, reasoningCustom: true }));
+    controller = env.render(useTypography);
+    env.commit();
+    assert.equal(env.variables.get("--reasoning-font-size"), "18px");
+    controller.reset();
+    controller = env.render(useTypography);
+    env.commit();
+    assert.equal(env.variables.size, 0);
+    assert.equal(env.attributes.size, 0);
+    assert.equal(env.storage.getItem(TYPOGRAPHY_STORAGE_KEY), null);
+    assert.deepEqual(controller.settings, DEFAULT_TYPOGRAPHY);
+  } finally { env.close(); }
+});
+
+test("changing chat font preserves independent reasoning and disabling it restores chat-only overrides", () => {
+  const env = environment();
+  try {
+    let controller = env.render(useTypography);
+    env.commit();
+    controller.setSettings({
+      ...typographyPreset("cli"), reasoningCustom: true, reasoningFontFamily: "custom",
+      reasoningCustomFontFamily: "Georgia", reasoningFontSize: 18, reasoningTone: "normal",
+    });
+    controller = env.render(useTypography);
+    env.commit();
+    const reasoning = [...env.variables].filter(([key]) => key.startsWith("--reasoning-"));
+    controller.setSettings((current) => ({ ...current, preset: "custom", fontFamily: "system", fontSize: 24 }));
+    controller = env.render(useTypography);
+    env.commit();
+    assert.deepEqual([...env.variables].filter(([key]) => key.startsWith("--reasoning-")), reasoning);
+    assert.equal(env.variables.get("--chat-font-size"), "24px");
+    assert.equal(env.attributes.get("data-typography"), "custom");
+    assert.equal(env.attributes.get("data-reasoning-tone"), "normal");
+    const chat = [...env.variables].filter(([key]) => key.startsWith("--chat-"));
+    controller.setSettings((current) => ({ ...current, reasoningCustom: false }));
+    env.render(useTypography);
+    env.commit();
+    assert.deepEqual([...env.variables], chat);
+    assert.deepEqual([...env.attributes], [["data-typography", "custom"]]);
+  } finally { env.close(); }
+});
+
+test("old v1 loading and cross-window reasoning changes migrate without writes and clean up on removal", () => {
+  const env = environment();
+  try {
+    const old = Object.fromEntries(Object.entries(typographyPreset("cli")).filter(([key]) => !key.startsWith("reasoning")));
+    env.storage.setItem(TYPOGRAPHY_STORAGE_KEY, JSON.stringify(old));
+    let controller = env.render(useTypography);
+    env.commit();
+    assert.deepEqual(controller.settings, typographyPreset("cli"));
+    assert.equal(env.attributes.get("data-reasoning-typography"), undefined);
+    const writes = env.writes;
+    const customized = { ...DEFAULT_TYPOGRAPHY, reasoningCustom: true, reasoningFontSize: 19, reasoningTone: "muted" };
+    env.storageEvent(JSON.stringify(customized));
+    controller = env.render(useTypography);
+    env.commit();
+    assert.deepEqual(controller.settings, customized);
+    assert.equal(env.variables.get("--reasoning-font-size"), "19px");
+    assert.equal(env.attributes.get("data-typography"), undefined);
+    assert.equal(env.attributes.get("data-reasoning-tone"), "muted");
+    env.storageEvent(JSON.stringify(old));
+    controller = env.render(useTypography);
+    env.commit();
+    assert.deepEqual(controller.settings, typographyPreset("cli"));
+    assert.equal(env.attributes.get("data-reasoning-typography"), undefined);
+    assert.equal(env.variables.get("--reasoning-font-size"), undefined);
+    env.storageEvent(JSON.stringify(customized));
+    env.render(useTypography);
+    env.commit();
+    env.storageEvent(null, null);
+    controller = env.render(useTypography);
+    env.commit();
+    assert.deepEqual(controller.settings, DEFAULT_TYPOGRAPHY);
+    assert.equal(env.variables.size, 0);
+    assert.equal(env.attributes.size, 0);
+    assert.equal(env.writes, writes);
+  } finally { env.close(); }
+});
+
+test("reasoning effect cleanup restores pre-existing attributes and variables on unmount", () => {
+  const env = environment();
+  env.attributes.set("data-reasoning-typography", "existing");
+  env.attributes.set("data-reasoning-tone", "existing-tone");
+  env.variables.set("--reasoning-font-size", "21px");
+  try {
+    let controller = env.render(useTypography);
+    env.commit();
+    controller.setSettings({ ...DEFAULT_TYPOGRAPHY, reasoningCustom: true, reasoningTone: "muted" });
+    controller = env.render(useTypography);
+    env.commit();
+    assert.equal(env.attributes.get("data-reasoning-typography"), "custom");
+    assert.equal(env.variables.get("--reasoning-font-size"), "14px");
+  } finally { env.close(); }
+  assert.deepEqual([...env.attributes], [
+    ["data-reasoning-typography", "existing"], ["data-reasoning-tone", "existing-tone"],
+  ]);
+  assert.deepEqual([...env.variables], [["--reasoning-font-size", "21px"]]);
+});
+
+test("reasoning storage failures stay visible while settings apply and reset in-window", () => {
+  const env = environment();
+  try {
+    env.storage.setItem = () => { throw new Error("quota exceeded"); };
+    env.storage.removeItem = () => { throw new Error("reset denied"); };
+    let controller = env.render(useTypography);
+    env.commit();
+    controller.setSettings({ ...DEFAULT_TYPOGRAPHY, reasoningCustom: true, reasoningFontSize: 18 });
+    controller = env.render(useTypography);
+    env.commit();
+    assert.match(controller.error, /quota exceeded.*only to this window/);
+    assert.equal(env.variables.get("--reasoning-font-size"), "18px");
+    controller.reset();
+    controller = env.render(useTypography);
+    env.commit();
+    assert.match(controller.error, /reset denied/);
+    assert.equal(env.variables.size, 0);
+    assert.equal(env.attributes.size, 0);
+  } finally { env.close(); }
+});

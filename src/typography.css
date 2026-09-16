@@ -43,11 +43,65 @@
   margin-bottom: var(--chat-turn-spacing);
 }
 
+/* Independent reasoning is opt-in even when conversation typography is original. */
+:root[data-reasoning-typography="custom"] .reasoning-content {
+  font-family: var(--reasoning-font-family);
+  font-size: var(--reasoning-font-size);
+  line-height: var(--reasoning-line-height);
+  font-style: var(--reasoning-font-style);
+}
+
+:root[data-reasoning-typography="custom"][data-reasoning-tone="normal"] .reasoning-content {
+  color: var(--text);
+}
+
+:root[data-reasoning-typography="custom"][data-reasoning-tone="muted"] .reasoning-content {
+  color: var(--muted);
+}
+
+:root[data-reasoning-typography="custom"] .reasoning-content pre {
+  font-family: var(--reasoning-code-font-family);
+  font-size: var(--reasoning-font-size);
+  line-height: var(--reasoning-line-height);
+  font-style: normal;
+}
+
+:root[data-reasoning-typography="custom"] .reasoning-content code {
+  font-family: var(--reasoning-code-font-family);
+  font-size: 0.95em;
+  font-style: normal;
+}
+
+:root[data-reasoning-typography="custom"] .reasoning-content pre code {
+  font-size: inherit;
+}
+
+:root[data-reasoning-typography="custom"] .reasoning-content :is(p, ul, ol, pre, blockquote, .markdown-table-scroll) {
+  margin-top: 0;
+  margin-bottom: var(--reasoning-paragraph-spacing);
+}
+
+:root[data-reasoning-typography="custom"] .reasoning-content > :last-child,
+:root[data-reasoning-typography="custom"] .reasoning-content .markdown-body > :last-child {
+  margin-bottom: 0;
+}
+
 .typography-settings {
   color: var(--text);
   font-size: 13px;
   line-height: 1.5;
 }
+
+.typography-disclosure > summary { cursor: pointer; min-height: 44px; list-style: none; margin-bottom: 0; }
+.typography-disclosure > summary::-webkit-details-marker { display: none; }
+.typography-disclosure > summary::after { content: "+"; margin-left: auto; font-size: 20px; color: var(--muted); }
+.typography-disclosure[open] > summary { margin-bottom: 16px; }
+.typography-disclosure[open] > summary::after { content: "\2212"; }
+.typography-disclosure > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: 4px; }
+.chat-width-setting { display: flex; align-items: flex-start; gap: 10px; margin-top: 18px; cursor: pointer; min-height: 44px; }
+.chat-width-setting input { flex-shrink: 0; margin-top: 3px; accent-color: var(--accent); }
+.chat-width-setting span { display: grid; gap: 4px; font-size: 13px; }
+.chat-width-setting small { color: var(--muted); font-size: 12px; line-height: 1.5; }
 
 .typography-presets {
   display: grid;
@@ -119,6 +173,24 @@
   width: 100%;
 }
 
+.typography-reasoning-controls {
+  display: grid;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.typography-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  cursor: pointer;
+}
+
+.typography-checkbox input {
+  accent-color: var(--accent);
+}
+
 .typography-custom-font {
   margin-top: 12px;
 }
@@ -186,6 +258,10 @@
 
 .typography-chat-preview {
   overflow-wrap: anywhere;
+}
+
+.typography-reasoning-preview {
+  margin-top: 12px;
 }
 
 .typography-terminal-preview {

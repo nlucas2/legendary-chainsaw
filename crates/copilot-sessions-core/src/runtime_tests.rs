@@ -241,6 +241,7 @@ fn mock_runtime_with_mcp(mcp: bool) -> MockRuntime {
                     is_active: false,
                     is_remote: false,
                     pinned: false,
+                    archived: false,
                     folder: None,
                     tags: vec![],
                 })
@@ -490,6 +491,8 @@ async fn newly_created_sessions_have_editable_known_app_defaults() {
         })
         .await
         .unwrap();
+    assert!(!session.archived);
+    assert!(!load_metadata(&runtime.service.metadata_path)[&session.session_id].archived);
     let controls = runtime
         .service
         .tool_controls(&session.session_id)
@@ -552,11 +555,13 @@ async fn resume_preserves_known_cwd_and_name_before_native_session_index_catches
         meta.cwd = Some(".".into());
         meta.title = Some("Unindexed workspace".into());
         meta.model = Some("selected-model".into());
+        meta.archived = true;
     }
     let summary = runtime.service.resume_session("a".into()).await.unwrap();
     assert_eq!(summary.cwd.as_deref(), Some("."));
     assert_eq!(summary.title, "Unindexed workspace");
     assert_eq!(summary.model.as_deref(), Some("selected-model"));
+    assert!(summary.archived);
 }
 
 #[tokio::test]

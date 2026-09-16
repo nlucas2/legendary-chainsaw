@@ -8,6 +8,9 @@ mod interactions;
 mod native_user_input;
 mod runtime_api;
 mod session_actions;
+mod session_archive;
+#[cfg(test)]
+mod session_archive_tests;
 pub mod git_workspace;
 #[cfg(test)]
 mod session_actions_tests;
@@ -26,6 +29,7 @@ pub use runtime_api::{
     QueueAction, SendMessageRequest, SessionState, SetSessionMode, SetSessionModeResult,
 };
 pub use session_actions::{AskSessionRequest, AskSessionResult, ForkSessionRequest, RenameSessionRequest};
+pub use session_archive::SetSessionArchived;
 pub use tool_controls::{AdoptToolControls, SetMcpEnabled, SetToolEnabled, ToolControls};
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -120,6 +124,8 @@ pub struct SessionSummary {
     pub is_active: bool,
     pub is_remote: bool,
     pub pinned: bool,
+    #[serde(default)]
+    pub archived: bool,
     pub folder: Option<String>,
     pub tags: Vec<String>,
 }
@@ -160,6 +166,26 @@ pub struct HistoryPage {
     pub human_messages: usize,
     pub window_start_event_id: Option<String>,
     pub truncated_before_anchor: bool,
+}
+
+fn is_human_message(event: &SessionEvent) -> bool {
+    event.event_type == "user.message"
+        && event.agent_id.is_none()
+        && match event.data.get("source") {
+            None | Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::String(source)) => source.is_empty() || source == "user",
+            _ => false,
+        }
+}
+
+fn human_history_anchor(events: &[SessionEvent]) -> Option<String> {
+    events
+        .iter()
+        .rev()
+        .filter(|event| is_human_message(event))
+        .take(HISTORY_WINDOW_MIN_HUMAN_MESSAGES)
+        .last()
+        .map(|event| event.id.clone())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -256,6 +282,10 @@ pub enum AppEvent {
     },
     SessionDeleted {
         session_id: String,
+    },
+    SessionArchiveChanged {
+        session_id: String,
+        archived: bool,
     },
     EventGap {
         session_id: Option<String>,
@@ -400,6 +430,7 @@ struct StoredSessionMeta {
     context_tier: Option<String>,
     title: Option<String>,
     pinned: bool,
+    archived: bool,
     folder: Option<String>,
     tags: Vec<String>,
     tool_exclusions: Vec<String>,
@@ -635,6 +666,7 @@ impl SessionService {
                         .and_then(serde_json::Value::as_bool)
                         .unwrap_or(false),
                     pinned: local.is_some_and(|meta| meta.pinned),
+                    archived: local.is_some_and(|meta| meta.archived),
                     folder: local.and_then(|meta| meta.folder.clone()),
                     tags: local.map(|meta| meta.tags.clone()).unwrap_or_default(),
                 }
@@ -698,6 +730,7 @@ impl SessionService {
                 context_tier: request.context_tier.clone(),
                 title: None,
                 pinned: false,
+                archived: false,
                 folder: None,
                 tags: Vec::new(),
                 tool_exclusions: Vec::new(),
@@ -711,12 +744,9 @@ impl SessionService {
         self.attach(session).await?;
         self.initialize_environment(&id).await?;
         self.refresh_model(&id).await?;
-        let model = self
-            .metadata
-            .read()
-            .await
-            .get(&id)
-            .and_then(|meta| meta.model.clone());
+        let metadata = self.metadata.read().await;
+        let local = metadata.get(&id);
+        let model = local.and_then(|meta| meta.model.clone());
         Ok(SessionSummary {
             session_id: id,
             title: "New session".to_string(),
@@ -727,6 +757,7 @@ impl SessionService {
             is_active: true,
             is_remote: false,
             pinned: false,
+            archived: local.is_some_and(|meta| meta.archived),
             folder: None,
             tags: Vec::new(),
         })
@@ -798,7 +829,8 @@ impl SessionService {
             self.refresh_model(&session_id).await?;
         }
         self.initialize_environment(&session_id).await?;
-        let meta = self.metadata.read().await.get(&session_id).cloned();
+        let metadata = self.metadata.read().await;
+        let meta = metadata.get(&session_id);
         let mut cache = self.session_cache.write().await;
         if let Some(summary) = cache
             .iter_mut()
@@ -806,34 +838,46 @@ impl SessionService {
         {
             summary.is_active = true;
             if let Some(meta) = meta {
-                summary.cwd = meta.cwd;
-                summary.model = meta.model;
+                summary.cwd = meta.cwd.clone();
+                summary.model = meta.model.clone();
                 summary.pinned = meta.pinned;
-                summary.folder = meta.folder;
-                summary.tags = meta.tags;
+                summary.archived = meta.archived;
+                summary.folder = meta.folder.clone();
+                summary.tags = meta.tags.clone();
             }
             return Ok(summary.clone());
         }
         drop(cache);
-        let local = meta.unwrap_or_default();
-        Ok(self
+        drop(metadata);
+        if let Some(summary) = self
             .list_sessions()
             .await?
             .into_iter()
             .find(|summary| summary.session_id == session_id)
-            .unwrap_or(SessionSummary {
-                session_id,
-                title: local.title.unwrap_or_else(|| "Session".to_string()),
-                start_time: String::new(),
-                modified_time: String::new(),
-                cwd: local.cwd,
-                model: local.model,
-                is_active: true,
-                is_remote: false,
-                pinned: local.pinned,
-                folder: local.folder,
-                tags: local.tags,
-            }))
+        {
+            return Ok(summary);
+        }
+        let local = self
+            .metadata
+            .read()
+            .await
+            .get(&session_id)
+            .cloned()
+            .unwrap_or_default();
+        Ok(SessionSummary {
+            session_id,
+            title: local.title.unwrap_or_else(|| "Session".to_string()),
+            start_time: String::new(),
+            modified_time: String::new(),
+            cwd: local.cwd,
+            model: local.model,
+            is_active: true,
+            is_remote: false,
+            pinned: local.pinned,
+            archived: local.archived,
+            folder: local.folder,
+            tags: local.tags,
+        })
     }
 
     pub async fn refresh_session(self: &Arc<Self>, session_id: String) -> Result<SessionRefresh> {
@@ -926,7 +970,7 @@ impl SessionService {
         {
             window.human_messages = window.events[index..]
                 .iter()
-                .filter(|event| event.event_type == "user.message" && event.agent_id.is_none())
+                .filter(|event| is_human_message(event))
                 .count();
         }
         window.truncated_before_anchor =
@@ -944,11 +988,7 @@ impl SessionService {
                 Some("primary"),
             )
             .await?;
-        let index = page
-            .events
-            .len()
-            .saturating_sub(HISTORY_WINDOW_MIN_HUMAN_MESSAGES);
-        Ok(page.events.get(index).map(|event| event.id.clone()))
+        Ok(human_history_anchor(&page.events))
     }
 
     async fn read_history_page(
@@ -1005,7 +1045,7 @@ impl SessionService {
         .map_err(|error| ServiceError::Persistence(error.to_string()))?;
         let human_messages = events
             .iter()
-            .filter(|event| event.event_type == "user.message" && event.agent_id.is_none())
+            .filter(|event| is_human_message(event))
             .count();
         Ok(HistoryPage {
             events,
@@ -1446,13 +1486,25 @@ impl SessionService {
         tags.sort_by_key(|value| value.to_lowercase());
         tags.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
         {
+            let _write_guard = self.metadata_write_gate.lock().await;
             let mut metadata = self.metadata.write().await;
-            let meta = metadata.entry(update.session_id.clone()).or_default();
+            let mut candidate = metadata.clone();
+            let meta = candidate.entry(update.session_id.clone()).or_default();
             meta.pinned = update.pinned;
-            meta.folder = folder;
-            meta.tags = tags;
+            meta.folder = folder.clone();
+            meta.tags = tags.clone();
+            let mut cache = self.session_cache.write().await;
+            self.write_metadata(&candidate)?;
+            *metadata = candidate;
+            if let Some(summary) = cache
+                .iter_mut()
+                .find(|item| item.session_id == update.session_id)
+            {
+                summary.pinned = update.pinned;
+                summary.folder = folder;
+                summary.tags = tags;
+            }
         }
-        self.persist_metadata().await?;
         self.list_sessions()
             .await?
             .into_iter()
@@ -1908,12 +1960,29 @@ impl SessionService {
 
     async fn persist_metadata(&self) -> Result<()> {
         let _write_guard = self.metadata_write_gate.lock().await;
-        let json = serde_json::to_vec_pretty(&*self.metadata.read().await)
+        self.write_metadata(&*self.metadata.read().await)
+    }
+
+    // Call only while holding metadata_write_gate. Stage and flush the complete
+    // snapshot before atomically replacing the last successfully saved file.
+    fn write_metadata(&self, metadata: &HashMap<String, StoredSessionMeta>) -> Result<()> {
+        use std::io::Write;
+
+        let json = serde_json::to_vec_pretty(metadata)
             .map_err(|e| ServiceError::Persistence(e.to_string()))?;
         let temp = self.metadata_path.with_extension("json.tmp");
-        std::fs::write(&temp, json).map_err(|e| ServiceError::Persistence(e.to_string()))?;
-        std::fs::rename(temp, &self.metadata_path)
-            .map_err(|e| ServiceError::Persistence(e.to_string()))
+        let mut file = std::fs::File::create(&temp)
+            .map_err(|e| ServiceError::Persistence(e.to_string()))?;
+        let result = (|| {
+            file.write_all(&json)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&temp, &self.metadata_path)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        result.map_err(|e| ServiceError::Persistence(e.to_string()))
     }
 }
 
@@ -1927,6 +1996,42 @@ fn load_metadata(path: &Path) -> HashMap<String, StoredSessionMeta> {
 #[cfg(test)]
 mod tests {
     use super::{AppEvent, EVENT_REPLAY_CAPACITY, EventBus, RuntimeStatus};
+
+    #[test]
+    fn history_attribution_excludes_injected_inputs_and_child_messages() {
+        let event = |id: &str, source: serde_json::Value, agent: Option<&str>| {
+            serde_json::from_value::<super::SessionEvent>(serde_json::json!({
+                "id": id, "timestamp": "2026-09-15T00:00:00Z", "parentId": null,
+                "type": "user.message", "agentId": agent,
+                "data": { "content": "same text", "source": source }
+            }))
+            .unwrap()
+        };
+        let mut events = Vec::new();
+        for id in ["first", "second", "third", "fourth"] {
+            events.push(event(id, serde_json::Value::Null, None));
+            for source in ["agent-primary", "skill-pdf", "custom-producer"] {
+                events.push(event(source, source.into(), None));
+            }
+            events.push(event("child", "user".into(), Some("child")));
+        }
+        assert_eq!(
+            events.iter().filter(|event| super::is_human_message(event)).count(),
+            4
+        );
+        assert_eq!(super::human_history_anchor(&events).as_deref(), Some("second"));
+        assert!(super::is_human_message(&event(
+            "explicit-user", "user".into(), None
+        )));
+        assert!(!super::is_human_message(&event(
+            "invalid", true.into(), None
+        )));
+        assert_eq!(
+            super::human_history_anchor(&[event("only", "agent-root".into(), None)]),
+            None
+        );
+        assert_eq!(super::human_history_anchor(&[]), None);
+    }
 
     fn status_event(active_sessions: usize) -> AppEvent {
         AppEvent::RuntimeStatus {

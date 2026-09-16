@@ -1,0 +1,22 @@
+.review-context-chip { display: flex; align-items: flex-start; gap: 8px; flex: 1 1 100%; min-width: 0; max-width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-1); font-size: 12px; }
+.review-context-chip details { flex: 1; min-width: 0; }
+.review-context-chip summary { display: flex; gap: 8px; align-items: center; cursor: pointer; min-height: 28px; }
+.review-context-chip summary > svg, .review-context-chip summary small { flex-shrink: 0; }
+.review-context-chip summary span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.review-context-chip p { color: var(--muted); margin: 6px 0; overflow-wrap: anywhere; }
+.review-context-chip pre { max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text); font-size: 11px; line-height: 1.5; }
+.review-context-chip > button { min-height: 28px; border: 0; background: transparent; color: var(--muted); cursor: pointer; }
+.git-review-notes { padding: 10px; border: 1px solid var(--line, #444c56); border-radius: 7px; min-width: 0; }
+.git-review-notes-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 6px; }
+.git-review-notes-list { display: grid; gap: 10px; margin-top: 10px; min-width: 0; font-size: 12px; }
+.git-review-notes-list article { min-width: 0; padding: 10px; border: 1px solid var(--line, #444c56); border-radius: 6px; display: grid; gap: 8px; }
+.git-review-notes-list article header { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.git-review-notes-list p, .git-review-notes-list code, .git-review-notes-list small { overflow-wrap: anywhere; }
+.git-review-notes-list small { color: var(--muted, #b1bac4); }
+.git-review-note-body { white-space: pre-wrap; }
+.git-review-notes-toolbar button, .git-panel-comment-editor button, .git-panel-comments button { min-height: 36px; }
+.git-note-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+@media (max-width: 760px) {
+  .review-context-chip summary, .review-context-chip > button { min-height: 40px; }
+  .git-review-notes-toolbar button { min-height: 44px; }
+}

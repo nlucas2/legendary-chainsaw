@@ -8,6 +8,7 @@ export interface SessionSummary {
   isActive: boolean;
   isRemote: boolean;
   pinned: boolean;
+  archived?: boolean;
   folder?: string;
   tags: string[];
 }
@@ -147,6 +148,7 @@ type DaemonEventPayload =
   | { type: "event_gap"; sessionId?: string | null; skipped: number }
   | { type: "session_attached"; sessionId: string }
   | { type: "session_deleted"; sessionId: string }
+  | { type: "session_archive_changed"; sessionId: string; archived: boolean }
   | { type: "interaction_requested"; interaction: PendingInteraction }
   | { type: "interaction_resolved"; sessionId: string; requestId: string };
 

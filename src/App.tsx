@@ -16,6 +16,8 @@ import type {
   SetStateAction,
 } from "react";
 import {
+  Archive,
+  ArchiveRestore,
   BookOpen,
   Bot,
   ChevronDown,
@@ -61,6 +63,7 @@ import { GitWorkspaceButton } from "./components/GitWorkspaceButton";
 import { ForkSession } from "./components/ForkSession";
 import { useTerminalLayout } from "./lib/useTerminalLayout";
 import { useTypography } from "./lib/useTypography";
+import { useChatWidth } from "./lib/useChatWidth";
 import { resizedTerminal, terminalSizeLimits } from "./lib/workspaceLayout";
 import { slashCommandSuggestions } from "./lib/slashCommands";
 import "./components/workspace-actions.css";
@@ -68,6 +71,8 @@ import { SessionSubagents } from "./components/SessionSubagents";
 import { agentKey, type AgentTask } from "./lib/agentTasks";
 import { useAgentTasks } from "./lib/useAgentTasks";
 import { SessionOrganizer } from "./components/SessionOrganizer";
+import { ReviewContextChip } from "./components/ReviewContextChip";
+import { reviewAttachment, withReviewAttachment, type ReviewChatContext } from "./lib/reviewChat";
 import {
   SettingsPanel,
   type ThemePreference,
@@ -97,6 +102,9 @@ import { attachmentPayload, readAttachment, validateAttachments, type Attachment
 import { chatDraftReducer, EMPTY_SESSION_DRAFTS } from "./lib/chatDrafts";
 import { mergeEvents, mergeHistoryEvents, reconcileOptimisticUserEvents } from "./lib/history";
 import { useSessionOperation } from "./lib/useSessionOperation";
+import { useSessionActivity } from "./lib/useSessionActivity";
+import { sessionActivityIndicator, type SessionActivity } from "./lib/sessionActivity";
+import { filterSessions, groupSessions, SessionArchiveChanges, type SessionView } from "./lib/sessionList";
 import type {
   AgentMode,
   DaemonEvent,
@@ -156,13 +164,24 @@ const GitPanel = lazy(() =>
 
 function App() {
   const typography = useTypography();
+  const chatWidth = useChatWidth();
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [sessionView, setSessionView] = useState<SessionView>("current");
+  const [archiveChanges] = useState(() => new SessionArchiveChanges());
+  const archiveOperation = useSessionOperation();
+  const [archiveError, setArchiveError] = useState("");
+  const [archiveErrorLocation, setArchiveErrorLocation] = useState<"sidebar" | "workspace">("sidebar");
+  const [archiveNotice, setArchiveNotice] = useState<{ sessionId: string; title: string; archived: boolean } | null>(null);
+  const sessionViewControl = useRef<HTMLSelectElement>(null);
+  const sessionListRef = useRef<HTMLElement>(null);
   const [activeSession, setActiveSession] = useState<SessionSummary | null>(null);
   const [events, setEvents] = useState<SessionEvent[]>([]);
   const [subagentContext, setSubagentContext] = useState<SessionEvent[]>([]);
   const [permissions, setPermissions] = useState<PermissionRequest[]>([]);
   const [connected, setConnected] = useState(false);
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus | null>(null);
+  const activityConnected = connected && runtimeStatus?.connected !== false;
+  const sidebarActivity = useSessionActivity(sessions, activityConnected);
   const [expandedSessions, setExpandedSessions] = useState(new Set<string>());
   const [selectedAgent, setSelectedAgent] = useState<{ sessionId: string; task: AgentTask } | null>(null);
   const [agentDrafts, dispatchAgentDraft] = useReducer(chatDraftReducer, {});
@@ -200,7 +219,7 @@ function App() {
   const [renamingSession, setRenamingSession] = useState<SessionSummary | null>(null);
   const [forkingSession, setForkingSession] = useState<SessionSummary | null>(null);
   const [forkingName, setForkingName] = useState<string | undefined>();
-  const [askPanel, setAskPanel] = useState<{ id: string; sessionId: string; question: string; submitOnOpen: boolean } | null>(null);
+  const [askPanel, setAskPanel] = useState<{ id: string; sessionId: string; question: string; submitOnOpen: boolean; reviewContext?: ReviewChatContext } | null>(null);
   const [gitOpen, setGitOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [themePreference, setThemePreference] =
@@ -208,6 +227,8 @@ function App() {
   const [creatingSession, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [drafts, dispatchDraft] = useReducer(chatDraftReducer, {});
+  const draftsRef = useRef(drafts);
+  draftsRef.current = drafts;
   const draftSessionId = activeSession?.sessionId ?? "";
   const sessionDrafts = drafts[draftSessionId] ?? EMPTY_SESSION_DRAFTS;
   const composer = sessionDrafts.current.text;
@@ -346,16 +367,21 @@ function App() {
 
   const loadSessions = useCallback(async () => {
     try {
-      const next = await daemonInvoke<SessionSummary[]>("list_sessions");
+      const checkpoint = archiveChanges.checkpoint();
+      const next = (await daemonInvoke<SessionSummary[]>("list_sessions")).map((session) => archiveChanges.reconcile(session, checkpoint));
       setSessions(next);
       setNeedsLogin(false);
       if (!activeIdRef.current) {
         const requested = initialSessionIdRef.current;
-        const session = requested ? next.find((item) => item.sessionId === requested) : next[0];
-        if (session) void openSession(session, false);
+        const session = requested ? next.find((item) => item.sessionId === requested) : next.find((item) => !item.archived);
+        if (session) {
+          if (requested && session.archived) setSessionView("archived");
+          void openSession(session, false);
+        }
         else if (requested) {
-          const resumed = await daemonInvoke<SessionSummary>("resume_session", { sessionId: requested });
+          const resumed = archiveChanges.reconcile(await daemonInvoke<SessionSummary>("resume_session", { sessionId: requested }), checkpoint);
           if (!activeIdRef.current) {
+            if (resumed.archived) setSessionView("archived");
             setSessions((current) => current.some((item) => item.sessionId === requested) ? current : [resumed, ...current]);
             void openSession(resumed, false);
           }
@@ -481,6 +507,7 @@ function App() {
 
       // Persisted history and live-session attachment are independent daemon operations.
       // Start all three at once and reveal each result as soon as it is ready.
+      const archiveCheckpoint = archiveChanges.checkpoint();
       const resumeRequest = daemonInvoke<SessionSummary>("resume_session", {
         sessionId: session.sessionId,
       });
@@ -528,7 +555,7 @@ function App() {
         .catch((cause) => handleError(cause, setError, setNeedsLogin));
 
       try {
-        const resumed = await resumeRequest;
+        const resumed = archiveChanges.reconcile(await resumeRequest, archiveCheckpoint);
         if (activeIdRef.current !== session.sessionId) return;
         setActiveSession(resumed);
         setSessionReady(true);
@@ -568,10 +595,20 @@ function App() {
       .catch(() => undefined);
   }, [loadSessions]);
 
+  const applyArchiveChange = useCallback((sessionId: string, archived: boolean) => {
+    archiveChanges.record(sessionId, archived);
+    setSessions((current) => current.map((session) => session.sessionId === sessionId ? { ...session, archived } : session));
+    setActiveSession((current) => current?.sessionId === sessionId ? { ...current, archived } : current);
+  }, [archiveChanges]);
+
   useEffect(() => {
+    let previouslyConnected = false;
     const unsubscribe = subscribeToDaemon(
       (event) => {
+        if (event.type === "session_archive_changed") applyArchiveChange(event.sessionId, event.archived);
+        if (event.type === "event_gap") void loadSessions();
         agentTasks.notify(event);
+        sidebarActivity.notify(event);
         setConnected(true);
         if (event.type === "interaction_requested" &&
             event.interaction.sessionId === activeIdRef.current) {
@@ -680,6 +717,8 @@ function App() {
         );
       },
       (isConnected) => {
+        if (isConnected && previouslyConnected) void loadSessions();
+        if (isConnected) previouslyConnected = true;
         sseConnectedRef.current = isConnected;
         setConnected(isConnected);
         if (isConnected && activeIdRef.current) void loadInteractions(activeIdRef.current);
@@ -687,7 +726,7 @@ function App() {
       showRawEvents,
     );
     return unsubscribe;
-  }, [loadQueue, loadSessions, loadInteractions, queueLiveEvent, showRawEvents]);
+  }, [loadQueue, loadSessions, loadInteractions, queueLiveEvent, showRawEvents, applyArchiveChange, sidebarActivity.notify]);
 
   useEffect(
     () => () => {
@@ -752,7 +791,7 @@ function App() {
       if (modal) {
         if (event.key === "Tab") {
           const controls = Array.from(modal.querySelectorAll<HTMLElement>(
-            'button:not(:disabled),input:not(:disabled),textarea:not(:disabled),select:not(:disabled),a[href]',
+            'button:not(:disabled),input:not(:disabled),textarea:not(:disabled),select:not(:disabled),a[href],summary',
           )).filter((element) => element.offsetParent !== null);
           const first = controls[0];
           const last = controls[controls.length - 1];
@@ -989,17 +1028,9 @@ function App() {
     return () => window.removeEventListener("storage", onStorage);
   }, []);
 
-  const filteredSessions = useMemo(() => {
-    const query = search.trim().toLowerCase();
-    if (!query) return sessions;
-    return sessions.filter(
-      (session) =>
-        session.title.toLowerCase().includes(query) ||
-        session.cwd?.toLowerCase().includes(query) ||
-        session.folder?.toLowerCase().includes(query) ||
-        session.tags.some((tag) => tag.toLowerCase().includes(query)),
-    );
-  }, [search, sessions]);
+  const filteredSessions = useMemo(() => filterSessions(sessions, search, sessionView), [search, sessions, sessionView]);
+  const archivedCount = sessions.filter((session) => session.archived === true).length;
+  const activeArchived = (sessions.find((session) => session.sessionId === activeSession?.sessionId) ?? activeSession)?.archived === true;
 
   const sessionGroups = useMemo(
     () => groupSessions(filteredSessions.slice(0, sessionRenderLimit)),
@@ -1008,7 +1039,8 @@ function App() {
 
   useEffect(() => {
     setSessionRenderLimit(100);
-  }, [search]);
+    sessionListRef.current?.scrollTo({ top: 0 });
+  }, [search, sessionView]);
 
   function toggleGroup(group: string) {
     setCollapsedGroups((current) => {
@@ -1142,6 +1174,12 @@ function App() {
       return;
     }
     const attachments = attachmentDrafts;
+    try {
+      validateAttachments([], attachments.map((attachment) => ({ size: attachment.size, name: attachment.displayName })));
+    } catch (cause) {
+      setError(String(cause));
+      return;
+    }
     const delivery = submitDeliveryRef.current ?? deliveryMode;
     submitDeliveryRef.current = null;
     const optimisticId = slash ? "" : `optimistic-user-${crypto.randomUUID()}`;
@@ -1529,17 +1567,46 @@ function App() {
     session: SessionSummary,
     organization: { pinned: boolean; folder?: string; tags: string[] },
   ) {
-    const updated = await daemonInvoke<SessionSummary>("organize_session", {
+    const checkpoint = archiveChanges.checkpoint();
+    const updated = archiveChanges.reconcile(await daemonInvoke<SessionSummary>("organize_session", {
       sessionId: session.sessionId,
       ...organization,
-    });
+    }), checkpoint);
     setSessions((current) =>
       sortSessions(
         current.map((item) => (item.sessionId === updated.sessionId ? updated : item)),
       ),
     );
-    if (activeSession?.sessionId === updated.sessionId) setActiveSession(updated);
+    setActiveSession((current) => current?.sessionId === updated.sessionId ? updated : current);
   }
+
+  const setSessionArchived = useCallback(async (sessionId: string, archived: boolean, title: string) => {
+    const token = archiveOperation.start(sessionId);
+    if (!token) return;
+    const checkpoint = archiveChanges.checkpoint();
+    const trigger = document.activeElement;
+    const fromSidebar = trigger instanceof HTMLElement && !!trigger.closest(".sidebar");
+    setArchiveError("");
+    setArchiveErrorLocation(fromSidebar ? "sidebar" : "workspace");
+    setArchiveNotice(null);
+    try {
+      const result = await daemonInvoke<SessionSummary>("set_session_archived", { sessionId, archived });
+      if (result.sessionId !== sessionId || result.archived !== archived) throw new Error("The daemon returned an unexpected archive result. Refresh the session list.");
+      if (!archiveChanges.changedSince(sessionId, checkpoint)) applyArchiveChange(sessionId, archived);
+      const effective = archiveChanges.reconcile(result, checkpoint);
+      if (effective.archived === archived) setArchiveNotice({ sessionId, title, archived });
+      requestAnimationFrame(() => {
+        if (trigger && !trigger.isConnected) (fromSidebar ? sessionViewControl.current : composerRef.current)?.focus();
+      });
+    } catch (cause) {
+      handleError(cause, setArchiveError, setNeedsLogin);
+      requestAnimationFrame(() => {
+        if (document.activeElement === document.body && trigger instanceof HTMLElement && trigger.isConnected) trigger.focus();
+      });
+    } finally {
+      archiveOperation.finish(sessionId, token);
+    }
+  }, [archiveChanges, archiveOperation.start, archiveOperation.finish, applyArchiveChange]);
 
   function openNewSession() {
     setNewCwd(trackedCwd || activeSession?.cwd || "");
@@ -1737,8 +1804,8 @@ function App() {
   }
 
   function sessionRenamed(updated: SessionSummary) {
-    setSessions((current) => current.map((session) => session.sessionId === updated.sessionId ? updated : session));
-    setActiveSession((current) => current?.sessionId === updated.sessionId ? updated : current);
+    setSessions((current) => current.map((session) => session.sessionId === updated.sessionId ? { ...updated, archived: session.archived } : session));
+    setActiveSession((current) => current?.sessionId === updated.sessionId ? { ...updated, archived: current.archived } : current);
     setRenamingSession(null);
   }
 
@@ -1746,6 +1813,23 @@ function App() {
     setForkingSession(null);
     setSessions((current) => [fork, ...current.filter((session) => session.sessionId !== fork.sessionId)]);
     void openSession(fork);
+  }
+
+  function discussReview(sessionId: string, context: ReviewChatContext) {
+    if (activeIdRef.current !== sessionId) throw new Error("The selected session changed. Reopen the review from its original session.");
+    if (readingAttachments) throw new Error("Wait for the current attachments to finish loading before adding review context.");
+    const attachment = reviewAttachment(context);
+    withReviewAttachment(draftsRef.current[sessionId]?.current.attachments ?? [], attachment);
+    dispatchDraft({ type: "edit", sessionId, update: (draft) => ({
+      ...draft,
+      text: draft.text.trim() ? draft.text : context.suggestedQuestion,
+      attachments: [...draft.attachments.filter((item) => item.id !== attachment.id), attachment],
+    }) });
+    setSelectedAgent(null);
+    setGitOpen(false);
+    setAskPanel(null);
+    setError("");
+    requestAnimationFrame(() => composerRef.current?.focus());
   }
 
   const trackTerminalCwd = useCallback((cwd: string) => {
@@ -1805,16 +1889,17 @@ function App() {
   const selectedAgentDraft = agentDrafts[selectedAgentKey] ?? EMPTY_SESSION_DRAFTS;
 
   const sessionRows = useMemo(() => sessionGroups.map((group) => {
-    const collapsed = !group.bare && collapsedGroups.has(group.key);
+    const collapsed = collapsedGroups.has(group.key);
+    const itemsId = `session-group-${encodeURIComponent(group.key)}`;
     return (
-      <section className="session-group" key={group.key}>
-        {!group.bare && (
-          <button className="session-group-heading" onClick={() => toggleGroup(group.key)} aria-expanded={!collapsed}>
+      <section className="session-group" key={group.key} data-group-key={group.key}
+        aria-label={group.pinned ? "Pinned sessions" : group.key === "loose" ? "Unfiled sessions" : `Folder ${group.name}`}>
+          <button className="session-group-heading" onClick={() => toggleGroup(group.key)} aria-expanded={!collapsed} aria-controls={itemsId}>
             {collapsed ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
             {group.pinned && <Pin size={11} />}
             <span>{group.name}</span><i>{group.sessions.length}</i>
           </button>
-        )}
+        <div id={itemsId} className="session-group-items" hidden={collapsed}>
         {!collapsed && group.sessions.map((session) => (
           <div className="session-node" key={session.sessionId}>
             <div className="session-node-row">
@@ -1828,10 +1913,16 @@ function App() {
               {expandedSessions.has(session.sessionId) ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
             </button>
           <SessionRow session={session} active={activeSession?.sessionId === session.sessionId}
+            activity={sidebarActivity.states[session.sessionId]} activityConnected={activityConnected}
             onOpen={() => { setSelectedAgent(null); void openSession(session); }}
             onTogglePin={() => void organizeSession(session, {
               pinned: !session.pinned, folder: session.folder, tags: session.tags,
+            }).catch((cause) => {
+              setArchiveErrorLocation("sidebar");
+              handleError(cause, setArchiveError, setNeedsLogin);
             })}
+            onToggleArchive={() => void setSessionArchived(session.sessionId, !session.archived, session.title)}
+            archiveBusy={!!archiveOperation.operations.get(session.sessionId)}
             onOrganize={() => setOrganizingSession(session)}
             onRename={() => setRenamingSession(session)}
             onDelete={() => void deleteSession(session)} />
@@ -1843,9 +1934,10 @@ function App() {
               onSelect={(task) => selectAgent(session, task)} onRefresh={() => agentTasks.refresh(session.sessionId)} />}
           </div>
         ))}
+        </div>
       </section>
     );
-  }), [sessionGroups, collapsedGroups, activeSession?.sessionId, expandedSessions, agentTasks.states, selectedAgent, selectAgent, runtimeStatus?.connected]);
+  }), [sessionGroups, collapsedGroups, activeSession?.sessionId, expandedSessions, agentTasks.states, selectedAgent, selectAgent, runtimeStatus?.connected, setSessionArchived, archiveOperation.revision, sidebarActivity.states, activityConnected]);
 
   if (needsLogin) {
     return <LoginScreen onLoggedIn={loadSessions} />;
@@ -1854,6 +1946,7 @@ function App() {
   return (
     <main
       className={`app-shell ${terminalOpen ? "terminal-visible" : ""} terminal-${terminalLayout.layout.dock}`}
+      data-chat-width={chatWidth.width}
       style={{ "--terminal-width": `${terminalWidth}px`, "--terminal-height": `${terminalLayout.height}px` } as CSSProperties}
     >
       <aside className={sidebarOpen ? "sidebar open" : "sidebar"}>
@@ -1886,8 +1979,24 @@ function App() {
             placeholder="Search sessions"
           />
         </label>
-        <div className="sidebar-label">Sessions</div>
+        <div className="session-list-controls">
+          <span className="sidebar-label">Sessions</span>
+          <select ref={sessionViewControl} aria-label="Session view" value={sessionView}
+            onChange={(event) => setSessionView(event.target.value as SessionView)}>
+            <option value="current">Current ({sessions.length - archivedCount})</option>
+            <option value="archived">Archived ({archivedCount})</option>
+            <option value="all">All ({sessions.length})</option>
+          </select>
+        </div>
+        {archiveError && archiveErrorLocation === "sidebar" && <p className="session-archive-error" role="alert">{archiveError}</p>}
+        {archiveNotice && <div className="session-archive-notice" role="status">
+          <span>{archiveNotice.archived ? "Archived" : "Restored"} "{archiveNotice.title}".</span>
+          <button type="button" disabled={!!archiveOperation.operations.get(archiveNotice.sessionId)}
+            onClick={() => void setSessionArchived(archiveNotice.sessionId, !archiveNotice.archived, archiveNotice.title)}>Undo</button>
+          <button type="button" aria-label="Dismiss archive notice" onClick={() => setArchiveNotice(null)}><X size={12} /></button>
+        </div>}
         <nav
+          ref={sessionListRef}
           className="session-list"
           onScroll={(event) => {
             const element = event.currentTarget;
@@ -1903,7 +2012,11 @@ function App() {
         >
           {loading && <div className="sidebar-placeholder">Loading sessions…</div>}
           {!loading && filteredSessions.length === 0 && (
-            <div className="sidebar-placeholder">No matching sessions</div>
+            <div className="sidebar-placeholder">
+              {search.trim() ? "No matching sessions in this view." : sessionView === "archived" ? "No archived sessions." : sessionView === "all" ? "No sessions." : "No current sessions."}
+              {sessionView === "current" && archivedCount > 0 && <button type="button" className="session-view-link"
+                onClick={() => setSessionView("archived")}>View archived sessions</button>}
+            </div>
           )}
           {sessionRows}
           {sessionRenderLimit < filteredSessions.length && (
@@ -1937,6 +2050,12 @@ function App() {
       )}
 
       <section className="workspace">
+        {archiveError && archiveErrorLocation === "workspace" && <p className="session-archive-error" role="alert">{archiveError}</p>}
+        {activeArchived && activeSession && <div className="session-archived-banner" role="status">
+          <Archive size={15} /><span>This session is archived. Its conversation and running work are unchanged.</span>
+          <button type="button" disabled={!!archiveOperation.operations.get(activeSession.sessionId)}
+            onClick={() => void setSessionArchived(activeSession.sessionId, false, activeSession.title)}>Restore session</button>
+        </div>}
         <header className="workspace-header">
           <button
             className="icon-button mobile-menu"
@@ -2195,17 +2314,26 @@ function App() {
         </div>
 
         {activeSession && (
-          <div className="message-queue" aria-live="polite">
-            {queue.items.length > 0 && (
-              <>
-                <div className="message-queue-heading">
-                  <strong>{queue.items.length} queued</strong>
-                  <span>Runs in submission order</span>
-                </div>
+          <div className="message-queue" key={activeSession.sessionId} aria-label="Message queue" role="region">
+            {(queue.items.length > 0 || queue.steeringMessages.length > 0) && (
+              <details className="message-queue-disclosure" open>
+                <summary className="message-queue-heading">
+                  <ChevronRight className="queue-toggle" size={12} />
+                  <strong aria-live="polite">
+                    {queue.items.length > 0 && `${queue.items.length} queued`}
+                    {queue.items.length > 0 && queue.steeringMessages.length > 0 && " · "}
+                    {queue.steeringMessages.length > 0 && `${queue.steeringMessages.length} guidance sent`}
+                  </strong>
+                  <span className="queue-next-preview" title={queue.items[0]?.displayText ?? queue.steeringMessages[0]}>
+                    {queue.items[0]?.displayText ?? queue.steeringMessages[0]}
+                  </span>
+                  <span className="queue-order-hint">{queue.items.length ? "Runs in submission order" : "Sent to the running turn"}</span>
+                </summary>
+                <div className="message-queue-items">
                 {queue.items.map((item, index) => (
-                  <div className="message-queue-item" key={item.id}>
+                  <div className="message-queue-item" key={item.id} data-queue-id={item.id}>
                     <span>{index + 1}</span>
-                    <div>
+                    <div className="queue-item-content">
                       {editingQueueId === item.id ? (
                         <input className="queue-edit" aria-label="Edit queued message"
                           value={editingQueueText} onChange={(event) => setEditingQueueText(event.target.value)}
@@ -2217,13 +2345,17 @@ function App() {
                               event.preventDefault(); setEditingQueueId(null);
                             }
                           }} />
-                      ) : <strong>{item.displayText}</strong>}
+                      ) : <strong title={item.displayText}>{item.displayText}</strong>}
                       <small>{modeLabel(item.agentMode)} · {item.kind}</small>
                     </div>
                     <div className="queue-actions">
                       {editingQueueId === item.id ? (
-                        <button type="button" disabled={!!queueBusy || !editingQueueText.trim()}
-                          onClick={() => void runQueueAction("update", item.id, { prompt: editingQueueText })}>Save</button>
+                        <>
+                          <button type="button" disabled={!!queueBusy || !editingQueueText.trim()}
+                            onClick={() => void runQueueAction("update", item.id, { prompt: editingQueueText })}>Save</button>
+                          <button type="button" disabled={!!queueBusy} title="Cancel editing queued message"
+                            onClick={() => setEditingQueueId(null)}>Cancel</button>
+                        </>
                       ) : (
                         <>
                           <button type="button" title="Move queued message earlier"
@@ -2231,14 +2363,19 @@ function App() {
                             onClick={() => void runQueueAction("move", item.id, { toPosition: index - 1 })}>↑</button>
                           <button type="button" title="Edit queued message"
                             disabled={!!queueBusy || item.kind !== "message" || item.id.startsWith("local-queue-")}
-                            onClick={() => { setEditingQueueId(item.id); setEditingQueueText(item.displayText); }}>Edit</button>
+                            onClick={() => { setEditingQueueId(item.id); setEditingQueueText(item.displayText); }}>
+                            <Pencil size={13} /><span className="queue-action-label">Edit</span>
+                          </button>
                           <button type="button" title="Send as guidance to the running turn"
                             disabled={!sessionProcessing || !!queueBusy || item.kind !== "message" || item.id.startsWith("local-queue-")}
-                            onClick={() => void runQueueAction("sendNow", item.id)}>Send now</button>
+                            onClick={() => void runQueueAction("sendNow", item.id)}>
+                            <Send size={13} /><span className="queue-action-label">Send now</span>
+                          </button>
                         </>
                       )}
                     <button
                       type="button"
+                      className="queue-remove"
                       title="Remove queued prompt"
                       disabled={!!queueBusy || item.id.startsWith("local-queue-")}
                       onClick={() => void removeQueueItem(item.id)}
@@ -2248,13 +2385,14 @@ function App() {
                     </div>
                   </div>
                 ))}
-              </>
+                {queue.steeringMessages.map((message, index) => (
+                  <div className="message-queue-item" key={`steer-${index}`}>
+                    <span>↳</span><div className="queue-item-content"><strong title={message}>{message}</strong><small>Guidance sent to the running turn</small></div>
+                  </div>
+                ))}
+                </div>
+              </details>
             )}
-            {queue.steeringMessages.map((message, index) => (
-              <div className="message-queue-item" key={`steer-${index}`}>
-                <span>↳</span><div><strong>{message}</strong><small>Guidance sent to the running turn</small></div>
-              </div>
-            ))}
             {queueError && <p role="alert">{queueError}</p>}
           </div>
         )}
@@ -2319,7 +2457,7 @@ function App() {
             <div className="saved-chat-draft" key={saved.id}>
               <strong>Unsent message</strong>
               <p>{saved.draft.text}</p>
-              {saved.draft.attachments.length > 0 && <small>{saved.draft.attachments.map((file) => file.displayName).join(", ")}</small>}
+              {saved.draft.attachments.length > 0 && <small>{saved.draft.attachments.map((file) => file.reviewContext?.label ?? file.displayName).join(", ")}</small>}
               {saved.error && <p role="alert">{saved.error}</p>}
               <button type="button" onClick={() => dispatchDraft({ type: "restore", sessionId: draftSessionId, id: saved.id })}>Restore draft</button>
               <button type="button" onClick={() => dispatchDraft({ type: "discard", sessionId: draftSessionId, id: saved.id })}>Discard</button>
@@ -2334,6 +2472,8 @@ function App() {
           {attachmentDrafts.length > 0 && (
             <div className="composer-attachments">
               {attachmentDrafts.map((file) => (
+                file.reviewContext ? <ReviewContextChip key={file.id} context={file.reviewContext}
+                  onRemove={() => setAttachmentDrafts((current) => current.filter((item) => item.id !== file.id))} /> :
                 <div className="attachment-chip" key={file.id}>
                   <Paperclip size={13} /><span>{file.displayName}</span>
                   <button type="button" aria-label={`Remove ${file.displayName}`}
@@ -2534,6 +2674,9 @@ function App() {
       {settingsOpen && (
         <SettingsPanel
           typography={typography}
+          chatWidth={chatWidth.width}
+          onChatWidthChange={chatWidth.setWidth}
+          chatWidthError={chatWidth.error}
           themePreference={themePreference}
           onThemePreferenceChange={setThemePreference}
           onClose={() => setSettingsOpen(false)}
@@ -2574,15 +2717,18 @@ function App() {
         onForked={sessionForked} onClose={() => setForkingSession(null)} />}
       {gitOpen && activeSession?.cwd && <Suspense fallback={<p role="status" className="git-loading">Opening Git workspace...</p>}>
         <GitPanel sessionId={activeSession.sessionId} cwd={activeSession.cwd} onClose={() => setGitOpen(false)}
-          onAsk={(question) => {
+          onDiscuss={(context) => discussReview(activeSession.sessionId, context)}
+          onAsk={(question, reviewContext) => {
             setGitOpen(false);
-            setAskPanel({ id: crypto.randomUUID(), sessionId: activeSession.sessionId, question, submitOnOpen: false });
+            setAskPanel({ id: crypto.randomUUID(), sessionId: activeSession.sessionId, question, reviewContext, submitOnOpen: false });
           }} />
       </Suspense>}
       {askPanel && <div className="ask-backdrop" role="presentation">
         <div className="ask-dialog" role="dialog" aria-modal="true" aria-label="Ask about conversation">
           <Suspense fallback={<p role="status">Opening /ask...</p>}>
             <AskPanel key={askPanel.id} sessionId={askPanel.sessionId} initialQuestion={askPanel.question}
+              reviewContext={askPanel.reviewContext}
+              onContinue={(context) => discussReview(askPanel.sessionId, context)}
               submitOnOpen={askPanel.submitOnOpen} onClose={() => {
                 setAskPanel(null);
                 requestAnimationFrame(() => composerRef.current?.focus());
@@ -2792,37 +2938,40 @@ function App() {
   );
 }
 
-interface SessionGroup {
-  key: string;
-  name: string;
-  pinned?: boolean;
-  bare?: boolean;
-  sessions: SessionSummary[];
-}
-
 function SessionRow({
   session,
   active,
+  activity,
+  activityConnected,
   onOpen,
   onTogglePin,
+  onToggleArchive,
+  archiveBusy,
   onOrganize,
   onRename,
   onDelete,
 }: {
   session: SessionSummary;
   active: boolean;
+  activity?: SessionActivity;
+  activityConnected: boolean;
   onOpen: () => void;
   onTogglePin: () => void;
+  onToggleArchive: () => void;
+  archiveBusy: boolean;
   onOrganize: () => void;
   onRename: () => void;
   onDelete: () => void;
 }) {
+  const indicator = sessionActivityIndicator(session.isActive, activityConnected, activity);
+  const statusId = `session-activity-${session.sessionId}`;
   return (
     <div className={active ? "session-item active" : "session-item"} data-session-id={session.sessionId}>
-      <button className="session-open" onClick={onOpen}>
+      <button className="session-open" onClick={onOpen} aria-describedby={statusId}>
         {session.pinned && <Pin className="session-pin" size={12} />}
         <span className="session-main">
           <strong>{session.title}</strong>
+          {session.archived && <span className="session-archived-label"><Archive size={10} />Archived</span>}
           <small>
             {session.folder && <em>{session.folder}</em>}
             {compactPath(session.cwd) || "No working directory"}
@@ -2837,7 +2986,17 @@ function SessionRow({
         </span>
       </button>
       <span className="session-meta">
-        {relativeTime(session.modifiedTime)}
+        <span className="session-meta-time">
+          <span id={statusId} className={`session-activity-dot ${indicator.kind}`}
+            role="img" aria-label={indicator.label} title={indicator.description} />
+          <span>{relativeTime(session.modifiedTime)}</span>
+        </span>
+        <span className="session-row-actions">
+        <button type="button" className="session-action session-archive-action" disabled={archiveBusy}
+          onClick={onToggleArchive} aria-label={`${session.archived ? "Restore" : "Archive"} ${session.title}`}
+          title={session.archived ? "Restore to current sessions" : "Hide from current sessions without stopping or deleting"}>
+          {session.archived ? <ArchiveRestore size={13} /> : <Archive size={13} />}
+        </button>
         {active && (
           <>
             <button className="session-action" onClick={onRename} aria-label={`Rename ${session.title}`}>
@@ -2868,6 +3027,7 @@ function SessionRow({
             </button>
           </>
         )}
+        </span>
       </span>
     </div>
   );
@@ -3048,45 +3208,6 @@ function sortSessions(sessions: SessionSummary[]): SessionSummary[] {
     if (left.pinned !== right.pinned) return left.pinned ? -1 : 1;
     return right.modifiedTime.localeCompare(left.modifiedTime);
   });
-}
-
-function groupSessions(sessions: SessionSummary[]): SessionGroup[] {
-  const groups: SessionGroup[] = [];
-  const pinned = sessions.filter((session) => session.pinned);
-  if (pinned.length > 0) {
-    groups.push({
-      key: "pinned",
-      name: "Pinned",
-      pinned: true,
-      sessions: pinned,
-    });
-  }
-
-  const folders = new Map<string, SessionSummary[]>();
-  for (const session of sessions) {
-    if (session.pinned || !session.folder) continue;
-    const current = folders.get(session.folder) ?? [];
-    current.push(session);
-    folders.set(session.folder, current);
-  }
-  for (const folder of [...folders.keys()].sort((a, b) => a.localeCompare(b))) {
-    groups.push({
-      key: `folder:${folder}`,
-      name: folder,
-      sessions: folders.get(folder) ?? [],
-    });
-  }
-
-  const loose = sessions.filter((session) => !session.pinned && !session.folder);
-  if (loose.length > 0) {
-    groups.push({
-      key: "loose",
-      name: "",
-      bare: true,
-      sessions: loose,
-    });
-  }
-  return groups;
 }
 
 function readCollapsedGroups(): Set<string> {

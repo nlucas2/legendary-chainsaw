@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
+import { MarkdownContent } from "./MarkdownContent";
 import { askRequests, normalizeAskResult } from "../lib/ask";
 import { daemonInvoke } from "../lib/daemon";
+import { continueReviewConversation, quickAskQuestion, type ReviewChatContext } from "../lib/reviewChat";
+import { ReviewContextChip } from "./ReviewContextChip";
 import "./ask-panel.css";
 
 export interface AskPanelProps {
@@ -11,15 +12,18 @@ export interface AskPanelProps {
   initialQuestion?: string;
   /** Only set for an explicit submitted /ask command, never a suggested question. */
   submitOnOpen?: boolean;
+  reviewContext?: ReviewChatContext;
+  onContinue?: (context: ReviewChatContext) => void;
 }
 
 export function AskPanel(props: AskPanelProps) {
   return <SessionAskPanel key={props.sessionId} {...props} />;
 }
 
-function SessionAskPanel({ sessionId, onClose, initialQuestion = "", submitOnOpen = false }: AskPanelProps) {
+function SessionAskPanel({ sessionId, onClose, initialQuestion = "", submitOnOpen = false, reviewContext, onContinue }: AskPanelProps) {
   const [question, setQuestion] = useState(initialQuestion);
   const [submittedQuestion, setSubmittedQuestion] = useState("");
+  const [submittedContext, setSubmittedContext] = useState<ReviewChatContext>();
   const [answer, setAnswer] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -38,11 +42,12 @@ function SessionAskPanel({ sessionId, onClose, initialQuestion = "", submitOnOpe
     setError("");
     setAnswer(null);
     setSubmittedQuestion(text.trim());
+    setSubmittedContext(reviewContext);
     try {
       // No AbortController: closing this transient view must not abort its parent
       // or pretend the native query supports cancellation.
       const result = normalizeAskResult(await daemonInvoke("ask_session", {
-        sessionId, question: text.trim(),
+        sessionId, question: quickAskQuestion(text.trim(), reviewContext),
       }), sessionId);
       if (mounted.current) setAnswer(result.answer);
     } catch (cause) {
@@ -72,6 +77,7 @@ function SessionAskPanel({ sessionId, onClose, initialQuestion = "", submitOnOpe
         title={busy ? "Close this panel. The query continues; the parent is not stopped." : "Close this transient answer"}>Close</button>
     </header>
     <p className="ask-panel-note">Ask a question using the current conversation context. No tools run and nothing is added to conversation history.</p>
+    {reviewContext && <ReviewContextChip context={reviewContext} />}
     <form onSubmit={(event) => { event.preventDefault(); void submit(question); }}>
       <label htmlFor={`ask-question-${sessionId}`}>Question</label>
       <textarea ref={input} id={`ask-question-${sessionId}`} value={question} disabled={busy}
@@ -99,9 +105,15 @@ function SessionAskPanel({ sessionId, onClose, initialQuestion = "", submitOnOpe
     {answer !== null && <article className="ask-panel-answer" aria-label="Transient answer" tabIndex={0}>
       <h3>Answer</h3>
       <p className="ask-panel-question">{submittedQuestion}</p>
-      {answer ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{answer}</ReactMarkdown>
+      {answer ? <MarkdownContent>{answer}</MarkdownContent>
         : <p>The runtime returned an empty answer.</p>}
+      {onContinue && <button type="button" className="button secondary" onClick={() => {
+        try {
+          onContinue(continueReviewConversation(submittedQuestion, answer, submittedContext));
+          setError("");
+        } catch (cause) { setError(String(cause)); }
+      }}>Continue in chat</button>}
     </article>}
-    <footer>This answer is not a saved chat. Closing the panel discards the displayed answer.</footer>
+    <footer>This answer is not a saved chat. Continue in chat attaches this question and answer to a normal draft for explicit submission. Closing without continuing discards the displayed answer.</footer>
   </section>;
 }

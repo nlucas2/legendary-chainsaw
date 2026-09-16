@@ -3,14 +3,18 @@ import { useEffect, useId, useState } from "react";
 import {
   TYPOGRAPHY_LIMITS,
   chatFontFamily,
+  reasoningTypography,
   sanitizeCustomFontFamily,
   terminalTypography,
   typographyPreset,
   type ChatFontFamily,
+  type ReasoningFontFamily,
+  type ReasoningTone,
   type TerminalFontFamily,
   type TypographySettings,
 } from "../lib/typography";
 import type { TypographyController } from "../lib/useTypography";
+import type { ChatWidth } from "../lib/chatWidth";
 import "../typography.css";
 
 export type ThemePreference = "auto" | "light" | "dark";
@@ -21,6 +25,9 @@ interface SettingsPanelProps {
   onOpenRuntime: () => void;
   onClose: () => void;
   typography?: TypographyController;
+  chatWidth?: ChatWidth;
+  onChatWidthChange?: (width: ChatWidth) => void;
+  chatWidthError?: string;
 }
 
 const schemes: {
@@ -55,6 +62,9 @@ export function SettingsPanel({
   onOpenRuntime,
   onClose,
   typography,
+  chatWidth = "readable",
+  onChatWidthChange,
+  chatWidthError,
 }: SettingsPanelProps) {
   return (
     <div className="settings-backdrop">
@@ -102,6 +112,12 @@ export function SettingsPanel({
               </button>
             ))}
           </div>
+          {onChatWidthChange && <label className="chat-width-setting">
+            <input type="checkbox" checked={chatWidth === "full"}
+              onChange={(event) => onChatWidthChange(event.target.checked ? "full" : "readable")} />
+            <span><strong>Use full chat width on desktop</strong><small>Expand messages and the composer to fit the available pane. Mobile keeps its current layout.</small></span>
+          </label>}
+          {chatWidthError && <p role="alert" className="typography-error">{chatWidthError}</p>}
         </div>
 
         {typography && <TypographySection typography={typography} />}
@@ -139,20 +155,23 @@ function TypographySection({ typography }: { typography: TypographyController })
   const { settings, setSettings, error, reset } = typography;
   const id = useId();
   const terminal = terminalTypography(settings);
+  const reasoning = reasoningTypography(settings);
   const updateChat = (patch: Partial<TypographySettings>) =>
     setSettings((current) => ({ ...current, ...patch, preset: "custom" }));
   const updateTerminal = (patch: Partial<TypographySettings>) =>
     setSettings((current) => ({ ...current, ...patch }));
+  const updateReasoning = (patch: Partial<TypographySettings>) =>
+    setSettings((current) => ({ ...current, ...patch }));
   return (
     <section className="settings-section typography-settings" aria-labelledby={`${id}-title`}>
-      <div className="settings-section-title">
+      <details className="typography-disclosure">
+      <summary className="settings-section-title">
         <SlidersHorizontal size={15} aria-hidden="true" />
         <div>
           <strong id={`${id}-title`}>Font &amp; spacing</strong>
-          <span>Local fonts only. Changes preview immediately; no terminal restart.</span>
+          <span>Customize local fonts, sizes, and spacing</span>
         </div>
-      </div>
-      {error && <p className="typography-error" role="alert">{error}</p>}
+      </summary>
       <div className="typography-presets" role="group" aria-label="Typography presets">
         <button type="button" aria-pressed={settings.preset === "default"} onClick={reset}>
           Original
@@ -161,7 +180,7 @@ function TypographySection({ typography }: { typography: TypographyController })
         <button
           type="button"
           aria-pressed={settings.preset === "cli"}
-          onClick={() => setSettings(typographyPreset("cli"))}
+          onClick={() => setSettings((current) => typographyPreset("cli", current))}
         >
           CLI-like
           <small>Readable monospace, compact spacing</small>
@@ -199,8 +218,60 @@ function TypographySection({ typography }: { typography: TypographyController })
         <TypographySlider label="Paragraph spacing" setting="paragraphSpacing" value={settings.paragraphSpacing} unit="px"
           onChange={(paragraphSpacing) => updateChat({ paragraphSpacing })} />
         <p className="typography-hint">
-          Affects messages, reasoning summaries, and the composer—not sidebar text or icons.
+          Affects messages and the composer, plus reasoning unless customized below—not sidebar text or icons.
           Code stays monospace. Original keeps the existing per-element spacing until customized.
+        </p>
+      </fieldset>
+      <fieldset>
+        <legend>Reasoning</legend>
+        <label className="typography-field" htmlFor={`${id}-reasoning-styling`}>
+          <span>Reasoning styling</span>
+          <select id={`${id}-reasoning-styling`} value={settings.reasoningCustom ? "custom" : "shared"}
+            onChange={(event) => updateReasoning({ reasoningCustom: event.target.value === "custom" })}>
+            <option value="shared">Use chat styling</option>
+            <option value="custom">Customize reasoning</option>
+          </select>
+        </label>
+        {settings.reasoningCustom && <div className="typography-reasoning-controls">
+          <label className="typography-field" htmlFor={`${id}-reasoning-family`}>
+            <span>Reasoning font</span>
+            <select id={`${id}-reasoning-family`} value={settings.reasoningFontFamily}
+              onChange={(event) => updateReasoning({ reasoningFontFamily: event.target.value as ReasoningFontFamily })}>
+              <option value="shared">Use chat font</option>
+              <option value="system">System sans-serif</option>
+              <option value="mono">Monospace</option>
+              <option value="custom">Custom local font</option>
+            </select>
+          </label>
+          {settings.reasoningFontFamily === "custom" && <CustomFontInput
+            label="Custom reasoning font families"
+            value={settings.reasoningCustomFontFamily}
+            onApply={(reasoningCustomFontFamily) => updateReasoning({ reasoningCustomFontFamily })}
+          />}
+          <TypographySlider label="Reasoning font size" setting="reasoningFontSize" value={settings.reasoningFontSize} unit="px"
+            onChange={(reasoningFontSize) => updateReasoning({ reasoningFontSize })} />
+          <TypographySlider label="Reasoning line spacing" setting="reasoningLineHeight" value={settings.reasoningLineHeight} unit="×"
+            onChange={(reasoningLineHeight) => updateReasoning({ reasoningLineHeight })} />
+          <TypographySlider label="Reasoning paragraph spacing" setting="reasoningParagraphSpacing" value={settings.reasoningParagraphSpacing} unit="px"
+            onChange={(reasoningParagraphSpacing) => updateReasoning({ reasoningParagraphSpacing })} />
+          <label className="typography-checkbox">
+            <input type="checkbox" checked={settings.reasoningItalic}
+              onChange={(event) => updateReasoning({ reasoningItalic: event.target.checked })} />
+            <span>Italic reasoning</span>
+          </label>
+          <label className="typography-field" htmlFor={`${id}-reasoning-tone`}>
+            <span>Reasoning tone</span>
+            <select id={`${id}-reasoning-tone`} value={settings.reasoningTone}
+              onChange={(event) => updateReasoning({ reasoningTone: event.target.value as ReasoningTone })}>
+              <option value="original">Original reasoning tone</option>
+              <option value="normal">Normal text</option>
+              <option value="muted">Muted text</option>
+            </select>
+          </label>
+        </div>}
+        <p className="typography-hint">
+          Use chat styling preserves the current reasoning appearance. Customization affects only
+          reasoning text, not chat, the composer, or terminal. Code stays monospace; links and tables keep their theme colors.
         </p>
       </fieldset>
       <fieldset>
@@ -244,6 +315,16 @@ function TypographySection({ typography }: { typography: TypographyController })
           <p style={{ margin: `0 0 ${settings.paragraphSpacing}px` }}>You: Show the next step.</p>
           <p style={{ margin: 0 }}>Copilot: Review the changes, then run the tests.</p>
         </div>
+        {settings.reasoningCustom && <div className="typography-reasoning-preview reasoning-content" aria-label="Reasoning typography preview" style={{
+          fontFamily: reasoning.fontFamily,
+          fontSize: `${reasoning.fontSize}px`,
+          lineHeight: reasoning.lineHeight,
+          fontStyle: reasoning.fontStyle,
+          color: settings.reasoningTone === "original" ? undefined : `var(--${settings.reasoningTone === "muted" ? "muted" : "text"})`,
+        }}>
+          <p style={{ margin: `0 0 ${reasoning.paragraphSpacing}px` }}>Reasoning: Compare the alternatives.</p>
+          <p style={{ margin: 0 }}>Then verify the chosen approach.</p>
+        </div>}
         <pre className="typography-terminal-preview" style={{
           fontFamily: terminal.fontFamily,
           fontSize: `${terminal.fontSize}px`,
@@ -251,6 +332,8 @@ function TypographySection({ typography }: { typography: TypographyController })
         }}>{"PS > git status\nOn branch main"}</pre>
       </section>
       <button className="typography-reset" type="button" onClick={reset}>Reset font &amp; spacing</button>
+      </details>
+      {error && <p className="typography-error" role="alert">{error}</p>}
     </section>
   );
 }

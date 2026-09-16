@@ -1,0 +1,110 @@
+.git-diff-lines {
+  overflow: auto;
+  min-width: 0;
+  max-width: 100%;
+  width: 100%;
+  max-height: 48vh;
+  border: 1px solid var(--line, #444c56);
+  border-radius: 6px;
+  color: #e6edf3;
+  background: #0d1117;
+  touch-action: pan-x pan-y;
+}
+
+.git-diff-lines-help {
+  margin: 0;
+  padding: 6px 10px;
+  color: #b1bac4;
+  background: #161b22;
+  border-bottom: 1px solid var(--line, #444c56);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.git-diff-lines-list {
+  min-width: max-content;
+  outline: none;
+}
+
+.git-diff-lines .git-diff-line {
+  display: flex;
+  align-items: baseline;
+  min-width: max-content;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.git-diff-lines .git-diff-line code {
+  padding-right: 14px;
+  white-space: pre;
+  font-family: "Cascadia Code", Consolas, monospace;
+}
+
+.git-diff-lines .git-diff-line.add {
+  background: #122b20;
+}
+
+.git-diff-lines .git-diff-line.delete {
+  background: #341a20;
+}
+
+.git-diff-lines .git-diff-line.hunk {
+  color: #a5d6ff;
+  background: #14283e;
+}
+
+.git-diff-lines .git-diff-line.meta {
+  color: #b1bac4;
+}
+
+.git-diff-lines-list:focus-visible {
+  outline: 2px solid #79c0ff;
+  outline-offset: -2px;
+}
+
+.git-diff-lines .git-diff-line[role="option"] {
+  cursor: text;
+}
+
+.git-diff-lines .git-diff-line.active {
+  box-shadow: inset 3px 0 #79c0ff;
+}
+
+.git-diff-lines .git-diff-line.selected {
+  background: #253f62;
+  box-shadow: inset 3px 0 #79c0ff;
+}
+
+.git-diff-lines .git-diff-number {
+  flex: 0 0 45px;
+  width: 45px;
+  text-align: right;
+  padding-right: 10px;
+  user-select: none;
+  color: #8b949e;
+  font-family: monospace;
+}
+
+@media (max-width: 760px) {
+  .git-diff-lines {
+    max-height: none;
+    overscroll-behavior-x: contain;
+  }
+
+  .git-diff-lines-help {
+    font-size: 10px;
+  }
+
+  .git-diff-lines .git-diff-line {
+    align-items: center;
+    min-height: 30px;
+    line-height: 1.5;
+  }
+
+  .git-diff-lines .git-diff-number {
+    flex-basis: 35px;
+    width: 35px;
+    padding-right: 6px;
+    font-size: 11px;
+  }
+}

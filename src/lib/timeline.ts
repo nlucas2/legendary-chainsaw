@@ -1,4 +1,5 @@
 import type { SessionEvent } from "./types.ts";
+import { messageOrigin, type MessageOrigin } from "./messageOrigin.ts";
 
 export interface TimelineAttachment {
   name: string;
@@ -10,6 +11,7 @@ export type TimelineItem =
       kind: "message";
       id: string;
       role: "user" | "assistant";
+      userOrigin?: MessageOrigin;
       content: string;
       attachments?: readonly TimelineAttachment[];
       streaming?: boolean;
@@ -101,6 +103,7 @@ export interface TimelineOptions {
   subagentContext?: readonly SessionEvent[];
   /** Current selection is used for newly appended turns, never old history. */
   assistantModel?: string;
+  subagentConversation?: boolean;
 }
 
 export interface TimelineProjection {
@@ -160,6 +163,7 @@ export function projectTimeline(
   const append = previous !== undefined &&
     previous.options.sessionId === options.sessionId &&
     previous.options.windowStartEventId === options.windowStartEventId &&
+    !!previous.options.subagentConversation === !!options.subagentConversation &&
     sameEvents(previous.options.subagentContext ?? EMPTY_EVENTS, context) &&
     samePrefix(previous.events, events);
   if (append && previous.events === events &&
@@ -170,7 +174,7 @@ export function projectTimeline(
     : Math.max(0, options.windowStartEventId
       ? events.findIndex((event) => event.id === options.windowStartEventId)
       : 0);
-  const draft = new Draft(append ? previous.state : emptyState());
+  const draft = new Draft(append ? previous.state : emptyState(), options.subagentConversation);
   const start = append ? previous.events.length : 0;
   let visibleIds: Set<string> | undefined;
   for (let index = start; index < events.length; index += 1) {
@@ -211,9 +215,11 @@ type MapKey = "positions" | "tools" | "reasoning" | "messages" |
 class Draft {
   state: TimelineState;
   private copied = new Set<string>();
+  private subagentConversation: boolean;
 
-  constructor(previous: TimelineState) {
+  constructor(previous: TimelineState, subagentConversation = false) {
     this.state = { ...previous };
+    this.subagentConversation = subagentConversation;
   }
 
   private map<K extends MapKey>(key: K): Map<
@@ -484,7 +490,7 @@ class Draft {
     }
     if (lifecycle) return true;
     const prior = this.state.children.get(id) ?? emptyState(item.model);
-    const child = new Draft(prior);
+    const child = new Draft(prior, true);
     child.event({ ...event, agentId: undefined });
     this.map("children").set(id, child.state);
     const finding = event.type === "assistant.message" ? assistantMessageContent(data) : "";
@@ -519,6 +525,7 @@ class Draft {
         if (content.trim() || attachments.length) {
           this.put({
             kind: "message", id: event.id, role: "user", content,
+            userOrigin: messageOrigin(data.source, this.subagentConversation),
             ...(attachments.length ? { attachments } : {}),
           });
         }

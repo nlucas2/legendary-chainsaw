@@ -197,6 +197,7 @@ impl SessionService {
                 is_active: false,
                 is_remote: source.is_remote,
                 pinned: false,
+                archived: false,
                 folder: None,
                 tags: Vec::new(),
             };
@@ -246,14 +247,13 @@ impl SessionService {
                     "Native rename did not persist the requested name.".into(),
                 ));
             }
-            service
-                .metadata
-                .write()
-                .await
+            let mut metadata = service.metadata.write().await;
+            let meta = metadata
                 .entry(request.session_id.clone())
-                .or_default()
-                .title = Some(name.clone());
+                .or_default();
+            meta.title = Some(name.clone());
             summary.title = name;
+            summary.archived = meta.archived;
             let mut cache = service.session_cache.write().await;
             if let Some(existing) = cache
                 .iter_mut()
@@ -265,6 +265,7 @@ impl SessionService {
                 cache.push(summary.clone());
             }
             drop(cache);
+            drop(metadata);
             service.persist_metadata().await?;
             Ok(summary)
         })

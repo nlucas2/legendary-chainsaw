@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+cap-fs-ext = "4.0.3"
+cap-std = "4.0.3"
 dirs.workspace = true
 futures-util.workspace = true
 github-copilot-sdk.workspace = true

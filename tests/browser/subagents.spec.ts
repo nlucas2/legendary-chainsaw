@@ -146,6 +146,47 @@ test("live child events exclude parent/sibling output and failed sends keep draf
   await expect(page.getByRole("textbox", { name: "Message Old agent", exact: true })).toBeDisabled();
 });
 
+test("subagent instruction attribution survives history and live updates without calling agents You", async ({ page }) => {
+  await setup(page);
+  const owner = "agent-a-shared-id";
+  await page.route("**/api/agent_history", (route) => route.fulfill({ json: {
+    sessionId: "a", taskId: "shared-id", agentId: owner, cursor: null, hasMore: false,
+    events: [
+      { ...event("agent-instruction", "user.message", "Only four files move.\n\nPlease narrow the remaining mapping.", owner), data: {
+        content: "Only four files move.\n\nPlease narrow the remaining mapping.", source: "agent-primary",
+      } },
+      event("unknown-instruction", "user.message", "Older instruction without sender metadata", owner),
+      { ...event("human-instruction", "user.message", "I typed this follow-up", owner), data: {
+        content: "I typed this follow-up", source: "user",
+      } },
+      event("answer", "assistant.message", "I will narrow the mapping.", owner),
+    ],
+  } }));
+  const a = await expand(page, "a");
+  await a.getByRole("button", { name: /Builder/ }).click();
+  const child = page.locator(".agent-conversation");
+  await expect(child.locator(".message.user .message-role")).toHaveText(["Agent instruction", "Instruction", "You"]);
+  await expect(child.locator("[data-message-origin='agent'] .message-role span")).toHaveAttribute("title", /agent-primary/);
+  await expect(child.locator("[data-message-origin='agent'] .user-message-text")).toHaveCSS("white-space", "pre-wrap");
+  await expect(child.locator("[data-root-human]")).toHaveCount(0);
+  await page.evaluate((input) => window.dispatchEvent(new CustomEvent("test-daemon", { detail: {
+    type: "session_event", sessionId: "a", event: input,
+  } })), { ...event("live-skill", "user.message", "Skill material", owner), data: { content: "Skill material", source: "skill-pdf" } });
+  await expect(child.locator(".message.user .message-role")).toHaveText(["Agent instruction", "Instruction", "You", "Skill instructions"]);
+  await child.getByRole("button", { name: "Refresh conversation" }).click();
+  await expect(child.locator(".message.user .message-role")).toHaveText(["Agent instruction", "Instruction", "You", "Skill instructions"]);
+  await child.getByRole("button", { name: "Back to parent" }).click();
+  const parent = page.locator(".parent-session-view");
+  await expect(parent.locator("[data-root-human] .message-role")).toHaveText("You");
+  await page.evaluate((input) => window.dispatchEvent(new CustomEvent("test-daemon", { detail: {
+    type: "session_event", sessionId: "a", event: input,
+  } })), { ...event("root-agent-message", "user.message", "A forwarded agent instruction"), data: {
+    content: "A forwarded agent instruction", source: "agent-reviewer",
+  } });
+  await expect(parent.locator("[data-message-origin='agent'] .message-role")).toHaveText("Agent instruction");
+  await expect(parent.locator("[data-root-human]")).toHaveCount(1);
+});
+
 test("agent and parent keyboard commands cannot accidentally submit or modify the parent", async ({ page }) => {
   const state = await setup(page);
   const a = await expand(page, "a");
@@ -433,6 +474,7 @@ test("CLI-like typography is opt-in, persists locally, and updates the terminal 
   await page.getByTitle("Open terminal").click();
   await expect.poll(() => connections).toBe(1);
   await page.locator(".daemon-state").click();
+  await page.locator(".typography-disclosure > summary").click();
   await page.getByRole("button", { name: /CLI-like/ }).click();
   expect(await text.evaluate((element) => getComputedStyle(element).fontFamily)).toContain("Cascadia");
   const slider = page.getByRole("slider", { name: "Terminal font size", exact: true });
@@ -446,6 +488,7 @@ test("CLI-like typography is opt-in, persists locally, and updates the terminal 
   await expect(text).toBeVisible();
   expect(await text.evaluate((element) => getComputedStyle(element).fontFamily)).toContain("Cascadia");
   await page.locator(".daemon-state").click();
+  await page.locator(".typography-disclosure > summary").click();
   await page.getByRole("button", { name: "Reset font & spacing", exact: true }).click();
   expect(await text.evaluate((element) => getComputedStyle(element).fontFamily)).not.toContain("Cascadia");
 });
@@ -491,10 +534,10 @@ test("Git review comments open an explicit transient question draft without send
   await page.getByRole("button", { name: "Open Git workspace" }).click();
   const git = page.getByRole("dialog", { name: "Git workspace" });
   await git.getByRole("button", { name: /file\.rs/ }).click();
-  await git.getByRole("checkbox", { name: "Select added line new:1", exact: true }).check();
+  await git.getByRole("option", { name: "Added line new:1", exact: true }).click();
   await git.getByLabel("Local review comment").fill("Why was this changed?");
   await git.getByRole("button", { name: "Save local comment" }).click();
-  await git.getByRole("button", { name: "Ask about comment" }).click();
+  await git.getByRole("button", { name: "Quick ask about comment" }).click();
   const ask = page.getByRole("dialog", { name: "Ask about conversation" });
   await expect(ask.getByLabel("Question", { exact: true })).toHaveValue(/Why was this changed\?/);
   expect(asked).toBe(false);
@@ -502,4 +545,154 @@ test("Git review comments open an explicit transient question draft without send
   await ask.getByRole("button", { name: "Ask", exact: true }).click();
   await expect(ask.getByRole("article", { name: "Transient answer" })).toContainText("Review answer");
   expect(asked).toBe(true);
+});
+
+test("mobile Git controls and footer remain bounded with the full application stylesheet", async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await setup(page);
+  const branch = "joklein/windows-driver-rust-integration";
+  const filename = "rust/crates/tunnel-tun-linux/src/lib.rs";
+  const workspace = {
+    state: "repository", repoRoot: "Q:/gits/db/windows-driver-rust-integration", branch, head: "a".repeat(40),
+    upstream: `refs/remotes/origin/${branch}`, base: `refs/remotes/origin/${branch}`, baseCommit: "b".repeat(40),
+    mergeBase: "c".repeat(40), detached: false, unborn: false, warnings: [], compareUnavailableReason: null,
+    refs: [{ name: "refs/heads/main", commit: "d".repeat(40) }],
+    staged: [], unstaged: [], untracked: [],
+    compare: [filename, "docs/design/design.md"].map((path) => ({ path, originalPath: null, status: "M", kind: "file", added: 1, deleted: 1, binary: false })),
+  };
+  await page.route("**/api/git_workspace", (route) => route.fulfill({ json: workspace }));
+  await page.route("**/api/git_diff", (route) => route.fulfill({ json: {
+    ...workspace, view: "compare", path: route.request().postDataJSON().path, originalPath: null,
+    contentId: "file", kind: "file", added: 1, deleted: 1, binary: false, truncated: false, unavailableReason: null,
+    patch: "@@ -20,40 +20,40 @@\n-old\n+new " + "x".repeat(200) + "\n" + " unchanged line\n".repeat(39),
+  } }));
+  await page.getByRole("button", { name: "Open Git workspace" }).click();
+  const panel = page.getByRole("dialog", { name: "Git workspace" });
+  await panel.getByRole("combobox", { name: "Git change view" }).selectOption("compare");
+  const picker = panel.getByRole("combobox", { name: "Choose file" });
+  await picker.selectOption(filename);
+  await expect(panel.getByRole("region", { name: "Selected file unified diff" })).toBeVisible();
+  expect(await panel.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+  await panel.evaluate((element) => { element.scrollTop = element.scrollHeight; });
+  await expect(picker).toBeInViewport();
+  const boundaries = await panel.evaluate((element) => ({
+    diff: element.querySelector(".git-panel-diff")!.getBoundingClientRect().bottom,
+    editor: element.querySelector(".git-panel-comment-editor")!.getBoundingClientRect().top,
+    editorEnd: element.querySelector(".git-panel-comment-editor")!.getBoundingClientRect().bottom,
+    footer: element.querySelector("footer")!.getBoundingClientRect().top,
+  }));
+  expect(boundaries.editor).toBeGreaterThanOrEqual(boundaries.diff);
+  expect(boundaries.footer).toBeGreaterThanOrEqual(boundaries.editorEnd);
+  await page.screenshot({ path: testInfo.outputPath("mobile-git-app-footer.png") });
+  await panel.getByRole("button", { name: "Next file" }).click();
+  await expect(picker).toHaveValue("docs/design/design.md");
+  await panel.locator(".git-mobile-options summary").click();
+  const select = panel.getByLabel("Comparison target");
+  await expect(select).toBeVisible();
+  expect((await select.boundingBox())!.x).toBeGreaterThanOrEqual(0);
+  expect(await panel.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+});
+
+test("desktop continuous Git keeps the file list visible and notes/footer below oversized diffs", async ({ page }, testInfo) => {
+  await setup(page);
+  const workspace = {
+    state: "repository", repoRoot: "Q:\\example", branch: "feature", head: "a".repeat(40),
+    upstream: null, base: null, baseCommit: null, mergeBase: null, detached: false, unborn: false,
+    refs: [], staged: [], untracked: [], compare: [], compareUnavailableReason: "Choose a target", warnings: [],
+    unstaged: Array.from({ length: 3 }, (_, index) => ({
+      path: `src/long-module-name/file-${index}.rs`, originalPath: null, status: "M", kind: "file", added: 1, deleted: 1, binary: false,
+    })),
+  };
+  await page.route("**/api/git_workspace", (route) => route.fulfill({ json: workspace }));
+  await page.route("**/api/git_diff", (route) => {
+    const args = route.request().postDataJSON();
+    return route.fulfill({ json: {
+      repoRoot: workspace.repoRoot, path: args.path, originalPath: null, view: "unstaged",
+      head: workspace.head, base: null, baseCommit: null, mergeBase: null, contentId: args.context ?? "changes",
+      context: args.context ?? "changes", fullContextComplete: args.context === "full",
+      patch: "@@ -1,150 +1,150 @@\n-old\n+new " + "x".repeat(220) + "\n" + " context line\n".repeat(args.context === "full" ? 299 : 149),
+      truncated: false, binary: false, kind: "file", added: 1, deleted: 1, unavailableReason: null, warnings: [],
+    } });
+  });
+  await page.getByRole("button", { name: "Open Git workspace" }).click();
+  const panel = page.getByRole("dialog", { name: "Git workspace" });
+  await panel.getByRole("button", { name: "Continuous diffs", exact: true }).click();
+  const list = panel.locator(".git-panel-files");
+  for (const file of workspace.unstaged) {
+    await list.getByTitle(file.path, { exact: true }).click();
+    const card = panel.getByRole("article", { name: `Diff for ${file.path}`, exact: true });
+    await expect(card.getByRole("region")).toContainText("+new");
+    await expect(list.getByTitle(file.path, { exact: true })).toHaveAttribute("aria-current", "location");
+    await card.getByLabel("Whole-file context").check();
+    await expect(card).toContainText("Complete file context.");
+    await card.getByRole("option", { name: "Added line new:1", exact: true }).click();
+    await card.getByLabel("Local review comment", { exact: true }).fill("A lengthy local note that should never paint over a later diff. ".repeat(10));
+    await card.getByRole("button", { name: "Save local comment", exact: true }).click();
+    const geometry = await card.evaluate((element) => {
+      const diff = element.querySelector(".git-panel-diff")!;
+      const editor = element.querySelector(".git-panel-comment-editor")!;
+      const comments = element.querySelector(".git-panel-comments")!;
+      const panel = element.closest(".git-panel")!;
+      return {
+        diffBottom: diff.getBoundingClientRect().bottom, editorTop: editor.getBoundingClientRect().top,
+        editorBottom: editor.getBoundingClientRect().bottom, commentsTop: comments.getBoundingClientRect().top,
+        commentsBottom: comments.getBoundingClientRect().bottom, cardBottom: element.getBoundingClientRect().bottom,
+        footerTop: panel.querySelector(".git-panel-body > footer")!.getBoundingClientRect().top,
+        feedBottom: panel.querySelector(".git-diff-feed")!.getBoundingClientRect().bottom,
+        overflow: panel.scrollWidth > panel.clientWidth + 1,
+      };
+    });
+    expect(geometry.editorTop).toBeGreaterThanOrEqual(geometry.diffBottom);
+    expect(geometry.commentsTop).toBeGreaterThanOrEqual(geometry.editorBottom);
+    expect(geometry.cardBottom).toBeGreaterThanOrEqual(geometry.commentsBottom);
+    expect(geometry.footerTop).toBeGreaterThanOrEqual(geometry.feedBottom);
+    expect(geometry.overflow).toBe(false);
+    await expect(list).toBeInViewport();
+  }
+  await panel.evaluate((element) => { element.scrollTop = element.scrollHeight; });
+  const footer = panel.locator(".git-panel-body > footer");
+  await expect(footer).toBeInViewport();
+  expect((await footer.boundingBox())!.y).toBeGreaterThanOrEqual((await panel.locator(".git-diff-feed").boundingBox())!.y
+    + (await panel.locator(".git-diff-feed").boundingBox())!.height);
+  await page.screenshot({ path: testInfo.outputPath("desktop-continuous-footer.png") });
+});
+
+test("untracked text can be reviewed from Unstaged with the full app on desktop and mobile", async ({ page }, testInfo) => {
+  await setup(page);
+  const path = "src/new-module/new-component.tsx";
+  const workspace = {
+    state: "repository", repoRoot: "Q:\\example", branch: "feature", head: "a".repeat(40),
+    upstream: null, base: null, baseCommit: null, mergeBase: null, detached: false, unborn: false,
+    refs: [], staged: [], unstaged: [], compare: [], compareUnavailableReason: "Choose a target", warnings: [],
+    untracked: [{ path, originalPath: null, status: "?", kind: "untracked", added: null, deleted: null, binary: false }],
+  };
+  const views: string[] = [];
+  await page.route("**/api/git_workspace", (route) => route.fulfill({ json: workspace }));
+  await page.route("**/api/git_diff", (route) => {
+    const args = route.request().postDataJSON();
+    views.push(args.view);
+    if (args.view !== "untracked") return route.fulfill({ status: 400, body: "This path is not a tracked unstaged file." });
+    return route.fulfill({ json: {
+      repoRoot: workspace.repoRoot, path, originalPath: null, view: "untracked", head: workspace.head,
+      base: null, baseCommit: null, mergeBase: null, contentId: "new-file",
+      patch: "--- /dev/null\n+++ b/src/new-module/new-component.tsx\n@@ -0,0 +1,3 @@\n+export const title = 'New file';\n+const literal = '<script>not executable</script>';\n+export const answer = 42;\n",
+      truncated: false, binary: false, kind: "untracked", added: 3, deleted: 0, unavailableReason: null, warnings: [],
+    } });
+  });
+  await page.getByRole("button", { name: "Open Git workspace" }).click();
+  const panel = page.getByRole("dialog", { name: "Git workspace" });
+  await expect(panel.getByRole("button", { name: "Unstaged 1", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await panel.getByTitle(path, { exact: true }).click();
+  const patch = panel.getByRole("region", { name: "Selected file unified diff" });
+  await expect(patch).toContainText("export const title = 'New file'");
+  await expect(patch.locator(".git-diff-line.add")).toHaveCount(3);
+  await expect(patch.locator("script")).toHaveCount(0);
+  await expect(panel.getByRole("option", { name: "Added line new:3", exact: true })).toBeVisible();
+  await expect(panel.getByLabel("Whole-file context")).toHaveCount(0);
+  await page.screenshot({ path: testInfo.outputPath("untracked-additions-desktop.png") });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(panel.getByRole("combobox", { name: "Choose file" })).toHaveValue(path);
+  await expect(patch).toContainText("export const answer = 42");
+  expect(await panel.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+  expect(views).toEqual(["untracked"]);
 });

@@ -8,6 +8,471 @@ use std::{
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
+#[tokio::test]
+async fn untracked_text_previews_preserve_contents_and_response_contract() {
+    let repo = Repo::new();
+    repo.write("tracked", "baseline\n");
+    let head = repo.commit();
+    let before_index = fs::read(repo.0.join(".git/index")).unwrap();
+    for (path, contents, body, count) in [
+        (
+            "nested/new file.txt",
+            "first\nsecond\n",
+            "+first\n+second\n",
+            2,
+        ),
+        (
+            "unicode-漢字-🦀.txt",
+            "héllo 漢字 🦀\n",
+            "+héllo 漢字 🦀\n",
+            1,
+        ),
+        ("-option [literal].txt", "literal\n", "+literal\n", 1),
+        (
+            "no-final-newline.txt",
+            "last",
+            "+last\n\\ No newline at end of file\n",
+            1,
+        ),
+        (
+            "windows-lines.txt",
+            "first\r\nsecond\r\n",
+            "+first\r\n+second\r\n",
+            2,
+        ),
+    ] {
+        repo.write(path, contents);
+        for context in [GitDiffContext::Changes, GitDiffContext::Full] {
+            let preview = repo
+                .diff_with_context(GitView::Untracked, path, None, context)
+                .await;
+            assert!(preview.unavailable_reason.is_none(), "{preview:?}");
+            assert_eq!(preview.path, path);
+            assert_eq!(preview.view, GitView::Untracked);
+            assert_eq!(preview.context, context);
+            assert_eq!(preview.kind, "untracked");
+            assert_eq!(preview.head.as_deref(), Some(head.as_str()));
+            assert!(!preview.repo_root.is_empty());
+            assert!(preview.original_path.is_none());
+            assert_eq!(preview.added, Some(count));
+            assert_eq!(preview.deleted, Some(0));
+            assert!(!preview.binary);
+            assert!(!preview.truncated);
+            assert_eq!(
+                preview.full_context_complete,
+                context == GitDiffContext::Full
+            );
+            assert!(preview.patch.contains("--- /dev/null\n"));
+            assert!(
+                preview
+                    .patch
+                    .contains(&format!("@@ -0,0 +1,{count} @@\n{body}")),
+                "{preview:?}"
+            );
+            assert!(!preview.content_id.is_empty());
+        }
+        assert_eq!(fs::read(repo.0.join(path)).unwrap(), contents.as_bytes());
+    }
+    assert_eq!(fs::read(repo.0.join(".git/index")).unwrap(), before_index);
+    let state = workspace(repo.cwd(), None).await.unwrap();
+    assert!(state.unstaged.is_empty());
+    assert_eq!(state.untracked.len(), 5);
+}
+
+#[tokio::test]
+async fn untracked_empty_file_has_an_explicit_complete_zero_line_preview() {
+    let repo = Repo::new();
+    repo.write("empty", "");
+    let preview = repo
+        .diff_with_context(GitView::Untracked, "empty", None, GitDiffContext::Full)
+        .await;
+    assert!(preview.head.is_none());
+    assert!(preview.unavailable_reason.is_none(), "{preview:?}");
+    assert!(preview.patch.ends_with("@@ -0,0 +0,0 @@\n"));
+    assert!(
+        preview
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Empty untracked file"))
+    );
+    assert_eq!(preview.added, Some(0));
+    assert_eq!(preview.deleted, Some(0));
+    assert!(preview.full_context_complete);
+    assert!(!preview.truncated);
+}
+
+#[tokio::test]
+async fn untracked_identity_tracks_changes_including_unread_tail_and_is_stable() {
+    let repo = Repo::new();
+    repo.write("new.txt", "first\n");
+    let first = repo.diff(GitView::Untracked, "new.txt", None).await;
+    let repeat = repo.diff(GitView::Untracked, "new.txt", None).await;
+    assert_eq!(first.content_id, repeat.content_id);
+    repo.write("new.txt", "next!\n");
+    let second = repo.diff(GitView::Untracked, "new.txt", None).await;
+    assert_eq!(first.head, second.head);
+    assert_ne!(first.content_id, second.content_id);
+    repo.write("large.txt", "line\n".repeat(PATCH_LINES * 20));
+    let large = repo.diff(GitView::Untracked, "large.txt", None).await;
+    {
+        use std::io::Write;
+        fs::OpenOptions::new()
+            .append(true)
+            .open(repo.0.join("large.txt"))
+            .unwrap()
+            .write_all(b"unread tail changed\n")
+            .unwrap();
+    }
+    let larger = repo.diff(GitView::Untracked, "large.txt", None).await;
+    assert!(large.truncated && larger.truncated);
+    assert_eq!(large.patch, larger.patch);
+    assert_ne!(large.content_id, larger.content_id);
+}
+
+#[tokio::test]
+async fn untracked_caps_bound_lines_bytes_and_keep_utf8_characters_whole() {
+    let repo = Repo::new();
+    for (path, contents) in [
+        ("many-lines", "line\n".repeat(PATCH_LINES * 30)),
+        (
+            "many-bytes",
+            format!("{}\n", "漢".repeat(300)).repeat(PATCH_LINES),
+        ),
+        ("huge-first-line", "x".repeat(PATCH_LIMIT * 2)),
+    ] {
+        repo.write(path, contents);
+        let preview = repo
+            .diff_with_context(GitView::Untracked, path, None, GitDiffContext::Full)
+            .await;
+        assert!(preview.unavailable_reason.is_none(), "{preview:?}");
+        assert!(preview.truncated);
+        assert!(!preview.binary);
+        assert!(!preview.full_context_complete);
+        assert!(preview.patch.len() <= PATCH_LIMIT);
+        assert!(preview.patch.lines().count() <= PATCH_LINES);
+        assert!(preview.patch.ends_with('\n'));
+        assert!(preview.added.is_none());
+        assert!(
+            preview
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("truncated at 192 KiB or 2500 lines"))
+        );
+        assert!(!preview.patch.contains("\\ No newline at end of file"));
+    }
+    repo.write(
+        "utf8-boundary",
+        format!("{}€\n", "x".repeat(PATCH_LIMIT - 1)),
+    );
+    let boundary = repo.diff(GitView::Untracked, "utf8-boundary", None).await;
+    assert!(boundary.truncated);
+    assert!(!boundary.binary, "{boundary:?}");
+    assert!(boundary.unavailable_reason.is_none());
+}
+
+#[tokio::test]
+async fn untracked_binary_and_non_utf8_have_no_text_preview() {
+    let repo = Repo::new();
+    for (path, contents) in [
+        ("binary", b"prefix\0binary\n".as_slice()),
+        ("invalid", b"\xffnot utf8\n".as_slice()),
+        ("unfinished-utf8", b"text\xe2\x82".as_slice()),
+    ] {
+        repo.write(path, contents);
+        let preview = repo
+            .diff_with_context(GitView::Untracked, path, None, GitDiffContext::Full)
+            .await;
+        assert!(preview.binary);
+        assert!(preview.patch.is_empty());
+        assert!(!preview.full_context_complete);
+        assert!(
+            preview
+                .unavailable_reason
+                .unwrap()
+                .contains("binary or not UTF-8")
+        );
+    }
+}
+
+#[tokio::test]
+async fn untracked_exact_patch_budgets_and_missing_newline_are_not_falsely_complete() {
+    let repo = Repo::new();
+    repo.write("lines", "line\n".repeat(PATCH_LINES - 5));
+    let exact_lines = repo
+        .diff_with_context(GitView::Untracked, "lines", None, GitDiffContext::Full)
+        .await;
+    assert_eq!(exact_lines.patch.lines().count(), PATCH_LINES);
+    assert!(exact_lines.full_context_complete);
+    repo.write("lines", format!("{}last", "line\n".repeat(PATCH_LINES - 6)));
+    let newline_marker = repo
+        .diff_with_context(GitView::Untracked, "lines", None, GitDiffContext::Full)
+        .await;
+    assert!(newline_marker.truncated);
+    assert!(!newline_marker.full_context_complete);
+    assert!(
+        !newline_marker
+            .patch
+            .contains("\\ No newline at end of file")
+    );
+    let header = "diff --git a/bytes b/bytes\nnew file mode 100644\n--- /dev/null\n+++ b/bytes\n@@ -0,0 +1,1 @@\n";
+    repo.write(
+        "bytes",
+        format!("{}\n", "x".repeat(PATCH_LIMIT - header.len() - 2)),
+    );
+    let exact_bytes = repo
+        .diff_with_context(GitView::Untracked, "bytes", None, GitDiffContext::Full)
+        .await;
+    assert_eq!(exact_bytes.patch.len(), PATCH_LIMIT);
+    assert!(exact_bytes.full_context_complete);
+    repo.write(
+        "bytes",
+        format!("{}\n", "x".repeat(PATCH_LIMIT - header.len() - 1)),
+    );
+    let over_bytes = repo
+        .diff_with_context(GitView::Untracked, "bytes", None, GitDiffContext::Full)
+        .await;
+    assert!(over_bytes.truncated);
+    assert!(!over_bytes.full_context_complete);
+    assert_eq!(over_bytes.added, Some(1));
+}
+
+#[tokio::test]
+async fn untracked_requires_exact_current_nonignored_git_membership() {
+    let repo = Repo::new();
+    repo.write("tracked", "baseline\n");
+    repo.write(".gitignore", "ignored\n");
+    repo.commit();
+    repo.write("ignored", "MUST NOT APPEAR\n");
+    repo.write("new.txt", "new text\n");
+    for path in ["tracked", "ignored", "vanished", "NEW.txt", "folder"] {
+        let preview = repo.diff(GitView::Untracked, path, None).await;
+        assert!(preview.patch.is_empty(), "{preview:?}");
+        assert!(
+            preview
+                .unavailable_reason
+                .unwrap()
+                .contains("no longer a Git-listed")
+        );
+    }
+    repo.git(&["add", "--", "new.txt"]);
+    let staged = repo.diff(GitView::Untracked, "new.txt", None).await;
+    assert!(staged.patch.is_empty());
+    assert!(staged.unavailable_reason.is_some());
+    let nested = repo.0.join("nested");
+    fs::create_dir(&nested).unwrap();
+    let nested_repo = Repo(nested);
+    nested_repo.git(&["init", "--quiet", "--initial-branch=main"]);
+    nested_repo.git(&["config", "user.name", "Git Workspace Fixture"]);
+    nested_repo.git(&["config", "user.email", "fixture@example.invalid"]);
+    nested_repo.git(&["config", "commit.gpgsign", "false"]);
+    nested_repo.write("inner", "NESTED MUST NOT APPEAR\n");
+    nested_repo.commit();
+    let directory = repo.diff(GitView::Untracked, "nested", None).await;
+    assert!(directory.patch.is_empty());
+    assert!(
+        directory
+            .unavailable_reason
+            .as_deref()
+            .unwrap()
+            .contains("nested repository"),
+        "{directory:?}"
+    );
+    let inner = repo.diff(GitView::Untracked, "nested/inner", None).await;
+    assert!(inner.patch.is_empty());
+    assert!(inner.unavailable_reason.is_some());
+    assert!(untracked::Snapshot::read(repo.cwd().into(), "nested/inner".into()).is_err());
+}
+
+#[test]
+fn untracked_rejects_metadata_traversal_and_windows_device_aliases() {
+    let repo = Repo::new();
+    for path in [
+        "../outside",
+        "/outside",
+        "a/../../outside",
+        "a//b",
+        ".git/config",
+        "a/.GiT/config",
+        "a/./b",
+    ] {
+        assert!(
+            untracked::Snapshot::read(repo.cwd().into(), path.into()).is_err(),
+            "{path}"
+        );
+    }
+    #[cfg(windows)]
+    for path in [
+        "C:/outside",
+        "C:outside",
+        r"\\server\share\file",
+        r"\\?\C:\outside",
+        r"\\.\NUL",
+        "new.txt:stream",
+        r"parent\outside",
+        "NUL",
+        "nul.txt",
+        "CON",
+        "CONOUT$",
+        "aux.log",
+        "COM1.txt",
+        "LPT¹",
+        "parent/PRN.txt",
+        "parent./file",
+        "parent /file",
+        ".git /config",
+        "GIT~1/config",
+    ] {
+        assert!(
+            untracked::Snapshot::read(repo.cwd().into(), path.into()).is_err(),
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn untracked_snapshot_prevents_or_detects_updates_and_replacements() {
+    let repo = Repo::new();
+    repo.write("parent/new", "snapshot\n");
+    let snapshot = untracked::Snapshot::read(repo.cwd().into(), "parent/new".into()).unwrap();
+    #[cfg(windows)]
+    {
+        assert!(fs::write(repo.0.join("parent/new"), "changed!\n").is_err());
+        assert!(fs::remove_file(repo.0.join("parent/new")).is_err());
+        assert!(fs::rename(repo.0.join("parent"), repo.0.join("moved")).is_err());
+        assert!(snapshot.validate().is_ok());
+    }
+    #[cfg(unix)]
+    {
+        fs::write(repo.0.join("parent/new"), "changed!\n").unwrap();
+        assert!(snapshot.validate().is_err());
+        fs::remove_file(repo.0.join("parent/new")).unwrap();
+        repo.write("parent/new", "snapshot\n");
+        assert!(snapshot.validate().is_err());
+    }
+    drop(snapshot);
+    fs::write(repo.0.join("parent/new"), "writable after inspection\n").unwrap();
+    #[cfg(unix)]
+    {
+        let snapshot = untracked::Snapshot::read(repo.cwd().into(), "parent/new".into()).unwrap();
+        fs::rename(repo.0.join("parent"), repo.0.join("moved")).unwrap();
+        fs::create_dir(repo.0.join("parent")).unwrap();
+        repo.write("parent/new", "replacement directory\n");
+        assert!(snapshot.validate().is_err());
+    }
+}
+
+#[test]
+fn untracked_hard_links_are_not_opened() {
+    let repo = Repo::new();
+    let outside = Repo::empty();
+    outside.write("secret", "OUTSIDE SECRET\n");
+    fs::hard_link(outside.0.join("secret"), repo.0.join("link")).unwrap();
+    let error = untracked::Snapshot::read(repo.cwd().into(), "link".into())
+        .err()
+        .unwrap();
+    assert!(error.contains("Hard-linked"), "{error}");
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn untracked_windows_junctions_and_ancestor_junctions_never_read_targets() {
+    let repo = Repo::new();
+    let outside = Repo::empty();
+    outside.write("secret", "OUTSIDE SECRET\n");
+    let junction = repo.0.join("junction");
+    let status = SyncCommand::new(std::env::var_os("ComSpec").unwrap())
+        .args(["/c", "mklink", "/J"])
+        .arg(&junction)
+        .arg(&outside.0)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "Cannot create isolated junction fixture");
+    for path in ["junction", "junction/secret"] {
+        assert!(
+            untracked::Snapshot::read(repo.cwd().into(), path.into()).is_err(),
+            "{path}"
+        );
+        let preview = repo.diff(GitView::Untracked, path, None).await;
+        assert!(preview.patch.is_empty(), "{preview:?}");
+        assert!(preview.unavailable_reason.is_some());
+    }
+    fs::remove_dir(&junction).unwrap();
+    assert_eq!(
+        fs::read(outside.0.join("secret")).unwrap(),
+        b"OUTSIDE SECRET\n"
+    );
+}
+
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn untracked_file_and_directory_symlinks_never_read_targets() {
+    let repo = Repo::new();
+    let outside = Repo::empty();
+    outside.write("secret", "OUTSIDE SECRET\n");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(outside.0.join("secret"), repo.0.join("link")).unwrap();
+        std::os::unix::fs::symlink(&outside.0, repo.0.join("parent")).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        if let Err(error) =
+            std::os::windows::fs::symlink_file(outside.0.join("secret"), repo.0.join("link"))
+        {
+            if error.raw_os_error() == Some(1314) {
+                eprintln!(
+                    "Windows symlink privilege unavailable; junction safety is tested separately."
+                );
+                return;
+            }
+            panic!("Cannot create symlink fixture: {error}");
+        }
+        std::os::windows::fs::symlink_dir(&outside.0, repo.0.join("parent")).unwrap();
+    }
+    for path in ["link", "parent/secret"] {
+        assert!(
+            untracked::Snapshot::read(repo.cwd().into(), path.into()).is_err(),
+            "{path}"
+        );
+        let preview = repo.diff(GitView::Untracked, path, None).await;
+        assert!(preview.patch.is_empty(), "{preview:?}");
+        assert!(preview.unavailable_reason.is_some());
+    }
+    fs::remove_file(repo.0.join("link")).unwrap();
+    #[cfg(windows)]
+    fs::remove_dir(repo.0.join("parent")).unwrap();
+    #[cfg(unix)]
+    fs::remove_file(repo.0.join("parent")).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn untracked_unix_unusual_paths_are_literal_and_headers_are_quoted() {
+    let repo = Repo::new();
+    for path in [
+        "line\nname",
+        "tab\tname",
+        "quote\"name",
+        "back\\slash",
+        ":(glob)*",
+    ] {
+        repo.write(path, "literal\n");
+        let preview = repo.diff(GitView::Untracked, path, None).await;
+        assert!(preview.unavailable_reason.is_none(), "{preview:?}");
+        assert_eq!(preview.path, path);
+        assert!(preview.patch.ends_with("@@ -0,0 +1,1 @@\n+literal\n"));
+        assert_eq!(preview.patch.lines().count(), 6);
+    }
+    {
+        use std::os::unix::fs::PermissionsExt;
+        repo.write("executable", "#!/bin/sh\n");
+        fs::set_permissions(repo.0.join("executable"), fs::Permissions::from_mode(0o755)).unwrap();
+        let preview = repo.diff(GitView::Untracked, "executable", None).await;
+        assert!(preview.patch.contains("new file mode 100755\n"));
+    }
+}
+
 struct Repo(PathBuf);
 
 impl Repo {
@@ -78,12 +543,23 @@ impl Repo {
         self.git(&["rev-parse", "HEAD"]).trim().into()
     }
     async fn diff(&self, view: GitView, path: &str, base: Option<&str>) -> GitDiff {
+        self.diff_with_context(view, path, base, GitDiffContext::Changes)
+            .await
+    }
+    async fn diff_with_context(
+        &self,
+        view: GitView,
+        path: &str,
+        base: Option<&str>,
+        context: GitDiffContext,
+    ) -> GitDiff {
         diff(
             self.cwd(),
             GitDiffRequest {
                 view,
                 path: path.into(),
                 base: base.map(str::to_owned),
+                context,
             },
         )
         .await
@@ -118,6 +594,39 @@ impl Drop for Repo {
     }
 }
 
+#[test]
+fn diff_context_defaults_to_changes_and_rejects_invalid_values() {
+    let request: GitDiffRequest =
+        serde_json::from_value(serde_json::json!({"view": "unstaged", "path": "a"})).unwrap();
+    assert_eq!(request.context, GitDiffContext::Changes);
+    for (value, context) in [
+        ("changes", GitDiffContext::Changes),
+        ("full", GitDiffContext::Full),
+    ] {
+        let request: GitDiffRequest = serde_json::from_value(serde_json::json!({
+            "view": "staged", "path": "a", "context": value
+        }))
+        .unwrap();
+        assert_eq!(request.context, context);
+        assert_eq!(serde_json::to_value(context).unwrap(), value);
+    }
+    for value in [
+        serde_json::json!("FULL"),
+        serde_json::json!("all"),
+        serde_json::json!("--output=unsafe"),
+        serde_json::json!(2147483647),
+        serde_json::Value::Null,
+    ] {
+        assert!(
+            serde_json::from_value::<GitDiffRequest>(serde_json::json!({
+                "view": "unstaged", "path": "a", "context": value
+            }))
+            .is_err(),
+            "{value}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn no_repository_unborn_and_detached_are_explicit() {
     let not_repo = Repo::empty();
@@ -138,6 +647,11 @@ async fn no_repository_unborn_and_detached_are_explicit() {
             .patch
             .contains("+first")
     );
+    let full = repo
+        .diff_with_context(GitView::Staged, "first.txt", None, GitDiffContext::Full)
+        .await;
+    assert!(full.full_context_complete);
+    assert!(full.patch.contains("+first"));
     repo.commit();
     repo.git(&["checkout", "--quiet", "--detach"]);
     let detached = workspace(repo.cwd(), None).await.unwrap();
@@ -193,14 +707,18 @@ async fn staged_unstaged_and_pr_comparison_are_distinct_and_read_only() {
     assert!(compare.patch.contains("-baseline\n+committed"));
     assert!(!compare.patch.contains("working"));
     assert!(!compare.patch.contains("+staged"));
-    let untracked = repo.diff(GitView::Untracked, "untracked.txt", None).await;
-    assert!(
-        untracked
-            .unavailable_reason
-            .unwrap()
-            .contains("listed only")
-    );
-    assert!(untracked.patch.is_empty());
+    for context in [GitDiffContext::Changes, GitDiffContext::Full] {
+        let untracked = repo
+            .diff_with_context(GitView::Untracked, "untracked.txt", None, context)
+            .await;
+        assert!(untracked.unavailable_reason.is_none(), "{untracked:?}");
+        assert!(untracked.patch.contains("@@ -0,0 +1,1 @@\n+not staged\n"));
+        assert_eq!(untracked.kind, "untracked");
+        assert_eq!(
+            untracked.full_context_complete,
+            context == GitDiffContext::Full
+        );
+    }
     assert_eq!(repo.git(&["rev-parse", "HEAD"]).trim(), head);
     assert_eq!(fs::read(repo.0.join(".git/index")).unwrap(), before_index);
     assert_eq!(fs::read(repo.0.join(".git/config")).unwrap(), before_config);
@@ -209,6 +727,218 @@ async fn staged_unstaged_and_pr_comparison_are_distinct_and_read_only() {
         before_worktree
     );
     assert!(!repo.0.join(".git/index.lock").exists());
+}
+
+#[tokio::test]
+async fn full_context_includes_unchanged_lines_and_preserves_each_read_only_view() {
+    let repo = Repo::new();
+    let path = "space directory/change file.txt";
+    let contents = |version| {
+        format!(
+            "distant-prefix\n{}first-{version}\n{}second-{version}\n{}distant-suffix\n",
+            "unchanged-prefix\n".repeat(20),
+            "unchanged-middle\n".repeat(20),
+            "unchanged-suffix\n".repeat(20)
+        )
+    };
+    repo.write(path, contents("baseline"));
+    repo.commit();
+    repo.git(&["checkout", "--quiet", "-b", "feature"]);
+    repo.git(&["branch", "--set-upstream-to=main"]);
+    repo.write(path, contents("committed"));
+    let head = repo.commit();
+    repo.write(path, contents("staged"));
+    repo.git(&["add", "--all"]);
+    repo.write(path, contents("working"));
+    repo.git(&["config", "diff.context", "100"]);
+    let before_index = fs::read(repo.0.join(".git/index")).unwrap();
+    let before_config = fs::read(repo.0.join(".git/config")).unwrap();
+    let before_worktree = fs::read(repo.0.join(path)).unwrap();
+    let before_refs = repo.git(&["show-ref"]);
+    for (view, old, new) in [
+        (GitView::Staged, "committed", "staged"),
+        (GitView::Unstaged, "staged", "working"),
+        (GitView::Compare, "baseline", "committed"),
+    ] {
+        let changes = repo.diff(view, path, None).await;
+        assert_eq!(changes.context, GitDiffContext::Changes);
+        assert!(!changes.full_context_complete);
+        assert!(!changes.patch.contains("distant-prefix"));
+        assert!(!changes.patch.contains("distant-suffix"));
+        assert_eq!(
+            changes
+                .patch
+                .lines()
+                .filter(|line| line.starts_with("@@ "))
+                .count(),
+            2
+        );
+        let full = repo
+            .diff_with_context(view, path, None, GitDiffContext::Full)
+            .await;
+        assert_eq!(full.context, GitDiffContext::Full);
+        assert!(full.full_context_complete);
+        assert!(!full.truncated);
+        assert!(full.patch.contains("\n distant-prefix\n"));
+        assert!(full.patch.ends_with(" distant-suffix\n"));
+        assert!(full.patch.contains("@@ -1,64 +1,64 @@"));
+        for edit in ["first", "second"] {
+            let expected = format!("-{edit}-{old}\n+{edit}-{new}\n");
+            assert!(changes.patch.contains(&expected), "{}", changes.patch);
+            assert!(full.patch.contains(&expected), "{}", full.patch);
+        }
+        for other in ["baseline", "committed", "staged", "working"] {
+            if other != old && other != new {
+                assert!(!full.patch.contains(&format!("first-{other}")));
+            }
+        }
+        assert_eq!((full.added, full.deleted), (Some(2), Some(2)));
+        assert_eq!((full.added, full.deleted), (changes.added, changes.deleted));
+        assert_eq!(full.head, changes.head);
+        assert_eq!(full.merge_base, changes.merge_base);
+        assert_ne!(full.content_id, changes.content_id);
+        let serialized = serde_json::to_value(&full).unwrap();
+        assert_eq!(serialized["context"], "full");
+        assert_eq!(serialized["fullContextComplete"], true);
+    }
+    assert_eq!(fs::read(repo.0.join(".git/index")).unwrap(), before_index);
+    assert_eq!(fs::read(repo.0.join(".git/config")).unwrap(), before_config);
+    assert_eq!(fs::read(repo.0.join(path)).unwrap(), before_worktree);
+    assert_eq!(repo.git(&["rev-parse", "HEAD"]).trim(), head);
+    assert_eq!(repo.git(&["show-ref"]), before_refs);
+    assert!(!repo.0.join(".git/index.lock").exists());
+}
+
+#[tokio::test]
+async fn full_context_handles_added_and_deleted_files_using_index_and_commits() {
+    let repo = Repo::new();
+    let deleted = format!(
+        "deleted-prefix\n{}deleted-suffix\n",
+        "removed line\n".repeat(20)
+    );
+    let added = format!("added-prefix\n{}added-suffix\n", "new line\n".repeat(20));
+    repo.write("deleted.txt", &deleted);
+    repo.commit();
+    repo.git(&["checkout", "--quiet", "-b", "feature"]);
+    repo.git(&["branch", "--set-upstream-to=main"]);
+    fs::remove_file(repo.0.join("deleted.txt")).unwrap();
+    let unstaged = repo
+        .diff_with_context(GitView::Unstaged, "deleted.txt", None, GitDiffContext::Full)
+        .await;
+    assert!(unstaged.full_context_complete);
+    assert!(
+        unstaged
+            .patch
+            .contains("--- a/deleted.txt\n+++ /dev/null\n")
+    );
+    assert!(unstaged.patch.contains("-deleted-prefix\n"));
+    assert!(unstaged.patch.ends_with("-deleted-suffix\n"));
+    repo.write("added.txt", &added);
+    repo.git(&["add", "--all"]);
+    repo.write("added.txt", "unstaged text must not appear\n");
+    repo.write("deleted.txt", "recreated untracked text must not appear\n");
+    for view in [GitView::Staged, GitView::Compare] {
+        if view == GitView::Compare {
+            repo.git(&["commit", "--quiet", "-m", "commit index only"]);
+        }
+        for (path, prefix, suffix, counts) in [
+            (
+                "added.txt",
+                "+added-prefix\n",
+                "+added-suffix\n",
+                (Some(22), Some(0)),
+            ),
+            (
+                "deleted.txt",
+                "-deleted-prefix\n",
+                "-deleted-suffix\n",
+                (Some(0), Some(22)),
+            ),
+        ] {
+            let full = repo
+                .diff_with_context(view, path, None, GitDiffContext::Full)
+                .await;
+            assert!(full.full_context_complete, "{}", full.patch);
+            assert!(full.patch.contains(prefix));
+            assert!(full.patch.ends_with(suffix));
+            assert!(!full.patch.contains("must not appear"));
+            assert_eq!((full.added, full.deleted), counts);
+            assert!(!full.truncated);
+        }
+    }
+}
+
+#[tokio::test]
+async fn full_context_is_explicitly_incomplete_for_metadata_only_changes() {
+    let repo = Repo::new();
+    repo.write("old-name.txt", "unchanged rename contents\n");
+    repo.write("mode.txt", "unchanged mode contents\n");
+    repo.commit();
+    repo.git(&["mv", "--", "old-name.txt", "new-name.txt"]);
+    repo.git(&["update-index", "--chmod=+x", "--", "mode.txt"]);
+    repo.write("empty.txt", "");
+    repo.git(&["add", "--", "empty.txt"]);
+    for (path, metadata) in [
+        ("new-name.txt", "rename to new-name.txt"),
+        ("mode.txt", "new mode 100755"),
+        ("empty.txt", "new file mode"),
+    ] {
+        let full = repo
+            .diff_with_context(GitView::Staged, path, None, GitDiffContext::Full)
+            .await;
+        assert!(!full.full_context_complete);
+        assert!(!full.truncated);
+        assert!(full.unavailable_reason.is_none());
+        assert!(full.patch.contains(metadata), "{}", full.patch);
+        assert!(!full.patch.contains("@@ "));
+        assert!(!full.patch.contains("unchanged"));
+        assert!(
+            full.warnings
+                .iter()
+                .any(|warning| warning.contains("full-file contents are not displayed"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn full_context_unchanged_contents_obey_byte_and_line_caps() {
+    let repo = Repo::new();
+    let lines = format!(
+        "old\n{}distant-suffix\n",
+        "unchanged\n".repeat(PATCH_LINES + 100)
+    );
+    let bytes = format!(
+        "old\n{}{}\ndistant-suffix\n",
+        "unchanged\n".repeat(20),
+        "😀".repeat(PATCH_LIMIT / 4 + 100)
+    );
+    repo.write("lines.txt", &lines);
+    repo.write("bytes.txt", &bytes);
+    repo.commit();
+    repo.write("lines.txt", lines.replacen("old\n", "new\n", 1));
+    repo.write("bytes.txt", bytes.replacen("old\n", "new\n", 1));
+    for path in ["lines.txt", "bytes.txt"] {
+        let changes = repo.diff(GitView::Unstaged, path, None).await;
+        assert!(!changes.truncated);
+        assert!(changes.patch.len() < 1000);
+        let full = repo
+            .diff_with_context(GitView::Unstaged, path, None, GitDiffContext::Full)
+            .await;
+        assert!(full.truncated);
+        assert!(!full.full_context_complete);
+        assert!(!full.binary);
+        assert!(full.unavailable_reason.is_none());
+        assert!(full.patch.contains("-old\n+new\n"));
+        assert!(!full.patch.contains("distant-suffix"));
+        assert!(full.patch.len() <= PATCH_LIMIT);
+        assert!(full.patch.lines().count() <= PATCH_LINES);
+        assert!(full.patch.ends_with('\n'));
+        assert!(
+            full.warnings
+                .iter()
+                .any(|warning| warning.contains("truncated at 192 KiB or 2500 lines"))
+        );
+    }
 }
 
 #[tokio::test]
@@ -292,6 +1022,13 @@ async fn rename_and_literal_pathspec_names_remain_single_addressable_files() {
     let preview = repo.diff(GitView::Staged, "new name.txt", None).await;
     assert!(preview.patch.contains("rename from old name.txt"));
     assert!(preview.patch.contains("rename to new name.txt"));
+    let full = repo
+        .diff_with_context(GitView::Staged, "new name.txt", None, GitDiffContext::Full)
+        .await;
+    assert!(full.full_context_complete);
+    assert!(full.patch.contains("rename from old name.txt"));
+    assert!(full.patch.contains("\n one\n"));
+    assert!(full.patch.contains("+five\n"));
 }
 
 #[cfg(not(windows))]
@@ -351,10 +1088,15 @@ async fn binary_and_large_patches_are_explicit_and_bounded() {
         "long-line.txt",
         format!("{}\n", "x".repeat(PATCH_LIMIT + 1000)),
     );
-    let binary = repo.diff(GitView::Unstaged, "binary.dat", None).await;
-    assert!(binary.binary);
-    assert!(binary.patch.is_empty());
-    assert!(binary.unavailable_reason.unwrap().contains("Binary"));
+    for context in [GitDiffContext::Changes, GitDiffContext::Full] {
+        let binary = repo
+            .diff_with_context(GitView::Unstaged, "binary.dat", None, context)
+            .await;
+        assert!(binary.binary);
+        assert!(binary.patch.is_empty());
+        assert!(binary.unavailable_reason.unwrap().contains("Binary"));
+        assert!(!binary.full_context_complete);
+    }
     for file in ["large.txt", "long-line.txt"] {
         let preview = repo.diff(GitView::Unstaged, file, None).await;
         assert!(preview.truncated);
@@ -369,27 +1111,30 @@ async fn injection_and_unchanged_paths_are_rejected() {
     let repo = Repo::new();
     repo.write("safe", "safe\n");
     repo.commit();
-    for path in [
-        "../outside",
-        "/absolute",
-        ".git/config",
-        "safe/../outside",
-        "safe\0bad",
-        "",
-    ] {
-        assert!(
-            diff(
-                repo.cwd(),
-                GitDiffRequest {
-                    view: GitView::Unstaged,
-                    path: path.into(),
-                    base: None
-                }
-            )
-            .await
-            .is_err(),
-            "{path:?}"
-        );
+    for context in [GitDiffContext::Changes, GitDiffContext::Full] {
+        for path in [
+            "../outside",
+            "/absolute",
+            ".git/config",
+            "safe/../outside",
+            "safe\0bad",
+            "",
+        ] {
+            assert!(
+                diff(
+                    repo.cwd(),
+                    GitDiffRequest {
+                        view: GitView::Unstaged,
+                        path: path.into(),
+                        base: None,
+                        context,
+                    }
+                )
+                .await
+                .is_err(),
+                "{path:?}"
+            );
+        }
     }
     for base in [
         "--output=bad",
@@ -400,19 +1145,25 @@ async fn injection_and_unchanged_paths_are_rejected() {
     ] {
         assert!(workspace(repo.cwd(), Some(base)).await.is_err(), "{base}");
     }
-    assert!(
-        diff(
-            repo.cwd(),
-            GitDiffRequest {
-                view: GitView::Unstaged,
-                path: "safe".into(),
-                base: None
-            }
-        )
-        .await
-        .unwrap_err()
-        .contains("no longer changed")
-    );
+    repo.write("untracked.txt", "not a tracked change\n");
+    for context in [GitDiffContext::Changes, GitDiffContext::Full] {
+        for path in ["safe", "untracked.txt"] {
+            assert!(
+                diff(
+                    repo.cwd(),
+                    GitDiffRequest {
+                        view: GitView::Unstaged,
+                        path: path.into(),
+                        base: None,
+                        context,
+                    }
+                )
+                .await
+                .unwrap_err()
+                .contains("no longer changed")
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -430,8 +1181,20 @@ async fn external_diff_and_textconv_are_never_executed() {
     repo.git(&["config", "filter.unsafe.process", "THIS_MUST_NEVER_RUN"]);
     repo.git(&["config", "filter.unsafe.required", "true"]);
     repo.write("safe.txt", "new\n");
-    let preview = repo.diff(GitView::Unstaged, "safe.txt", None).await;
-    assert!(preview.patch.contains("+new"));
+    repo.write("untracked.txt", "unfiltered new text\n");
+    for context in [GitDiffContext::Changes, GitDiffContext::Full] {
+        let preview = repo
+            .diff_with_context(GitView::Unstaged, "safe.txt", None, context)
+            .await;
+        assert!(preview.patch.contains("+new"));
+        let untracked = repo
+            .diff_with_context(GitView::Untracked, "untracked.txt", None, context)
+            .await;
+        assert!(
+            untracked.patch.contains("+unfiltered new text"),
+            "{untracked:?}"
+        );
+    }
     let state = workspace(repo.cwd(), None).await.unwrap();
     assert_eq!(state.unstaged.len(), 2);
 }
@@ -464,9 +1227,13 @@ async fn staged_symlinks_and_committed_submodules_are_explicit_without_target_re
         blob.trim(),
         "link",
     ]);
-    let symlink = repo.diff(GitView::Staged, "link", None).await;
-    assert_eq!(symlink.kind, "symlink");
-    assert!(symlink.patch.contains("+unopened-target"));
+    for context in [GitDiffContext::Changes, GitDiffContext::Full] {
+        let symlink = repo
+            .diff_with_context(GitView::Staged, "link", None, context)
+            .await;
+        assert_eq!(symlink.kind, "symlink");
+        assert!(symlink.patch.contains("+unopened-target"));
+    }
     repo.git(&[
         "update-index",
         "--add",
@@ -475,15 +1242,20 @@ async fn staged_symlinks_and_committed_submodules_are_explicit_without_target_re
         &base,
         "nested",
     ]);
-    let submodule = repo.diff(GitView::Staged, "nested", None).await;
-    assert_eq!(submodule.kind, "submodule");
-    assert!(submodule.patch.is_empty());
-    assert!(
-        submodule
-            .unavailable_reason
-            .unwrap()
-            .contains("nested repository content")
-    );
+    for context in [GitDiffContext::Changes, GitDiffContext::Full] {
+        let submodule = repo
+            .diff_with_context(GitView::Staged, "nested", None, context)
+            .await;
+        assert_eq!(submodule.kind, "submodule");
+        assert!(submodule.patch.is_empty());
+        assert!(!submodule.full_context_complete);
+        assert!(
+            submodule
+                .unavailable_reason
+                .unwrap()
+                .contains("nested repository content")
+        );
+    }
     repo.git(&["commit", "--quiet", "-m", "fixture gitlink and symlink"]);
     let state = workspace(repo.cwd(), Some("refs/heads/main"))
         .await

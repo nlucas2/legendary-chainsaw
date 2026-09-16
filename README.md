@@ -49,12 +49,17 @@ Mobile/web browser ──┘                                  │
   through the daemon event bus. Slow or failing servers show warnings without hiding the controls.
   Reopening the drawer retains its last snapshot while refreshing authoritative state.
 - **Chat while working** supports FIFO queueing and explicit immediate steering. Queued messages can
-  be edited, moved earlier, removed, or sent to the running turn. Selected files and pasted images are
+  be edited, moved earlier, removed, or sent to the running turn. The queue uses compact preview rows
+  with inline actions and a bounded scrolling list. Click its heading to collapse it to a count and
+  next-message preview; errors remain visible, and collapsing does not cancel or change queued work.
+  Selected files and pasted images are
   sent as SDK attachments only when the message is submitted. Draft text and files stay together
   per session while the client remains open; failed sends are restored or retained as separate unsent
   drafts without overwriting newer text. Ctrl+S stashes the complete session draft, including files.
 - **`/ask <question>`** runs a transient, no-tools query against the current conversation without
   adding a chat turn. The Ask button opens a question draft. Answers live only in the panel.
+  **Continue in chat** prepares a normal chat draft carrying the submitted question, answer,
+  and any attached review context. It does not send until you submit the composer.
   The pinned runtime cannot correlate its broadcast query chunks to a caller, so the panel waits
   for the request's final answer instead of risking another client's output. Closing it does not
   stop the parent; cancellation is not exposed by this runtime API.
@@ -67,27 +72,97 @@ Mobile/web browser ──┘                                  │
   conversation and a directly addressed text composer while the parent continues running. Parent
   and child drafts remain separate, and **Back to parent** restores the parent view. Messaging
   availability comes from the runtime; completed or unsupported tasks are read-only.
+  Message attribution uses the runtime's source metadata, not just its `user` role:
+  inter-agent prompts say **Agent instruction**, and injected skills say **Skill instructions**.
+  Subagent inputs with no recorded sender say **Instruction**, rather than claiming they came
+  from you; hover the label for provenance details. Known human inputs keep **You**.
+  Agent/skill inputs do not become human-turn scroll anchors or replace pending human messages.
 - **Questions and approvals** are separate from tool argument displays. Pending questions appear in
   a visible input panel above the conversation, including while viewing a subagent. Choices remain
   unselected until you answer; free-form replies are available when the runtime permits them.
 - **Organization metadata** is app-owned and non-invasive: sessions can be pinned and assigned a
   folder and tags without modifying the underlying Copilot transcript.
   The pencil beside the session title (or on its selected sidebar row) edits the session's name.
+  **Archive** hides a session from the default **Current** sidebar view without stopping work,
+  closing its terminal, deleting history, or changing folders, tags or pins. Use the sidebar's
+  **Current / Archived / All** selector to browse or restore archived sessions in their original
+  groups. Archive state is shared by clients connected to the same daemon.
+  Rows have Archive/Restore actions, including for sessions that are not open; successful changes
+  offer Undo. An already-open archived conversation stays open with a Restore button.
+  Folder groups have subtle separators and indentation; sessions outside a folder have an explicit,
+  collapsible **Unfiled** group rather than appearing to belong to the preceding folder.
+  A small sidebar dot shows attached session activity: pulsing accent color for **Working**,
+  steady green for **Idle**, and hollow for **Not attached** or **Status unavailable** (hover for
+  details). Live events update sessions even when another chat is selected; bounded, read-only
+  status polling restores state after reconnects or missed events without opening saved sessions.
+  Indicators reflect the main session's processing state; subagents retain their own statuses.
+  The pulse respects reduced-motion preferences.
 - **Git workspace** discovers the repository from the session's current directory. Its read-only
   views cover staged, unstaged and untracked paths, plus a PR-style **committed** comparison from
   the selected target's merge base to HEAD. Choose a local target ref; the tracking upstream may
-  not be the intended PR target. There is no fetch, stage, commit, or push action.
-  Diffs load only for a selected file and are bounded. Binary files, untracked contents, conflicts
+  not be the intended PR target. Existing remote default refs (`origin/HEAD`), main/master branches,
+  and the upstream appear first under **Likely PR targets**. No refs are invented or fetched.
+  There is no fetch, stage, commit, or push action.
+  **Unstaged** includes tracked working-tree edits and clearly marked new, untracked files;
+  **Untracked** remains available as a new-files-only filter. Regular untracked text files are
+  previewed as additions against an empty file and support the same line comments and Ask drafts.
+  Viewing a new file does not stage it, and untracked files remain excluded from PR comparison.
+  Untracked previews are limited to currently Git-listed, nonignored UTF-8 regular files.
+  Reads are bounded and opened relative to held directory handles without following links;
+  symlinks, junctions/reparse points, hard links and nested repositories are not opened.
+  Files that change during inspection or cannot be opened safely show an explicit unavailable
+  message. Empty files and truncated previews are labeled rather than silently omitted.
+  **One file** loads a selected diff. **Continuous diffs** displays a PR-style stream and loads
+  three more files as you scroll, with a keyboard-accessible Load more button and at most three
+  concurrent requests. The desktop file list stays visible and highlights the diff at your reading
+  position. Clicking a filename jumps within the stream without switching to One file or losing
+  in-progress notes. Distant jumps load nearby previews, not every skipped file; skipped previews
+  load on scrolling back to them. Mobile's file picker and previous/next buttons navigate the
+  same stream. **Whole-file context** includes unchanged lines around edits in tracked
+  text files. All previews remain capped at 192 KiB or 2,500 lines, with truncation clearly marked.
+  On mobile, comparison/repository details start collapsed. Compact change-view, layout and
+  file selectors stay visible while scrolling, with previous/next-file buttons. Diffs scroll
+  horizontally within their own bounds; comments and the footer follow the diff normally.
+  Binary/non-text files, unsafe untracked paths, conflicts
   and submodule contents are explicitly unavailable rather than opened unsafely.
-  Select changed lines to save local review comments; **Ask about comment/diff** opens a transient
-  question draft for explicit submission. Notes stay in this client, tied to the exact diff snapshot,
-  and are never posted to GitHub or written into repository files.
+  Select code directly instead of aiming at checkboxes: click a line, drag across text, Shift-click
+  a range, or Ctrl/Cmd-click to toggle individual lines. Keyboard Up/Down, Home/End and Space/Enter
+  work too; touch taps toggle lines without preventing scrolling. Added, deleted, and unchanged
+  context lines are selectable; diff metadata is not. Each note can cover up to 40 source lines.
+  Save local review notes across files, then use **Bring all notes into chat** to triage the
+  repository's collected notes together. The bundle includes stable note IDs, file/line references,
+  original snapshot identities, and saved code excerpts. Other repositories are excluded; older
+  snapshots and legacy notes without surrounding context are labeled, never silently rebased.
+  **Quick ask** opens an editable, transient question with separate review context.
+  **Discuss in chat** attaches that context to the normal composer without overwriting an existing
+  draft; notes, selected code, and unfinished note text are carried over. Review chips can be
+  expanded or removed before sending. **Continue in chat** also carries the actual submitted
+  question and answer, not any later unsent edits to the question box.
+  Review context uses standard UTF-8 text-blob attachments, so it remains in the conversation for
+  follow-ups and survives the existing draft stash/retry/session-switch workflow. Each context is
+  capped at 512 KiB and counts toward the normal five-file attachment limit. Nothing is sent
+  automatically, and sending does not delete or mark local notes resolved. Remove notes explicitly
+  when finished. Notes stay in this client until attached; they are never posted to GitHub or
+  written into repository files.
 - **Appearance** follows mkb's Auto / Light / Dark model. Auto tracks the OS, and Light uses mkb's
   warm Catppuccin-Latte-inspired paper palette. The preference follows open browser tabs.
   **Font & spacing** offers an optional CLI-like monospace preset, custom local font families,
   chat size/line/paragraph spacing, and independent terminal typography. Changes apply immediately;
   terminal font changes resize the existing terminal instead of restarting it. No CLI settings
-  are inspected and no fonts are downloaded.
+  are inspected and no fonts are downloaded. The font section starts collapsed.
+  **Font & spacing → Reasoning → Customize reasoning** separately controls reasoning font,
+  size, line/paragraph spacing, italics, and normal/muted text tone, with a live preview.
+  It defaults to the existing appearance and does not change chat or terminal styling.
+  Explicit reasoning choices survive switching to the CLI-like preset; **Use chat styling**
+  disables the override without losing those choices. **Reset font & spacing** resets all fonts.
+  **Appearance → Use full chat width on desktop** expands the conversation and composer within
+  the current pane, including split-terminal layouts, without changing mobile spacing or font
+  preferences. Markdown tables have padded cells, soft borders and their own horizontal scrolling;
+  links use accessible theme colors and wrap long addresses.
+  Web links open in the system browser from Tauri, or a separate tab from the web client, rather
+  than replacing the conversation. This also applies to reasoning, quick answers, and requested
+  authentication pages. In-page anchors stay local. Unsupported schemes and relative repository
+  links do not navigate the app; opener failures are shown without falling back to in-app navigation.
 
 ## Process lifecycle and updates
 

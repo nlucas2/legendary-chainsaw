@@ -122,6 +122,7 @@ export function AgentConversation({
         disabled={loadingEarlier} onClick={() => void loadEarlier()}>{loadingEarlier ? "Loading..." : "Load earlier subagent messages"}</button></div>}
       {!loading && !events.length ? <p className="agent-chat-notice">No conversation events available for this subagent yet.</p>
         : <Transcript sessionId={`${parent.sessionId}:${task.id}`} hasSession loading={loading} events={events}
+          subagentConversation
           subagentContext={NO_EVENTS} permissions={NO_PERMISSIONS} showRawEvents={false}
           reasoningExpanded={reasoningExpanded} toolDetailsExpanded={toolDetailsExpanded}
           assistantLabel={effective.name} assistantModel={effective.model} onPermission={NO_PERMISSION_ACTION} />}

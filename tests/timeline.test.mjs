@@ -50,6 +50,29 @@ test("interleaved reasoning final representations do not duplicate or move behin
   assert.deepEqual(visible(result).filter((item) => item.turnLead).map((item) => item.kind), ["reasoning"]);
 });
 
+test("user-role source attribution survives live projection, replay and nested children", () => {
+  const result = replay([
+    event("user.message", { content: "Human input" }),
+    event("user.message", { content: "Agent follow-up", source: "agent-parent" }),
+    event("user.message", { content: "Skill context", source: "skill-pdf" }),
+    event("subagent.started", { agentName: "Builder" }, { agentId: "child" }),
+    event("user.message", { content: "Child instruction", source: "agent-parent" }, { agentId: "child" }),
+    event("user.message", { content: "Legacy child input" }, { agentId: "child" }),
+  ]);
+  assert.deepEqual(result.items.slice(0, 3).map((item) => item.userOrigin.kind), ["human", "agent", "skill"]);
+  assert.deepEqual(result.items[3].timeline.map((item) => item.userOrigin.kind), ["agent", "unknown"]);
+});
+
+test("switching to a focused child scope invalidates attribution in the projection cache", () => {
+  const events = [event("user.message", { content: "Sender unavailable" })];
+  const root = project(events);
+  assert.equal(root.items[0].userOrigin.kind, "human");
+  const child = projectTimeline(root, events, { subagentConversation: true });
+  assert.equal(child.items[0].userOrigin.kind, "unknown");
+  assert.equal(root.items[0].userOrigin.kind, "human");
+  assert.equal(projectTimeline(child, events, {}).items[0].userOrigin.kind, "human");
+});
+
 test("distinct reasoning in later model cycles remains before the corresponding response", () => {
   const result = replay([
     event("user.message", { content: "Help" }),

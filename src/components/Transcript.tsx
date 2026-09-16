@@ -1,6 +1,5 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
+import { MarkdownContent as Markdown } from "./MarkdownContent";
 import {
   Bot,
   Brain,
@@ -18,6 +17,7 @@ import {
   XCircle,
 } from "lucide-react";
 import type { PermissionRequest, SessionEvent } from "../lib/types";
+import type { MessageOrigin } from "../lib/messageOrigin";
 import {
   decodeAttachmentImage, projectTimeline,
   type TimelineAttachment, type TimelineItem, type TimelineProjection,
@@ -37,13 +37,9 @@ interface TranscriptProps {
   toolDetailsExpanded: boolean;
   assistantModel?: string;
   assistantLabel?: string;
+  subagentConversation?: boolean;
   onPermission: (requestId: string, approved: boolean) => void;
 }
-
-const markdownPlugins = [remarkGfm];
-const Markdown = memo(function Markdown({ children }: { children: string }) {
-  return <ReactMarkdown remarkPlugins={markdownPlugins}>{children}</ReactMarkdown>;
-});
 
 export const Transcript = memo(function Transcript({
   sessionId,
@@ -58,14 +54,15 @@ export const Transcript = memo(function Transcript({
   toolDetailsExpanded,
   assistantModel,
   assistantLabel,
+  subagentConversation = false,
   onPermission,
 }: TranscriptProps) {
   const committed = useRef<TimelineProjection | undefined>(undefined);
   const projection = useMemo(
     () => projectTimeline(committed.current, events, {
-      sessionId, windowStartEventId, subagentContext, assistantModel,
+      sessionId, windowStartEventId, subagentContext, assistantModel, subagentConversation,
     }),
-    [sessionId, events, windowStartEventId, subagentContext, assistantModel],
+    [sessionId, events, windowStartEventId, subagentContext, assistantModel, subagentConversation],
   );
   // Only publish the cache after commit. Interrupted renders project from an
   // immutable snapshot, never mutating items still displayed by another tree.
@@ -120,6 +117,7 @@ export const Transcript = memo(function Transcript({
         <TimelineEntry
           item={item}
           assistantLabel={assistantLabel}
+          rootHumanMessages={!subagentConversation}
           key={item.id}
           reasoningExpanded={reasoningExpanded}
           toolDetailsExpanded={toolDetailsExpanded}
@@ -174,12 +172,14 @@ const TimelineEntry = memo(function TimelineEntry({
   item,
   assistantLabel = "Copilot",
   root = true,
+  rootHumanMessages = true,
   reasoningExpanded = true,
   toolDetailsExpanded = false,
 }: {
   item: TimelineItem;
   assistantLabel?: string;
   root?: boolean;
+  rootHumanMessages?: boolean;
   reasoningExpanded?: boolean;
   toolDetailsExpanded?: boolean;
 }) {
@@ -191,7 +191,7 @@ const TimelineEntry = memo(function TimelineEntry({
     return (
       <MessageEntry role={item.role} content={item.content}
         streaming={item.streaming === true} assistantLabel={assistantLabel}
-        rootMessage={root} model={item.model}
+        rootMessage={root && rootHumanMessages} model={item.model} userOrigin={item.userOrigin}
         attachments={item.attachments}
         showAvatar={item.role === "user" || item.turnLead === true} />
     );
@@ -231,7 +231,7 @@ const TimelineEntry = memo(function TimelineEntry({
 });
 
 const MessageEntry = memo(function MessageEntry({
-  role, content, streaming, assistantLabel, rootMessage, showAvatar, model, attachments,
+  role, content, streaming, assistantLabel, rootMessage, showAvatar, model, attachments, userOrigin,
 }: {
   role: "user" | "assistant";
   content: string;
@@ -241,17 +241,21 @@ const MessageEntry = memo(function MessageEntry({
   showAvatar: boolean;
   model?: string;
   attachments?: readonly TimelineAttachment[];
+  userOrigin?: MessageOrigin;
 }) {
   return (
     <article className={`message ${role}`}
-      data-root-human={rootMessage && role === "user" ? "" : undefined}>
+      data-message-origin={role === "user" ? userOrigin?.kind ?? "unknown" : undefined}
+      data-root-human={rootMessage && role === "user" && userOrigin?.kind === "human" ? "" : undefined}>
       <div className={showAvatar ? "message-avatar" : "message-avatar placeholder"}>
-        {role === "user" ? <User size={16} /> : <Bot size={17} />}
+        {role === "assistant" || userOrigin?.kind === "agent" ? <Bot size={17} />
+          : userOrigin?.kind === "human" ? <User size={16} />
+            : userOrigin?.kind === "skill" ? <Wrench size={16} /> : <CircleDot size={16} />}
       </div>
       <div className="message-content">
         {(role === "user" || showAvatar) && (
           <div className="message-role">
-            <span>{role === "user" ? "You" : assistantLabel}</span>
+            <span title={role === "user" ? userOrigin?.description : undefined}>{role === "user" ? userOrigin?.label ?? "Input" : assistantLabel}</span>
             {role === "assistant" && model && <em>({model})</em>}
           </div>
         )}

@@ -2,8 +2,8 @@ import { useId, useMemo, useState } from "react";
 import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import type { ValidateFunction } from "ajv";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
+import { MarkdownContent } from "./MarkdownContent";
+import { ExternalLink } from "./ExternalLink";
 import type { PendingInteraction } from "../lib/types";
 import "./chat-controls.css";
 
@@ -97,7 +97,7 @@ export function InteractionPanel({
           <p>{text(data.message)}</p>
           {schemaError ? <p role="alert">{schemaError}</p> : data.mode === "url" ? (
             safeExternalUrl(data.url) ? (
-              <p><a href={safeExternalUrl(data.url)} target="_blank" rel="noopener noreferrer">Open requested page</a></p>
+              <p><ExternalLink href={safeExternalUrl(data.url)}>Open requested page</ExternalLink></p>
             ) : <p role="alert">The runtime supplied an unsupported URL.</p>
           ) : Object.entries(properties).map(([name, raw]) => {
             const field = record(raw);
@@ -162,7 +162,7 @@ export function InteractionPanel({
           void respond({ approved: true, selectedAction: planAction, autoApproveEdits: false, feedback });
         }}>
           <p>{text(data.summary)}</p>
-          <div className="plan-preview"><ReactMarkdown remarkPlugins={[remarkGfm]}>{text(data.planContent)}</ReactMarkdown></div>
+          <div className="plan-preview"><MarkdownContent>{text(data.planContent)}</MarkdownContent></div>
           <label>
             Continue with
             <select value={planAction} onChange={(event) => setPlanAction(event.target.value)} disabled={busy}>

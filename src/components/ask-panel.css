@@ -58,11 +58,8 @@
 }
 .ask-panel-answer > * + * { margin-top: 10px; }
 .ask-panel-question { color: var(--muted, #a3b1c4); white-space: pre-wrap; }
-.ask-panel-answer pre, .ask-panel-answer table { max-width: 100%; overflow-x: auto; }
+.ask-panel-answer pre { max-width: 100%; overflow-x: auto; }
 .ask-panel-answer pre { padding: 10px; background: var(--background, #0c121b); }
-.ask-panel-answer table { display: block; border-collapse: collapse; }
-.ask-panel-answer :is(th, td) { padding: 6px; border: 1px solid var(--line, #34465b); }
-.ask-panel-answer a { color: var(--accent, #7dd3fc); }
 .ask-panel footer { margin-top: auto; padding-top: 8px; }
 
 @media (max-width: 600px) {

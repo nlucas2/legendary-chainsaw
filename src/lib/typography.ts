@@ -8,6 +8,8 @@ export const ORIGINAL_TERMINAL_FONT_FAMILY =
 
 export type ChatFontFamily = "system" | "mono" | "custom";
 export type TerminalFontFamily = ChatFontFamily | "default" | "shared";
+export type ReasoningFontFamily = ChatFontFamily | "shared";
+export type ReasoningTone = "original" | "normal" | "muted";
 export interface TypographySettings {
   version: 1;
   preset: "default" | "cli" | "custom";
@@ -16,6 +18,14 @@ export interface TypographySettings {
   fontSize: number;
   lineHeight: number;
   paragraphSpacing: number;
+  reasoningCustom: boolean;
+  reasoningFontFamily: ReasoningFontFamily;
+  reasoningCustomFontFamily: string;
+  reasoningFontSize: number;
+  reasoningLineHeight: number;
+  reasoningParagraphSpacing: number;
+  reasoningItalic: boolean;
+  reasoningTone: ReasoningTone;
   terminalFontFamily: TerminalFontFamily;
   terminalCustomFontFamily: string;
   terminalFontSize: number;
@@ -26,6 +36,9 @@ export const TYPOGRAPHY_LIMITS = {
   fontSize: { min: 12, max: 24, step: 1 },
   lineHeight: { min: 1.2, max: 2.2, step: 0.05 },
   paragraphSpacing: { min: 0, max: 24, step: 1 },
+  reasoningFontSize: { min: 12, max: 24, step: 1 },
+  reasoningLineHeight: { min: 1.2, max: 2.2, step: 0.01 },
+  reasoningParagraphSpacing: { min: 0, max: 24, step: 1 },
   terminalFontSize: { min: 10, max: 24, step: 1 },
   terminalLineHeight: { min: 1, max: 1.8, step: 0.01 },
 } as const;
@@ -38,13 +51,24 @@ export const DEFAULT_TYPOGRAPHY: Readonly<TypographySettings> = Object.freeze({
   fontSize: 15,
   lineHeight: 1.7,
   paragraphSpacing: 12,
+  reasoningCustom: false,
+  reasoningFontFamily: "shared",
+  reasoningCustomFontFamily: "",
+  reasoningFontSize: 14,
+  reasoningLineHeight: 1.68,
+  reasoningParagraphSpacing: 9,
+  reasoningItalic: false,
+  reasoningTone: "original",
   terminalFontFamily: "default",
   terminalCustomFontFamily: "",
   terminalFontSize: 13,
   terminalLineHeight: 1.18,
 });
 
-export function typographyPreset(preset: "default" | "cli"): TypographySettings {
+export function typographyPreset(
+  preset: "default" | "cli",
+  current: Readonly<TypographySettings> = DEFAULT_TYPOGRAPHY,
+): TypographySettings {
   return preset === "cli"
     ? {
         ...DEFAULT_TYPOGRAPHY,
@@ -55,6 +79,14 @@ export function typographyPreset(preset: "default" | "cli"): TypographySettings 
         paragraphSpacing: 6,
         terminalFontFamily: "mono",
         terminalLineHeight: 1.1,
+        reasoningCustom: current.reasoningCustom,
+        reasoningFontFamily: current.reasoningFontFamily,
+        reasoningCustomFontFamily: current.reasoningCustomFontFamily,
+        reasoningFontSize: current.reasoningFontSize,
+        reasoningLineHeight: current.reasoningLineHeight,
+        reasoningParagraphSpacing: current.reasoningParagraphSpacing,
+        reasoningItalic: current.reasoningItalic,
+        reasoningTone: current.reasoningTone,
       }
     : { ...DEFAULT_TYPOGRAPHY };
 }
@@ -97,6 +129,14 @@ export function normalizeTypography(value: unknown): TypographySettings {
     fontSize: bounded(saved.fontSize, "fontSize"),
     lineHeight: bounded(saved.lineHeight, "lineHeight"),
     paragraphSpacing: bounded(saved.paragraphSpacing, "paragraphSpacing"),
+    reasoningCustom: saved.reasoningCustom === true,
+    reasoningFontFamily: oneOf(saved.reasoningFontFamily, ["shared", "system", "mono", "custom"], "shared"),
+    reasoningCustomFontFamily: sanitizeCustomFontFamily(saved.reasoningCustomFontFamily),
+    reasoningFontSize: bounded(saved.reasoningFontSize, "reasoningFontSize"),
+    reasoningLineHeight: bounded(saved.reasoningLineHeight, "reasoningLineHeight"),
+    reasoningParagraphSpacing: bounded(saved.reasoningParagraphSpacing, "reasoningParagraphSpacing"),
+    reasoningItalic: saved.reasoningItalic === true,
+    reasoningTone: oneOf(saved.reasoningTone, ["original", "normal", "muted"], "original"),
     terminalFontFamily: oneOf(
       saved.terminalFontFamily, ["default", "system", "mono", "custom", "shared"], "default",
     ),
@@ -129,9 +169,34 @@ export function terminalTypography(settings: TypographySettings) {
   return { fontFamily, fontSize: settings.terminalFontSize, lineHeight: settings.terminalLineHeight };
 }
 
-export function typographyVariables(settings: TypographySettings): Record<string, string> {
-  if (settings.preset === "default") return {};
+export function reasoningTypography(settings: TypographySettings) {
+  let fontFamily = chatFontFamily(settings);
+  switch (settings.reasoningFontFamily) {
+    case "system": fontFamily = SYSTEM_FONT_FAMILY; break;
+    case "mono": fontFamily = MONOSPACE_FONT_FAMILY; break;
+    case "custom": fontFamily = customFamily(settings.reasoningCustomFontFamily, SYSTEM_FONT_FAMILY); break;
+  }
   return {
+    fontFamily,
+    fontSize: settings.reasoningFontSize,
+    lineHeight: settings.reasoningLineHeight,
+    paragraphSpacing: settings.reasoningParagraphSpacing,
+    fontStyle: settings.reasoningItalic ? "italic" : "normal",
+  } as const;
+}
+
+export function typographyAttributes(settings: TypographySettings): Record<string, string> {
+  const attributes: Record<string, string> = {};
+  if (settings.preset !== "default") attributes["data-typography"] = "custom";
+  if (settings.reasoningCustom) {
+    attributes["data-reasoning-typography"] = "custom";
+    if (settings.reasoningTone !== "original") attributes["data-reasoning-tone"] = settings.reasoningTone;
+  }
+  return attributes;
+}
+
+export function typographyVariables(settings: TypographySettings): Record<string, string> {
+  const variables: Record<string, string> = settings.preset === "default" ? {} : {
     "--chat-font-family": chatFontFamily(settings),
     "--chat-code-font-family": MONOSPACE_FONT_FAMILY,
     "--chat-font-size": `${settings.fontSize}px`,
@@ -139,6 +204,18 @@ export function typographyVariables(settings: TypographySettings): Record<string
     "--chat-paragraph-spacing": `${settings.paragraphSpacing}px`,
     "--chat-turn-spacing": `${settings.paragraphSpacing + 12}px`,
   };
+  if (settings.reasoningCustom) {
+    const reasoning = reasoningTypography(settings);
+    Object.assign(variables, {
+      "--reasoning-font-family": reasoning.fontFamily,
+      "--reasoning-code-font-family": MONOSPACE_FONT_FAMILY,
+      "--reasoning-font-size": `${reasoning.fontSize}px`,
+      "--reasoning-line-height": String(reasoning.lineHeight),
+      "--reasoning-paragraph-spacing": `${reasoning.paragraphSpacing}px`,
+      "--reasoning-font-style": reasoning.fontStyle,
+    });
+  }
+  return variables;
 }
 
 export interface TypographyLoadResult {

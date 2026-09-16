@@ -1,4 +1,5 @@
 import type { SessionEvent } from "./types.ts";
+import { isHumanMessage } from "./messageOrigin.ts";
 
 export function mergeEvents(events: SessionEvent[], incoming: SessionEvent[]): SessionEvent[] {
   if (incoming.length === 0) return events;
@@ -20,9 +21,7 @@ export function reconcileOptimisticUserEvents(
   events: SessionEvent[],
   incoming: SessionEvent[],
 ): SessionEvent[] {
-  const realMessages = incoming.filter(
-    (event) => event.type === "user.message" && !event.agentId,
-  );
+  const realMessages = incoming.filter(isHumanMessage);
   if (realMessages.length === 0) return events;
   const remaining = [...events];
   for (const message of realMessages) {

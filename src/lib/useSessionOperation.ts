@@ -3,7 +3,7 @@ import { SessionOperations } from "./sessionOperations";
 
 export function useSessionOperation() {
   const [operations] = useState(() => new SessionOperations());
-  const [, redraw] = useReducer((revision: number) => revision + 1, 0);
+  const [revision, redraw] = useReducer((revision: number) => revision + 1, 0);
   const start = useCallback((sessionId: string, value = "pending") => {
     const token = operations.start(sessionId, value);
     if (token) redraw();
@@ -12,5 +12,5 @@ export function useSessionOperation() {
   const finish = useCallback((sessionId: string, token: symbol) => {
     if (operations.finish(sessionId, token)) redraw();
   }, [operations]);
-  return { operations, start, finish };
+  return { operations, start, finish, revision };
 }

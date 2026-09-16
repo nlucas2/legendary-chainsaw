@@ -15,7 +15,7 @@ use copilot_sessions_core::{
     AdoptToolControls, AgentHistoryRequest, AgentTasksRequest, InteractionResponse, NewSession,
     OrganizationUpdate, PermissionDecision, QueueAction, SendAgentMessageRequest,
     SendMessageRequest, ServiceError, SessionService, SetMcpEnabled, SetSessionMode,
-    SetToolEnabled, project_app_event,
+    SetToolEnabled, SetSessionArchived, project_app_event,
     AskSessionRequest, ForkSessionRequest, RenameSessionRequest,
 };
 use serde::Deserialize;
@@ -269,6 +269,7 @@ async fn dispatch(state: &DaemonState, command: &str, body: Value) -> Result<Val
             json_result(copilot_sessions_core::git_workspace::diff(&cwd,
                 copilot_sessions_core::git_workspace::GitDiffRequest {
                     view: request.view, path: request.path, base: request.base,
+                    context: request.context,
                 }).await.map_err(ServiceError::CommandFailed)?)
         }
         "resume_session" => {
@@ -448,6 +449,10 @@ async fn dispatch(state: &DaemonState, command: &str, body: Value) -> Result<Val
             let update = decode::<OrganizationUpdate>(body)?;
             json_result(service.organize_session(update).await?)
         }
+        "set_session_archived" => {
+            let update = decode_archive_request(body)?;
+            json_result(service.set_session_archived(update).await?)
+        }
         "runtime_status" => json_result(service.runtime_status().await),
         "session_processing" => {
             let session_id = string_arg(&body, "sessionId")?;
@@ -573,6 +578,17 @@ struct GitDiffArgs {
     view: copilot_sessions_core::git_workspace::GitView,
     path: String,
     base: Option<String>,
+    #[serde(default)]
+    context: copilot_sessions_core::git_workspace::GitDiffContext,
+}
+
+fn decode_archive_request(value: Value) -> Result<SetSessionArchived, ServiceError> {
+    if !value.is_object() {
+        return Err(ServiceError::InvalidArgument(
+            "archive request must be an object".into(),
+        ));
+    }
+    decode(value)
 }
 
 fn string_arg(value: &Value, name: &str) -> Result<String, ServiceError> {
@@ -594,6 +610,35 @@ pub fn default_bind() -> SocketAddr {
 #[cfg(test)]
 mod api_contract_tests {
     use super::*;
+
+    #[test]
+    fn archive_command_requires_exact_typed_fields() {
+        for archived in [false, true] {
+            let request = decode_archive_request(json!({
+                "sessionId": "s", "archived": archived,
+            })).unwrap();
+            assert_eq!(request.session_id, "s");
+            assert_eq!(request.archived, archived);
+        }
+        for body in [
+            json!({}),
+            json!(["s", true]),
+            json!(null),
+            json!({"sessionId":"s"}),
+            json!({"archived":true}),
+            json!({"sessionId":1,"archived":true}),
+            json!({"sessionId":"s","archived":"true"}),
+            json!({"sessionId":"s","archived":1}),
+            json!({"sessionId":"s","archived":null}),
+            json!({"sessionId":"s","archived":false,"pinned":false}),
+            json!({"sessionId":"s","archived":false,"delete":true}),
+        ] {
+            assert!(matches!(
+                decode_archive_request(body),
+                Err(ServiceError::InvalidArgument(_))
+            ));
+        }
+    }
 
     #[test]
     fn diagnostics_query_is_opt_in_and_preserves_cursor() {
