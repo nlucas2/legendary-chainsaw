@@ -46,6 +46,7 @@ impl SessionService {
                 archived: meta.archived,
                 folder: meta.folder.clone(),
                 tags: meta.tags.clone(),
+                initialization: None,
             }
         } else {
             return Err(ServiceError::InvalidArgument(format!(

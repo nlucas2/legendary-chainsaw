@@ -19,6 +19,7 @@ import {
   Archive,
   ArchiveRestore,
   BookOpen,
+  CalendarClock,
   Bot,
   ChevronDown,
   ChevronRight,
@@ -64,9 +65,15 @@ import { ForkSession } from "./components/ForkSession";
 import { useTerminalLayout } from "./lib/useTerminalLayout";
 import { useTypography } from "./lib/useTypography";
 import { useChatWidth } from "./lib/useChatWidth";
+import { useSessionStartup } from "./lib/useSessionStartup";
+import { SessionStartupBanner } from "./components/SessionStartupBanner";
+import { useDeliveryDefault } from "./lib/useDeliveryDefault";
+import type { MessageDelivery } from "./lib/deliveryPreference";
+import { isTerminalToggle } from "./lib/shortcuts";
 import { resizedTerminal, terminalSizeLimits } from "./lib/workspaceLayout";
 import { slashCommandSuggestions } from "./lib/slashCommands";
 import "./components/workspace-actions.css";
+import "./components/scheduled-tasks.css";
 import { SessionSubagents } from "./components/SessionSubagents";
 import { agentKey, type AgentTask } from "./lib/agentTasks";
 import { useAgentTasks } from "./lib/useAgentTasks";
@@ -161,6 +168,9 @@ const AskPanel = lazy(() =>
 const GitPanel = lazy(() =>
   import("./components/GitPanel").then((module) => ({ default: module.GitPanel })),
 );
+const ScheduledTasksPanel = lazy(() =>
+  import("./components/ScheduledTasksPanel").then((module) => ({ default: module.ScheduledTasksPanel })),
+);
 
 function App() {
   const typography = useTypography();
@@ -195,7 +205,18 @@ function App() {
   const [needsLogin, setNeedsLogin] = useState(false);
   const [loading, setLoading] = useState(true);
   const [historyState, setHistoryState] = useState<HistoryState>("idle");
-  const [sessionReady, setSessionReady] = useState(false);
+  const [sessionAttached, setSessionReady] = useState(false);
+  const initializationReady = useCallback((sessionId: string, summary?: SessionSummary) => {
+    const update = (current: SessionSummary): SessionSummary => ({
+      ...current, model: summary?.model ?? current.model,
+      initialization: { phase: "ready", stage: "ready" },
+    });
+    setSessions((current) => current.map((item) => item.sessionId === sessionId ? update(item) : item));
+    setActiveSession((current) => current?.sessionId === sessionId ? update(current) : current);
+    if (activeIdRef.current === sessionId) setSessionReady(true);
+  }, []);
+  const sessionStartup = useSessionStartup(activeSession, activityConnected, initializationReady);
+  const sessionReady = sessionAttached && sessionStartup.ready;
   const [hasMoreHistory, setHasMoreHistory] = useState(false);
   const historyOperation = useSessionOperation();
   const catchUpOperation = useSessionOperation();
@@ -221,6 +242,7 @@ function App() {
   const [forkingName, setForkingName] = useState<string | undefined>();
   const [askPanel, setAskPanel] = useState<{ id: string; sessionId: string; question: string; submitOnOpen: boolean; reviewContext?: ReviewChatContext } | null>(null);
   const [gitOpen, setGitOpen] = useState(false);
+  const [schedulesOpen, setSchedulesOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [themePreference, setThemePreference] =
     useState<ThemePreference>(readThemePreference);
@@ -249,7 +271,9 @@ function App() {
   const busy = creatingSession || !!sendOperation.operations.get(draftSessionId);
   const catchingUp = !!catchUpOperation.operations.get(draftSessionId);
   const loadingMore = !!historyOperation.operations.get(draftSessionId);
-  const [deliveryMode, setDeliveryMode] = useState<"enqueue" | "immediate">("enqueue");
+  const deliveryDefault = useDeliveryDefault();
+  const [deliveryOverride, setDeliveryOverride] = useState<MessageDelivery | null>(null);
+  const deliveryMode = deliveryOverride ?? deliveryDefault.value;
   const [activity, setActivity] = useState<ChatActivity>(emptyActivity);
   const [interactions, setInteractions] = useState<PendingInteraction[]>([]);
   const [contextRevision, setContextRevision] = useState(0);
@@ -280,6 +304,10 @@ function App() {
   const [newSessionModels, setNewSessionModels] = useState<ModelOption[]>([]);
   const [newSessionModelsLoading, setNewSessionModelsLoading] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
+  const [terminalFocusSession, setTerminalFocusSession] = useState<string | null>(null);
+  useEffect(() => {
+    if (!terminalOpen || terminalFocusSession !== activeSession?.sessionId) setTerminalFocusSession(null);
+  }, [terminalOpen, terminalFocusSession, activeSession?.sessionId]);
   const terminalLayout = useTerminalLayout();
   const terminalWidth = terminalLayout.width;
   const terminalDrag = useRef<{ x: number; y: number; size: number } | null>(null);
@@ -368,7 +396,7 @@ function App() {
   const loadSessions = useCallback(async () => {
     try {
       const checkpoint = archiveChanges.checkpoint();
-      const next = (await daemonInvoke<SessionSummary[]>("list_sessions")).map((session) => archiveChanges.reconcile(session, checkpoint));
+      const next = (await daemonInvoke<SessionSummary[]>("list_sessions")).map((session) => sessionStartup.track(archiveChanges.reconcile(session, checkpoint)));
       setSessions(next);
       setNeedsLogin(false);
       if (!activeIdRef.current) {
@@ -454,7 +482,8 @@ function App() {
   }, []);
 
   const openSession = useCallback(
-    async (session: SessionSummary, closeSidebar = true) => {
+    async (incoming: SessionSummary, closeSidebar = true, newlyCreated = false) => {
+      const session = sessionStartup.track(incoming);
       if (activeIdRef.current === session.sessionId) {
         if (closeSidebar) setSidebarOpen(false);
         return;
@@ -505,13 +534,18 @@ function App() {
       setReferenceOpen(false);
       if (closeSidebar) setSidebarOpen(false);
 
-      // Persisted history and live-session attachment are independent daemon operations.
-      // Start all three at once and reveal each result as soon as it is ready.
+      // A freshly created session already has its runtime handle and event stream.
+      // Startup status, not a second resume RPC, controls readiness while it warms.
       const archiveCheckpoint = archiveChanges.checkpoint();
-      const resumeRequest = daemonInvoke<SessionSummary>("resume_session", {
+      const reuseAttachment = newlyCreated || (session.isActive && !!session.initialization);
+      const resumeRequest = reuseAttachment
+        ? Promise.resolve(session)
+        : daemonInvoke<SessionSummary>("resume_session", {
         sessionId: session.sessionId,
       });
-      const historyRequest = resumeRequest.then(() =>
+      const historyRequest = newlyCreated ? Promise.resolve<HistoryPage>({
+        events: [], hasMore: false, cursor: "", loadedPages: 0, humanMessages: 0, truncatedBeforeAnchor: false,
+      }) : resumeRequest.then(() =>
         daemonInvoke<HistoryPage>("session_history_window", {
           sessionId: session.sessionId,
         }),
@@ -555,12 +589,13 @@ function App() {
         .catch((cause) => handleError(cause, setError, setNeedsLogin));
 
       try {
-        const resumed = archiveChanges.reconcile(await resumeRequest, archiveCheckpoint);
+        const resumed = sessionStartup.track(archiveChanges.reconcile(await resumeRequest, archiveCheckpoint));
         if (activeIdRef.current !== session.sessionId) return;
         setActiveSession(resumed);
         setSessionReady(true);
+        if (!reuseAttachment) sessionStartup.refresh();
         void loadInteractions(session.sessionId);
-        void daemonInvoke<SessionEvent[]>("subagent_context", {
+        if (!newlyCreated) void daemonInvoke<SessionEvent[]>("subagent_context", {
           sessionId: session.sessionId,
         })
           .then((context) => {
@@ -608,6 +643,11 @@ function App() {
         if (event.type === "session_archive_changed") applyArchiveChange(event.sessionId, event.archived);
         if (event.type === "event_gap") void loadSessions();
         agentTasks.notify(event);
+        sessionStartup.notify(event);
+        if (event.type === "session_initialization_changed") {
+          setSessions((current) => current.map((item) => item.sessionId === event.sessionId
+            ? { ...item, initialization: event.initialization } : item));
+        }
         sidebarActivity.notify(event);
         setConnected(true);
         if (event.type === "interaction_requested" &&
@@ -726,7 +766,7 @@ function App() {
       showRawEvents,
     );
     return unsubscribe;
-  }, [loadQueue, loadSessions, loadInteractions, queueLiveEvent, showRawEvents, applyArchiveChange, sidebarActivity.notify]);
+  }, [loadQueue, loadSessions, loadInteractions, queueLiveEvent, showRawEvents, applyArchiveChange, sidebarActivity.notify, sessionStartup.notify]);
 
   useEffect(
     () => () => {
@@ -742,6 +782,30 @@ function App() {
   }, [activeSession?.sessionId, loadQueue, sessionReady]);
 
   useEffect(() => {
+    const toggleTerminal = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || !isTerminalToggle(event)) return;
+      if (shortcutsOpen || newSessionOpen || renamingSession || forkingSession || askPanel || gitOpen || schedulesOpen ||
+          modeConfirmation || modelPickerOpen || settingsOpen || organizingSession || runtimeOpen || referenceOpen) return;
+      if (!activeSession || (!terminalOpen && !activeSession.cwd && !trackedCwd)) return;
+      event.preventDefault();
+      // Handle this shortcut before xterm can consume it as terminal input.
+      event.stopPropagation();
+      if (event.repeat) return;
+      setTerminalFocusSession(terminalOpen ? null : activeSession.sessionId);
+      setTerminalOpen((current) => !current);
+      if (terminalOpen && event.target instanceof Element && event.target.closest(".terminal-pane")) {
+        requestAnimationFrame(() => {
+          (document.querySelector<HTMLTextAreaElement>(".agent-composer textarea") ?? composerRef.current)?.focus();
+        });
+      }
+    };
+    window.addEventListener("keydown", toggleTerminal, true);
+    return () => window.removeEventListener("keydown", toggleTerminal, true);
+  }, [terminalOpen, activeSession, trackedCwd, shortcutsOpen, newSessionOpen, renamingSession,
+    forkingSession, askPanel, gitOpen, schedulesOpen, modeConfirmation, modelPickerOpen, settingsOpen,
+    organizingSession, runtimeOpen, referenceOpen]);
+
+  useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.defaultPrevented || event.isComposing) return;
       const key = event.key.toLowerCase();
@@ -750,11 +814,11 @@ function App() {
       const inComposer = event.target === composerRef.current;
       const inTerminal = event.target instanceof Element && !!event.target.closest(".terminal-pane");
       const modal = event.target instanceof Element
-        ? event.target.closest(".modal-backdrop,.model-backdrop,.settings-backdrop,.runtime-backdrop,.ask-backdrop,.git-backdrop")
+        ? event.target.closest(".modal-backdrop,.model-backdrop,.settings-backdrop,.runtime-backdrop,.ask-backdrop,.git-backdrop,.scheduled-tasks-backdrop")
         : null;
 
       if (event.key === "Escape") {
-        if (shortcutsOpen || newSessionOpen || renamingSession || forkingSession || askPanel || gitOpen || modeConfirmation || modelPickerOpen ||
+        if (shortcutsOpen || newSessionOpen || renamingSession || forkingSession || askPanel || gitOpen || schedulesOpen || modeConfirmation || modelPickerOpen ||
             settingsOpen || organizingSession || runtimeOpen || referenceOpen) {
           event.preventDefault();
           setShortcutsOpen(false);
@@ -763,6 +827,7 @@ function App() {
           setForkingSession(null);
           setAskPanel(null);
           setGitOpen(false);
+          setSchedulesOpen(false);
           setModeConfirmation(null);
           setModelPickerOpen(false);
           setSettingsOpen(false);
@@ -786,7 +851,7 @@ function App() {
         regions[(index + (event.shiftKey ? -1 : 1) + regions.length) % regions.length]?.focus();
         return;
       }
-      if (inTerminal && !(modifier && event.shiftKey && key === "t")) return;
+      if (inTerminal) return;
 
       if (modal) {
         if (event.key === "Tab") {
@@ -822,11 +887,6 @@ function App() {
         return;
       }
 
-      if (modifier && event.shiftKey && key === "t") {
-        event.preventDefault();
-        if (activeIdRef.current) setTerminalOpen((current) => !current);
-        return;
-      }
       if (modifier && event.shiftKey && key === "b") {
         event.preventDefault();
         setSidebarOpen((current) => !current);
@@ -914,7 +974,7 @@ function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [queue.items, shortcutsOpen, newSessionOpen, modeConfirmation, modelPickerOpen,
       settingsOpen, organizingSession, runtimeOpen, referenceOpen, modeBusy,
-      composer, trackedCwd, activeSession, newSessionModels, newSessionModelsLoading, selectedAgent, renamingSession, forkingSession, askPanel, gitOpen]);
+      composer, trackedCwd, activeSession, newSessionModels, newSessionModelsLoading, selectedAgent, renamingSession, forkingSession, askPanel, gitOpen, schedulesOpen]);
 
   useEffect(() => {
     if (!activeSession || !sessionReady || runtimeStatus?.connected === false) {
@@ -1071,10 +1131,11 @@ function App() {
         reasoningEffort: newReasoningEffort || null,
         reasoningSummary: newReasoningSummary,
         contextTier: newContextTier || null,
+        deferInitialization: true,
       });
-      setSessions((current) => [session, ...current]);
+      setSessions((current) => [session, ...current.filter((item) => item.sessionId !== session.sessionId)]);
       setNewSessionOpen(false);
-      await openSession(session);
+      await openSession(session, true, true);
     } catch (cause) {
       handleError(cause, setError, setNeedsLogin);
     } finally {
@@ -1754,11 +1815,13 @@ function App() {
         : runtimeStatus?.connected === false
           ? { state: "offline", label: "Runtime disconnected" }
           : !sessionReady
-            ? { state: "detached", label: "Session detached" }
+            ? sessionStartup.status
+              ? { state: "syncing", label: sessionStartup.status.initialization.phase === "failed" ? "Startup failed" : "Preparing session" }
+              : { state: "detached", label: "Session detached" }
             : (sessionProcessing ?? isSessionProcessing(events))
               ? { state: "working", label: "Copilot working" }
               : { state: "idle", label: "Attached · idle" },
-    [catchingUp, events, runtimeStatus?.connected, sessionProcessing, sessionReady],
+    [catchingUp, events, runtimeStatus?.connected, sessionProcessing, sessionReady, sessionStartup.status],
   );
 
   async function loadEarlierHistory() {
@@ -1971,6 +2034,9 @@ function App() {
           New session
           <span>⌘ N</span>
         </button>
+        <button type="button" className="scheduled-nav-button" onClick={() => setSchedulesOpen(true)}>
+          <CalendarClock size={16} />Scheduled tasks
+        </button>
         <label className="session-search">
           <Search size={15} />
           <input
@@ -2076,7 +2142,7 @@ function App() {
                   <button
                     className="model-trigger"
                     title="Change this session's model"
-                    disabled={!!selectedAgent}
+                    disabled={!!selectedAgent || !sessionReady}
                     onClick={() => setModelPickerOpen(true)}
                   >
                     {activeSession.model || "Resolving model…"}
@@ -2151,6 +2217,7 @@ function App() {
             <button
               className={terminalOpen ? "icon-button active" : "icon-button"}
               title={terminalOpen ? "Hide terminal" : "Open terminal"}
+              aria-keyshortcuts="Control+Shift+t Meta+Shift+t"
               disabled={!activeSession?.cwd && !trackedCwd}
               onClick={() => setTerminalOpen((current) => !current)}
             >
@@ -2171,6 +2238,10 @@ function App() {
             </div>}
           </div>
         </header>
+        {sessionStartup.status && !sessionStartup.ready && <SessionStartupBanner
+          initialization={sessionStartup.status.initialization} error={sessionStartup.status.error}
+          connected={activityConnected} retrying={sessionStartup.retrying}
+          onRetry={() => void sessionStartup.retry()} />}
         {terminalLayout.error && <p className="error-banner" role="alert">{terminalLayout.error}</p>}
 
         {activeSession && interactions.length > 0 && <section className="interaction-dock" aria-label="Pending session questions">
@@ -2412,7 +2483,7 @@ function App() {
               )}
               <strong>
                 {!connected ? "Reconnecting to daemon" :
-                  !sessionReady ? "Attaching session" :
+                  !sessionReady ? sessionStartup.status ? "Preparing session" : "Attaching session" :
                   interactions.length || permissions.length ? "Copilot needs your input" :
                   activity.phase === "submitting" ? "Sending message" :
                   activity.phase === "stopping" ? "Stopping turn" :
@@ -2452,6 +2523,7 @@ function App() {
             void addAttachments(Array.from(event.dataTransfer.files));
           }}>
           {modeNotice && <p className="mode-notice" role="status">{modeNotice}</p>}
+          {deliveryDefault.error && <p role="alert">{deliveryDefault.error}</p>}
           {sessionDrafts.error && <p role="alert">{sessionDrafts.error}</p>}
           {sessionDrafts.saved.map((saved) => (
             <div className="saved-chat-draft" key={saved.id}>
@@ -2536,10 +2608,10 @@ function App() {
                 : activeSession && sessionReady
                   ? "Ask Copilot anything…"
                 : activeSession
-                  ? "Connecting to session…"
+                  ? sessionStartup.status ? "Draft a message while the session initializes..." : "Connecting to session…"
                   : "Select a session to start chatting"
             }
-            disabled={!activeSession || !sessionReady || catchingUp}
+            disabled={!activeSession || (!sessionReady && !sessionStartup.status) || catchingUp}
             rows={1}
           />
           <div className="composer-footer">
@@ -2561,7 +2633,8 @@ function App() {
               title="Attach files or images" disabled={readingAttachments || !sessionReady}
               onClick={() => attachmentInputRef.current?.click()}><Paperclip size={17} /></button>
             <select aria-label="Message delivery" value={deliveryMode}
-              onChange={(event) => setDeliveryMode(event.target.value === "immediate" ? "immediate" : "enqueue")}>
+              title="Temporary override. Save your default in Settings → Chat defaults."
+              onChange={(event) => setDeliveryOverride(event.target.value === deliveryDefault.value ? null : event.target.value === "immediate" ? "immediate" : "enqueue")}>
               <option value="enqueue">Queue while busy</option>
               <option value="immediate">Steer running turn</option>
             </select>
@@ -2620,6 +2693,8 @@ function App() {
               onCwdChange={trackTerminalCwd}
               onClose={() => setTerminalOpen(false)}
               typography={typography.settings}
+              autoFocus={terminalFocusSession === activeSession.sessionId}
+              onAutoFocus={() => setTerminalFocusSession(null)}
             />
           </Suspense>
         </>
@@ -2677,6 +2752,10 @@ function App() {
           chatWidth={chatWidth.width}
           onChatWidthChange={chatWidth.setWidth}
           chatWidthError={chatWidth.error}
+          deliveryDefault={deliveryDefault.value}
+          deliveryDefaultError={deliveryDefault.error}
+          onDeliveryDefaultChange={(value) => { deliveryDefault.setValue(value); setDeliveryOverride(null); }}
+          onOpenShortcuts={() => { setSettingsOpen(false); setShortcutsOpen(true); }}
           themePreference={themePreference}
           onThemePreferenceChange={setThemePreference}
           onClose={() => setSettingsOpen(false)}
@@ -2686,6 +2765,22 @@ function App() {
           }}
         />
       )}
+      {schedulesOpen && <Suspense fallback={<p role="status">Opening scheduled tasks...</p>}>
+        <ScheduledTasksPanel sessions={sessions} defaultCwd={activeSession?.cwd ?? trackedCwd}
+          onClose={() => setSchedulesOpen(false)}
+          onOpenSession={async (sessionId) => {
+            const checkpoint = archiveChanges.checkpoint();
+            const latest = (await daemonInvoke<SessionSummary[]>("list_sessions"))
+              .map((session) => sessionStartup.track(archiveChanges.reconcile(session, checkpoint)));
+            const target = latest.find((session) => session.sessionId === sessionId);
+            if (!target) throw new Error("This scheduled task's conversation is no longer available.");
+            setSessions(latest);
+            setSessionView(target.archived ? "archived" : "current");
+            setSchedulesOpen(false);
+            setSelectedAgent(null);
+            await openSession(target);
+          }} />
+      </Suspense>}
 
       {modelPickerOpen && activeSession && (
         <ModelPicker
@@ -2895,7 +2990,7 @@ function App() {
                 <span>Keyboard workflow</span>
                 <h2>Shortcuts</h2>
               </div>
-              <button type="button" onClick={() => setShortcutsOpen(false)} aria-label="Close">
+              <button type="button" autoFocus onClick={() => { setShortcutsOpen(false); composerRef.current?.focus(); }} aria-label="Close">
                 <X size={17} />
               </button>
             </header>
@@ -2915,7 +3010,8 @@ function App() {
               <kbd>Ctrl .</kbd><span>Stop current turn</span>
               <kbd>Ctrl Shift Backspace</kbd><span>Remove newest queued prompt</span>
               <kbd>Ctrl Shift B</kbd><span>Toggle sessions sidebar</span>
-              <kbd>Ctrl Shift T</kbd><span>Toggle terminal</span>
+              <kbd>Ctrl Shift T</kbd><span>Toggle terminal (Cmd Shift T on macOS also works)</span>
+              <kbd>Ctrl C / Cmd C</kbd><span>In terminal: copy selected text. Ctrl C without selection interrupts the shell.</span>
               <kbd>Ctrl N</kbd><span>New session</span>
               <kbd>?</kbd><span>Show this help</span>
             </div>

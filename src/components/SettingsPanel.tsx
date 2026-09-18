@@ -1,4 +1,4 @@
-import { Palette, Settings2, SlidersHorizontal, Wrench, X } from "lucide-react";
+import { Keyboard, Palette, Settings2, SlidersHorizontal, Wrench, X } from "lucide-react";
 import { useEffect, useId, useState } from "react";
 import {
   TYPOGRAPHY_LIMITS,
@@ -15,6 +15,7 @@ import {
 } from "../lib/typography";
 import type { TypographyController } from "../lib/useTypography";
 import type { ChatWidth } from "../lib/chatWidth";
+import type { MessageDelivery } from "../lib/deliveryPreference";
 import "../typography.css";
 
 export type ThemePreference = "auto" | "light" | "dark";
@@ -28,6 +29,10 @@ interface SettingsPanelProps {
   chatWidth?: ChatWidth;
   onChatWidthChange?: (width: ChatWidth) => void;
   chatWidthError?: string;
+  deliveryDefault?: MessageDelivery;
+  onDeliveryDefaultChange?: (value: MessageDelivery) => void;
+  deliveryDefaultError?: string;
+  onOpenShortcuts?: () => void;
 }
 
 const schemes: {
@@ -65,6 +70,10 @@ export function SettingsPanel({
   chatWidth = "readable",
   onChatWidthChange,
   chatWidthError,
+  deliveryDefault = "enqueue",
+  onDeliveryDefaultChange,
+  deliveryDefaultError,
+  onOpenShortcuts,
 }: SettingsPanelProps) {
   return (
     <div className="settings-backdrop">
@@ -121,6 +130,29 @@ export function SettingsPanel({
         </div>
 
         {typography && <TypographySection typography={typography} />}
+
+        {onOpenShortcuts && <div className="settings-section">
+          <button type="button" className="settings-navigation" onClick={onOpenShortcuts}>
+            <span className="settings-navigation-icon"><Keyboard size={17} /></span>
+            <span><strong>Keyboard shortcuts</strong><small>Terminal, copy, chat, queue, and navigation</small></span>
+            <i>Open</i>
+          </button>
+        </div>}
+        {onDeliveryDefaultChange && <details className="settings-section workflow-settings">
+          <summary className="settings-section-title"><SlidersHorizontal size={15} />
+            <div><strong>Chat defaults</strong><span>Saved locally for this browser or desktop client</span></div>
+          </summary>
+          <label className="workflow-default-field">
+            <strong>Default message delivery</strong>
+            <select aria-label="Default message delivery" value={deliveryDefault} onChange={(event) => onDeliveryDefaultChange(event.target.value === "immediate" ? "immediate" : "enqueue")}>
+              <option value="enqueue">Queue while busy</option>
+              <option value="immediate">Steer running turn</option>
+            </select>
+            <small>Applies to the composer now and after reload. Queue waits for the current turn; Steer sends guidance to the running turn. This does not change messages already queued.</small>
+          </label>
+          <p>The composer dropdown is a temporary override for this window. Ctrl+Q explicitly queues; Ctrl+Enter explicitly steers.</p>
+        </details>}
+        {deliveryDefaultError && <p role="alert" className="typography-error">{deliveryDefaultError}</p>}
 
         <div className="settings-section">
           <div className="settings-section-title">

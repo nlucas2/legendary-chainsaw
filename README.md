@@ -4,6 +4,13 @@ A responsive web client and lightweight Tauri desktop shell for GitHub Copilot C
 Both interfaces connect to the same long-lived Rust daemon, so sessions, approvals, terminal
 processes, and event streams have one owner and remain available when an interface closes.
 
+New sessions open their workspace after native creation and attachment, without waiting for
+tool/MCP warm-up or model resolution. Initialization continues in the daemon with visible progress;
+you can draft immediately, but sending stays disabled until the session reports ready.
+Failures keep the created session open with a same-session **Retry initialization** action.
+This avoids a redundant resume/history load for an empty new session; the initial SDK creation
+itself can still take time.
+
 ## Architecture
 
 ```text
@@ -29,6 +36,12 @@ Mobile/web browser ──┘                                  │
   Above is the default for clients without a saved layout; existing saved placement is preserved.
   Drag the divider, or focus it and use the arrow keys (Shift for larger steps). Placement and size
   are saved locally.
+  **Ctrl+Shift+T** (or **Cmd+Shift+T**) opens and focuses the terminal so you can type immediately;
+  using it again from the terminal hides the pane and returns focus to your chat draft, without
+  sending that key combination to the shell. **Ctrl+C/Cmd+C** copies selected terminal
+  text; Ctrl+C with no selection still interrupts the shell. A Copy selection button is also
+  available, including in read-only terminals. Clipboard errors stay visible rather than being
+  silently ignored; web clipboard access requires HTTPS or localhost.
 - **Multiple clients** may observe the same session. A terminal grants input control to one tab at a
   time while other attached clients remain read-only; permission and runtime state resolves across
   every open interface.
@@ -52,6 +65,10 @@ Mobile/web browser ──┘                                  │
   be edited, moved earlier, removed, or sent to the running turn. The queue uses compact preview rows
   with inline actions and a bounded scrolling list. Click its heading to collapse it to a count and
   next-message preview; errors remain visible, and collapsing does not cancel or change queued work.
+  **Settings → Chat defaults → Default message delivery** saves Queue while busy or Steer running
+  turn for this browser/desktop client. It applies immediately and after reload, but does not
+  change already queued work. The composer dropdown is a temporary override for the current window;
+  Ctrl+Q and Ctrl+Enter still explicitly queue or steer a single submission.
   Selected files and pasted images are
   sent as SDK attachments only when the message is submitted. Draft text and files stay together
   per session while the client remains open; failed sends are restored or retained as separate unsent
@@ -97,6 +114,27 @@ Mobile/web browser ──┘                                  │
   status polling restores state after reconnects or missed events without opening saved sessions.
   Indicators reflect the main session's processing state; subagents retain their own statuses.
   The pulse respects reduced-motion preferences.
+- **Scheduled tasks** in the sidebar runs a saved prompt once or daily. For a daily briefing, create
+  a schedule, specify the skill and sources to review, choose a time/time zone, and leave
+  **Create a dedicated session on first run** selected. Each result lands in that same conversation,
+  pinned in the **Scheduled** folder and tagged `scheduled`, where you can ask follow-up questions.
+  Alternatively, choose an existing session without changing its folders or tags.
+  Nothing is scheduled until you explicitly save it; the briefing template requires you to replace
+  its source placeholder. Normal tool permissions still apply, so a run may wait for approval.
+  Schedules run in the daemon even with the UI closed, but cannot wake a sleeping computer or run
+  while the daemon is stopped. One missed occurrence catches up when available; missed days are
+  not replayed as a burst. Busy sessions and a draining/disconnected runtime are not interrupted.
+  Targets must be in interactive mode; schedules do not switch plan/autopilot modes or bypass
+  queued messages, pending input, or background tasks reported by the runtime.
+  Daily times use the selected IANA time zone: repeated clock times run at the earlier instant;
+  nonexistent clock times advance to the first valid minute that day, or skip a wholly missing day.
+  The manager offers pause/enable, Run now, recent run outcomes, and Open conversation. Deleting
+  a schedule leaves its session/history intact and does not cancel work already running.
+  Interrupted dispatches with uncertain delivery are paused for review before explicitly enabling
+  another run; exactly-once delivery across crashes is not guaranteed. Prompts appear as
+  **Scheduled task**, not **You**. Schedules and the latest 20 runs per task persist in the daemon's
+  `schedules.json` (up to 100 tasks); unreadable storage disables scheduling without blocking chat.
+  No briefing prompts, schedules, or data-source access are enabled by default.
 - **Git workspace** discovers the repository from the session's current directory. Its read-only
   views cover staged, unstaged and untracked paths, plus a PR-style **committed** comparison from
   the selected target's merge base to HEAD. Choose a local target ref; the tracking upstream may
@@ -115,8 +153,10 @@ Mobile/web browser ──┘                                  │
   **One file** loads a selected diff. **Continuous diffs** displays a PR-style stream and loads
   three more files as you scroll, with a keyboard-accessible Load more button and at most three
   concurrent requests. The desktop file list stays visible and highlights the diff at your reading
-  position. Clicking a filename jumps within the stream without switching to One file or losing
-  in-progress notes. Distant jumps load nearby previews, not every skipped file; skipped previews
+  position. The Git header also stays visible with **Back to top** and **Close** controls; returning
+  to the top keeps loaded diffs and unfinished notes intact. Clicking a filename jumps within the
+  stream without switching to One file or losing in-progress notes. Distant jumps load nearby
+  previews, not every skipped file; skipped previews
   load on scrolling back to them. Mobile's file picker and previous/next buttons navigate the
   same stream. **Whole-file context** includes unchanged lines around edits in tracked
   text files. All previews remain capped at 192 KiB or 2,500 lines, with truncation clearly marked.
@@ -226,6 +266,9 @@ confirmation is not yet supported. The client displays the limitation instead of
 confirmation value or starting a follow-up implementation turn automatically.
 
 ## Keyboard workflow
+
+Open **Settings → Keyboard shortcuts** for the shortcut popup (also available with `?` outside
+text fields). Ctrl+T remains the reasoning toggle; no Alt+T terminal shortcut is assigned.
 
 The prompt keeps focus while a session runs. Enter submits using the selected delivery mode;
 Shift+Enter inserts a newline. Ctrl+Q explicitly queues; Ctrl+Enter steers the running turn.

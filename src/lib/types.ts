@@ -11,6 +11,19 @@ export interface SessionSummary {
   archived?: boolean;
   folder?: string;
   tags: string[];
+  initialization?: SessionInitialization;
+}
+
+export interface SessionInitialization {
+  phase: "initializing" | "ready" | "failed";
+  stage: string;
+  error?: string;
+}
+
+export interface SessionInitializationSnapshot {
+  sessionId: string;
+  initialization: SessionInitialization;
+  session?: SessionSummary;
 }
 
 export interface SessionEvent {
@@ -149,6 +162,7 @@ type DaemonEventPayload =
   | { type: "session_attached"; sessionId: string }
   | { type: "session_deleted"; sessionId: string }
   | { type: "session_archive_changed"; sessionId: string; archived: boolean }
+  | { type: "session_initialization_changed"; sessionId: string; initialization: SessionInitialization }
   | { type: "interaction_requested"; interaction: PendingInteraction }
   | { type: "interaction_resolved"; sessionId: string; requestId: string };
 

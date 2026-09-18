@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ChevronLeft, ChevronRight, GitBranch, RefreshCw, X } from "lucide-react";
+import { ArrowUpToLine, ChevronLeft, ChevronRight, GitBranch, RefreshCw, X } from "lucide-react";
 import { daemonInvoke } from "../lib/daemon";
 import {
   comparisonTargetGroups, gitFilesForView, gitViewLabels, loadGitComments, MAX_COMMENTS, GIT_COMMENTS_KEY, saveGitComments, visiblePath,
@@ -61,6 +61,7 @@ function WorkspacePanel({ sessionId, cwd, onClose, onAsk, onDiscuss }: GitPanelP
   const [commentError, setCommentError] = useState("");
   const [loadDiff] = useState(() => createGitDiffLoader<GitDiff>());
   const panel = useRef<HTMLElement>(null);
+  const header = useRef<HTMLElement>(null);
   const fileList = useRef<HTMLDivElement>(null);
   const options = useRef<HTMLDetailsElement>(null);
 
@@ -68,6 +69,15 @@ function WorkspacePanel({ sessionId, cwd, onClose, onAsk, onDiscuss }: GitPanelP
     const previous = document.activeElement;
     panel.current?.focus();
     return () => { if (previous instanceof HTMLElement && previous.isConnected) previous.focus(); };
+  }, []);
+  useEffect(() => {
+    const element = panel.current;
+    if (!element || !header.current) return;
+    const resize = new ResizeObserver(() => {
+      element.style.setProperty("--git-header-height", `${header.current?.offsetHeight ?? 0}px`);
+    });
+    resize.observe(header.current);
+    return () => resize.disconnect();
   }, []);
   useEffect(() => {
     const read = () => {
@@ -129,6 +139,10 @@ function WorkspacePanel({ sessionId, cwd, onClose, onAsk, onDiscuss }: GitPanelP
     setLayout(next);
     panel.current?.scrollTo({ top: 0 });
   }
+  function backToTop() {
+    setNavigation(null);
+    panel.current?.scrollTo({ top: 0, behavior: "instant" });
+  }
   function deleteComment(id: string) {
     try {
       const next = loadGitComments(localStorage).filter((comment) => comment.id !== id);
@@ -177,10 +191,11 @@ function WorkspacePanel({ sessionId, cwd, onClose, onAsk, onDiscuss }: GitPanelP
           if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
         }
       }}>
-      <header className="git-panel-header">
+      <header ref={header} className="git-panel-header">
         <div className="git-panel-title-row">
           <h2><GitBranch size={18} /><span className="git-panel-title">Git workspace</span><span className="git-read-only">Read only</span></h2>
           <div className="git-panel-actions">
+            <button type="button" onClick={backToTop} aria-label="Back to top" title="Back to top"><ArrowUpToLine size={16} /><span className="git-top-label">Top</span></button>
             <button type="button" onClick={() => setRevision((value) => value + 1)} disabled={loading} aria-label="Refresh Git workspace" title="Refresh Git workspace"><RefreshCw size={16} /><span className="git-refresh-label">Refresh</span></button>
             <button type="button" onClick={onClose} aria-label="Close Git workspace"><X size={18} /></button>
           </div>

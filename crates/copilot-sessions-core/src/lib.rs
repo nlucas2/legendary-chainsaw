@@ -5,8 +5,10 @@ mod agent_tasks_tests;
 mod attachments;
 mod event_projection;
 mod interactions;
+mod initialization;
 mod native_user_input;
 mod runtime_api;
+mod scheduled;
 mod session_actions;
 mod session_archive;
 #[cfg(test)]
@@ -25,9 +27,11 @@ pub use agent_tasks::{
 };
 pub use event_projection::project_app_event;
 pub use interactions::{InteractionKind, InteractionResponse, PendingInteraction};
+pub use initialization::{InitializationPhase, InitializationSnapshot, InitializationStage, SessionInitialization};
 pub use runtime_api::{
     QueueAction, SendMessageRequest, SessionState, SetSessionMode, SetSessionModeResult,
 };
+pub use scheduled::ScheduledDelivery;
 pub use session_actions::{AskSessionRequest, AskSessionResult, ForkSessionRequest, RenameSessionRequest};
 pub use session_archive::SetSessionArchived;
 pub use tool_controls::{AdoptToolControls, SetMcpEnabled, SetToolEnabled, ToolControls};
@@ -108,6 +112,8 @@ pub enum ServiceError {
         "session {0} is currently processing; wait for its turn to finish before this operation"
     )]
     SessionProcessing(String),
+    #[error("session {session_id} is not ready: {reason}")]
+    SessionNotReady { session_id: String, reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, ServiceError>;
@@ -128,6 +134,8 @@ pub struct SessionSummary {
     pub archived: bool,
     pub folder: Option<String>,
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initialization: Option<InitializationSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,6 +146,8 @@ pub struct NewSession {
     pub reasoning_effort: Option<String>,
     pub reasoning_summary: Option<String>,
     pub context_tier: Option<String>,
+    #[serde(default)]
+    pub defer_initialization: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -286,6 +296,10 @@ pub enum AppEvent {
     SessionArchiveChanged {
         session_id: String,
         archived: bool,
+    },
+    SessionInitializationChanged {
+        session_id: String,
+        initialization: InitializationSnapshot,
     },
     EventGap {
         session_id: Option<String>,
@@ -545,6 +559,7 @@ pub struct SessionService {
     accepting_work: AtomicBool,
     active: RwLock<HashMap<String, Arc<Session>>>,
     warmed: RwLock<HashSet<String>>,
+    initializations: RwLock<initialization::InitializationRegistry>,
     turn_gates: RwLock<HashMap<String, Arc<AsyncMutex<()>>>>,
     ask_gates: RwLock<HashMap<String, Arc<AsyncMutex<()>>>>,
     last_submissions: RwLock<HashMap<String, tokio::time::Instant>>,
@@ -581,6 +596,7 @@ impl SessionService {
             accepting_work: AtomicBool::new(true),
             active: RwLock::new(HashMap::new()),
             warmed: RwLock::new(HashSet::new()),
+            initializations: RwLock::new(Default::default()),
             turn_gates: RwLock::new(HashMap::new()),
             ask_gates: RwLock::new(HashMap::new()),
             last_submissions: RwLock::new(HashMap::new()),
@@ -628,10 +644,12 @@ impl SessionService {
             .cloned()
             .unwrap_or_default();
         sessions.sort_by_key(|session| Reverse(value_string(session, "modifiedTime")));
+        let initializations = self.initializations.read().await;
         let active = self.active.read().await;
         let metadata = self.metadata.read().await;
         let mut summaries = sessions
             .into_iter()
+            .filter(|session| !initializations.deleted.contains(&value_string(session, "sessionId")))
             .map(|session| {
                 let id = value_string(&session, "sessionId");
                 let local = metadata.get(&id);
@@ -669,15 +687,46 @@ impl SessionService {
                     archived: local.is_some_and(|meta| meta.archived),
                     folder: local.and_then(|meta| meta.folder.clone()),
                     tags: local.map(|meta| meta.tags.clone()).unwrap_or_default(),
+                    initialization: initializations.snapshot(&id),
                 }
             })
             .collect::<Vec<_>>();
+        let mut cache = self.session_cache.write().await;
+        // Native indexing can lag creation. Merge against the current cache,
+        // not a snapshot taken before session.list's RPC.
+        for cached in cache.iter().filter(|cached| {
+            !initializations.deleted.contains(&cached.session_id)
+                && (active.contains_key(&cached.session_id)
+                    || initializations.runs.contains_key(&cached.session_id))
+        }) {
+            if !summaries.iter().any(|item| item.session_id == cached.session_id) {
+                let mut summary = cached.clone();
+                summary.is_active = active.contains_key(&summary.session_id);
+                summary.initialization = initializations.snapshot(&summary.session_id);
+                if let Some(meta) = metadata.get(&summary.session_id) {
+                    initialization::apply_metadata(&mut summary, meta);
+                }
+                summaries.push(summary);
+            }
+        }
         summaries.sort_by_key(|session| (!session.pinned, Reverse(session.modified_time.clone())));
-        *self.session_cache.write().await = summaries.clone();
+        *cache = summaries.clone();
         Ok(summaries)
     }
 
     pub async fn create_session(self: &Arc<Self>, request: NewSession) -> Result<SessionSummary> {
+        if request.defer_initialization {
+            let service = Arc::clone(self);
+            // Once accepted, HTTP cancellation must not strand an SDK session
+            // between creation, persistence, attachment, and warmup scheduling.
+            return tokio::spawn(async move { service.create_session_inner(request).await })
+                .await
+                .map_err(|error| ServiceError::CommandFailed(format!("Session creation failed: {error}")))?;
+        }
+        self.create_session_inner(request).await
+    }
+
+    async fn create_session_inner(self: &Arc<Self>, request: NewSession) -> Result<SessionSummary> {
         let _create = self
             .create_gate
             .try_lock()
@@ -718,8 +767,10 @@ impl SessionService {
         {
             config = config.with_context_tier(tier);
         }
+        let started = std::time::Instant::now();
         let session = Arc::new(self.client().await?.create_session(config).await?);
         let id = session.id().to_string();
+        tracing::info!(session_id = %id, stage = "create", elapsed_ms = started.elapsed().as_millis(), "session startup");
         self.metadata.write().await.insert(
             id.clone(),
             StoredSessionMeta {
@@ -737,17 +788,20 @@ impl SessionService {
                 tool_controls_managed: true,
                 tool_controls_created: true,
                 tool_available_tools: None,
-                prevent_pending_work: false,
+                prevent_pending_work: request.defer_initialization,
             },
         );
         self.persist_metadata().await?;
+        if request.defer_initialization {
+            return self.attach_deferred(session).await;
+        }
         self.attach(session).await?;
         self.initialize_environment(&id).await?;
         self.refresh_model(&id).await?;
         let metadata = self.metadata.read().await;
         let local = metadata.get(&id);
         let model = local.and_then(|meta| meta.model.clone());
-        Ok(SessionSummary {
+        let summary = SessionSummary {
             session_id: id,
             title: "New session".to_string(),
             start_time: String::new(),
@@ -760,7 +814,10 @@ impl SessionService {
             archived: local.is_some_and(|meta| meta.archived),
             folder: None,
             tags: Vec::new(),
-        })
+            initialization: None,
+        };
+        self.session_cache.write().await.push(summary.clone());
+        Ok(summary)
     }
 
     pub async fn resume_session(self: &Arc<Self>, session_id: String) -> Result<SessionSummary> {
@@ -774,6 +831,9 @@ impl SessionService {
         session_id: String,
         continue_pending_work: bool,
     ) -> Result<SessionSummary> {
+        if let Some(summary) = self.join_initialization(&session_id).await? {
+            return Ok(summary);
+        }
         let _lifecycle = self.lifecycle_gate.read().await;
         self.resume_session_with_pending_work_locked(session_id, continue_pending_work).await
     }
@@ -786,45 +846,9 @@ impl SessionService {
         let gate = self.turn_gate(&session_id).await;
         let _guard = gate.lock().await;
         self.require_accepting_work()?;
+        self.require_initialized(&session_id).await?;
         if !self.active.read().await.contains_key(&session_id) {
-            let meta = self.metadata.read().await.get(&session_id).cloned();
-            let mut config = ResumeSessionConfig::new(SessionId::new(session_id.clone()))
-                .with_streaming(true)
-                .with_continue_pending_work(continue_pending_work && !meta.as_ref().is_some_and(|meta| meta.prevent_pending_work))
-                .with_permission_handler(self.approvals.clone())
-                .with_user_input_handler(self.interactions.clone())
-                .with_elicitation_handler(self.interactions.clone())
-                .with_exit_plan_mode_handler(self.interactions.clone())
-                .with_auto_mode_switch_handler(self.interactions.clone());
-            if let Some(meta) = meta
-                .as_ref()
-                .filter(|meta| meta.tool_controls_managed && meta.tool_controls_created)
-            {
-                config = config.with_excluded_tools(meta.tool_exclusions.clone());
-                if let Some(available) = &meta.tool_available_tools {
-                    config = config.with_available_tools(available.clone());
-                }
-            }
-            if let Some(cwd) = meta.as_ref().and_then(|m| m.cwd.as_deref()) {
-                config = config.with_working_directory(cwd);
-            }
-            if let Some(model) = meta.as_ref().and_then(|m| m.model.as_deref()) {
-                config = config.with_model(model);
-            }
-            if let Some(effort) = meta.as_ref().and_then(|m| m.reasoning_effort.as_deref()) {
-                config = config.with_reasoning_effort(effort);
-            }
-            let summary = meta
-                .as_ref()
-                .and_then(|m| m.reasoning_summary.as_deref())
-                .unwrap_or("detailed");
-            if let Some(summary) = parse_reasoning_summary(summary) {
-                config = config.with_reasoning_summary(summary);
-            }
-            if let Some(tier) = meta.as_ref().and_then(|m| m.context_tier.as_deref()) {
-                config = config.with_context_tier(tier);
-            }
-            let session = Arc::new(self.client().await?.resume_session(config).await?);
+            let session = self.resume_handle(&session_id, continue_pending_work).await?;
             self.attach(session).await?;
             self.refresh_model(&session_id).await?;
         }
@@ -837,6 +861,7 @@ impl SessionService {
             .find(|summary| summary.session_id == session_id)
         {
             summary.is_active = true;
+            summary.initialization = None;
             if let Some(meta) = meta {
                 summary.cwd = meta.cwd.clone();
                 summary.model = meta.model.clone();
@@ -877,7 +902,49 @@ impl SessionService {
             archived: local.archived,
             folder: local.folder,
             tags: local.tags,
+            initialization: None,
         })
+    }
+
+    async fn resume_handle(&self, session_id: &str, continue_pending_work: bool) -> Result<Arc<Session>> {
+        let meta = self.metadata.read().await.get(session_id).cloned();
+        let mut config = ResumeSessionConfig::new(SessionId::new(session_id))
+            .with_streaming(true)
+            .with_continue_pending_work(continue_pending_work && !meta.as_ref().is_some_and(|meta| meta.prevent_pending_work))
+            .with_permission_handler(self.approvals.clone())
+            .with_user_input_handler(self.interactions.clone())
+            .with_elicitation_handler(self.interactions.clone())
+            .with_exit_plan_mode_handler(self.interactions.clone())
+            .with_auto_mode_switch_handler(self.interactions.clone());
+        if let Some(meta) = meta
+            .as_ref()
+            .filter(|meta| meta.tool_controls_managed && meta.tool_controls_created)
+        {
+            config = config.with_excluded_tools(meta.tool_exclusions.clone());
+            if let Some(available) = &meta.tool_available_tools {
+                config = config.with_available_tools(available.clone());
+            }
+        }
+        if let Some(cwd) = meta.as_ref().and_then(|m| m.cwd.as_deref()) {
+            config = config.with_working_directory(cwd);
+        }
+        if let Some(model) = meta.as_ref().and_then(|m| m.model.as_deref()) {
+            config = config.with_model(model);
+        }
+        if let Some(effort) = meta.as_ref().and_then(|m| m.reasoning_effort.as_deref()) {
+            config = config.with_reasoning_effort(effort);
+        }
+        let summary = meta
+            .as_ref()
+            .and_then(|m| m.reasoning_summary.as_deref())
+            .unwrap_or("detailed");
+        if let Some(summary) = parse_reasoning_summary(summary) {
+            config = config.with_reasoning_summary(summary);
+        }
+        if let Some(tier) = meta.as_ref().and_then(|m| m.context_tier.as_deref()) {
+            config = config.with_context_tier(tier);
+        }
+        Ok(Arc::new(self.client().await?.resume_session(config).await?))
     }
 
     pub async fn refresh_session(self: &Arc<Self>, session_id: String) -> Result<SessionRefresh> {
@@ -1062,7 +1129,7 @@ impl SessionService {
     }
 
     pub async fn subagent_context(&self, session_id: &str) -> Result<Vec<SessionEvent>> {
-        self.session(session_id).await?;
+        self.attached_session(session_id).await?;
         let result = self
             .client()
             .await?
@@ -1114,7 +1181,7 @@ impl SessionService {
     }
 
     pub async fn queue_items(&self, session_id: &str) -> Result<serde_json::Value> {
-        self.session(session_id).await?;
+        self.attached_session(session_id).await?;
         Ok(self
             .client()
             .await?
@@ -1210,7 +1277,7 @@ impl SessionService {
     }
 
     pub async fn references(&self, session_id: &str) -> Result<SessionReferences> {
-        self.session(session_id).await?;
+        self.attached_session(session_id).await?;
         let client = self.client().await?;
         let session = serde_json::json!({ "sessionId": session_id });
         let (commands, mcp, tools, instructions, tasks) = tokio::join!(
@@ -1234,7 +1301,7 @@ impl SessionService {
     }
 
     pub async fn context_attribution(&self, session_id: &str) -> Result<serde_json::Value> {
-        self.session(session_id).await?;
+        self.attached_session(session_id).await?;
         Ok(self
             .client()
             .await?
@@ -1250,7 +1317,7 @@ impl SessionService {
         session_id: &str,
         section: &str,
     ) -> Result<serde_json::Value> {
-        self.session(session_id).await?;
+        self.attached_session(session_id).await?;
         let client = self.client().await?;
         let session = Some(serde_json::json!({ "sessionId": session_id }));
         match section {
@@ -1270,7 +1337,7 @@ impl SessionService {
     }
 
     pub async fn discover_skills(&self, session_id: &str) -> Result<serde_json::Value> {
-        self.session(session_id).await?;
+        self.attached_session(session_id).await?;
         let cwd = self.cwd_for(session_id).await;
         Ok(self
             .client()
@@ -1286,7 +1353,7 @@ impl SessionService {
     }
 
     pub async fn mcp_tools(&self, session_id: &str) -> Result<serde_json::Value> {
-        self.session(session_id).await?;
+        self.attached_session(session_id).await?;
         let client = self.client().await?;
         let mcp = client
             .call(
@@ -1400,7 +1467,7 @@ impl SessionService {
         &self,
         session_id: &str,
     ) -> Result<Vec<PendingInteraction>> {
-        self.session(session_id).await?;
+        self.attached_session(session_id).await?;
         self.interactions
             .recover_native(session_id, &self.client().await?)
             .await?;
@@ -1408,21 +1475,34 @@ impl SessionService {
     }
 
     pub async fn respond_interaction_async(&self, response: InteractionResponse) -> Result<()> {
-        self.session(&response.session_id).await?;
+        // Initialization may itself need an answer to a pending callback.
+        self.attached_session(&response.session_id).await?;
         self.interactions
             .respond_native(response, &self.client().await?)
             .await
     }
 
-    pub async fn delete_session(&self, session_id: &str) -> Result<()> {
+    pub async fn delete_session(self: &Arc<Self>, session_id: &str) -> Result<()> {
+        let service = Arc::clone(self);
+        let session_id = session_id.to_owned();
+        tokio::spawn(async move { service.delete_session_inner(&session_id).await })
+            .await
+            .map_err(|error| ServiceError::CommandFailed(format!("Session deletion failed: {error}")))?
+    }
+
+    async fn delete_session_inner(&self, session_id: &str) -> Result<()> {
         let _lifecycle = self.lifecycle_gate.read().await;
         let gate = self.turn_gate(session_id).await;
         let _guard = gate.lock().await;
-        self.active.write().await.remove(session_id);
-        self.client()
-            .await?
-            .delete_session(&SessionId::new(session_id))
-            .await?;
+        let previous = self.forget_initialization(session_id).await?;
+        let deletion = async {
+            self.client().await?.delete_session(&SessionId::new(session_id)).await?;
+            Ok::<_, ServiceError>(())
+        }.await;
+        if let Err(error) = deletion {
+            self.restore_failed_deletion(session_id, previous, &error).await;
+            return Err(error);
+        }
         self.metadata.write().await.remove(session_id);
         self.last_submissions.write().await.remove(session_id);
         self.warmed.write().await.remove(session_id);
@@ -1513,7 +1593,7 @@ impl SessionService {
     }
 
     pub async fn model_info(&self, session_id: &str) -> Result<serde_json::Value> {
-        self.session(session_id).await?;
+        self.attached_session(session_id).await?;
         let client = self.client().await?;
         let params = Some(serde_json::json!({ "sessionId": session_id }));
         let (current, available) = tokio::join!(
@@ -1582,7 +1662,7 @@ impl SessionService {
     }
 
     pub async fn session_processing(&self, session_id: &str) -> Result<bool> {
-        self.session(session_id).await?;
+        self.attached_session(session_id).await?;
         self.client()
             .await?
             .call(
@@ -1630,6 +1710,7 @@ impl SessionService {
     pub async fn drain(&self, timeout: Duration, force: bool) -> Result<DrainStatus> {
         let _runtime_guard = self.runtime_gate.lock().await;
         self.accepting_work.store(false, Ordering::Relaxed);
+        self.cancel_initializations("Copilot is draining; retry after reconnecting", false).await;
         let _lifecycle = self.lifecycle_gate.write().await;
         let client = self.client().await?;
         let deadline = tokio::time::Instant::now() + timeout;
@@ -1681,6 +1762,7 @@ impl SessionService {
             }
         }
 
+        self.cancel_initializations("Copilot is disconnected; resume the session after reconnecting", true).await;
         let sessions = self
             .active
             .write()
@@ -1695,6 +1777,9 @@ impl SessionService {
         self.ask_gates.write().await.clear();
         self.tool_state.write().await.clear();
         self.tool_catalog.clear().await;
+        for summary in self.session_cache.write().await.iter_mut() {
+            summary.is_active = false;
+        }
         for session in sessions {
             session.disconnect().await?;
         }
@@ -1718,6 +1803,14 @@ impl SessionService {
         let session_ids = self.active.read().await.keys().cloned().collect::<Vec<_>>();
         let mut results = Vec::with_capacity(session_ids.len());
         for session_id in session_ids {
+            if let Err(error) = self.session(&session_id).await {
+                results.push(SessionOperationResult {
+                    session_id,
+                    success: false,
+                    error: Some(error.to_string()),
+                });
+                continue;
+            }
             match client
                 .call(
                     "session.mcp.reload",
@@ -1741,10 +1834,21 @@ impl SessionService {
     }
 
     async fn session(&self, session_id: &str) -> Result<Arc<Session>> {
+        let initializations = self.initializations.read().await;
+        if let Some(snapshot) = initializations.snapshot(session_id)
+            && snapshot.phase != InitializationPhase::Ready
+        {
+            return Err(initialization::not_ready(session_id, &snapshot));
+        }
+        self.attached_session(session_id).await
+    }
+
+    async fn attached_session(&self, session_id: &str) -> Result<Arc<Session>> {
         self.active
             .read()
             .await
             .get(session_id)
+            .filter(|session| !session.cancellation_token().is_cancelled())
             .cloned()
             .ok_or_else(|| ServiceError::SessionNotActive(session_id.to_string()))
     }
@@ -1831,9 +1935,16 @@ impl SessionService {
         let cancellation = session.cancellation_token();
         let interactions = self.interactions.clone();
         let cancelled_id = session_id.clone();
+        let cancelled_session = Arc::downgrade(&session);
+        let cancelled_service = Arc::downgrade(self);
         tokio::spawn(async move {
             cancellation.cancelled().await;
             interactions.clear_callbacks(&cancelled_id);
+            if let (Some(service), Some(session)) =
+                (cancelled_service.upgrade(), cancelled_session.upgrade())
+            {
+                service.disconnect_initialization(&cancelled_id, &session).await;
+            }
         });
 
         let events = self.events.clone();
@@ -1944,6 +2055,7 @@ impl SessionService {
                             && let Some(current_service) = weak_service.upgrade()
                         {
                             current_service.interactions.clear_callbacks(&session_id);
+                            current_service.disconnect_initialization(&session_id, &session).await;
                         }
                         tracing::warn!(
                             %error,

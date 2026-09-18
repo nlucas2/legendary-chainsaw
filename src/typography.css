@@ -243,6 +243,12 @@
   color: var(--danger);
 }
 
+.workflow-settings > summary { cursor: pointer; min-height: 44px; margin-bottom: 0; }
+.workflow-settings[open] > summary { margin-bottom: 16px; }
+.workflow-default-field { display: grid; gap: 8px; font-size: 13px; }
+.workflow-default-field select { min-width: 0; width: 100%; min-height: 44px; padding: 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); font: inherit; }
+.workflow-default-field small, .workflow-settings p { color: var(--muted); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+
 .typography-preview {
   min-width: 0;
   padding: 12px;

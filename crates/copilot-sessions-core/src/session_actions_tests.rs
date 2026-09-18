@@ -179,6 +179,7 @@ impl MockRuntime {
             accepting_work: AtomicBool::new(true),
             active: RwLock::new(HashMap::new()),
             warmed: RwLock::new(HashSet::new()),
+            initializations: RwLock::new(Default::default()),
             turn_gates: RwLock::new(HashMap::new()),
             ask_gates: RwLock::new(HashMap::new()),
             last_submissions: RwLock::new(HashMap::new()),
@@ -200,6 +201,7 @@ impl MockRuntime {
                         archived: false,
                         folder: Some("Folder".into()),
                         tags: vec!["tag".into()],
+                        initialization: None,
                     })
                     .into(),
             ),

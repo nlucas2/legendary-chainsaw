@@ -143,7 +143,7 @@ impl SessionService {
     }
 
     pub async fn session_state(&self, session_id: &str) -> Result<SessionState> {
-        let session = self.session(session_id).await?;
+        let session = self.attached_session(session_id).await?;
         let mode_rpc = session.rpc().mode();
         let (processing, mode) = tokio::join!(self.session_processing(session_id), mode_rpc.get());
         let mode = serde_json::from_value(json!(mode?)).map_err(invalid_argument)?;

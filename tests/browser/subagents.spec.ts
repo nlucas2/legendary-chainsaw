@@ -205,6 +205,263 @@ test("agent and parent keyboard commands cannot accidentally submit or modify th
   await expect(page.locator(".parent-session-view .composer textarea")).toBeFocused();
 });
 
+test("terminal shortcuts work from the composer and terminal without sending shortcut bytes", async ({ page }) => {
+  const inputs: string[] = [];
+  await page.routeWebSocket((url) => url.pathname === "/api/terminal", (socket) => {
+    socket.send(JSON.stringify({ type: "ready", shell: "Test shell", cwd: "Q:\\example", restored: false, hasControl: true, viewers: 1 }));
+    socket.onMessage((raw) => {
+      const message = JSON.parse(String(raw));
+      if (message.type === "input") inputs.push(message.data);
+    });
+  });
+  await setup(page);
+  const composer = page.locator(".parent-session-view .composer textarea");
+  await composer.fill("Do not change my draft");
+  await composer.press("Alt+t");
+  await expect(page.locator(".terminal-pane")).toHaveCount(0);
+  await composer.press("Control+Shift+t");
+  await expect(page.locator(".terminal-pane")).toBeVisible();
+  const terminal = page.locator(".xterm-helper-textarea");
+  await expect(terminal).toBeFocused();
+  await page.keyboard.type("echo ready");
+  await expect.poll(() => inputs.join("")).toBe("echo ready");
+  const before = [...inputs];
+  await terminal.press("Control+Shift+t");
+  await expect(page.locator(".terminal-pane")).toHaveCount(0);
+  await expect(composer).toBeFocused();
+  expect(inputs).toEqual(before);
+  await expect(composer).toHaveValue("Do not change my draft");
+  await composer.press("Control+Shift+t");
+  await expect(page.locator(".terminal-pane")).toBeVisible();
+  await expect(page.locator(".xterm-helper-textarea")).toBeFocused();
+  await page.keyboard.press("Control+Shift+t");
+  await expect(page.locator(".terminal-pane")).toHaveCount(0);
+  expect(inputs).toEqual(before);
+  await composer.dispatchEvent("keydown", { key: "t", ctrlKey: true, shiftKey: true, repeat: true });
+  await expect(page.locator(".terminal-pane")).toHaveCount(0);
+  await page.locator(".daemon-state").click();
+  await page.getByRole("button", { name: "Close settings" }).press("Control+Shift+t");
+  await expect(page.locator(".terminal-pane")).toHaveCount(0);
+});
+
+test("terminal shortcut also works while viewing a child without changing its draft", async ({ page }) => {
+  await page.routeWebSocket((url) => url.pathname === "/api/terminal", (socket) => {
+    socket.send(JSON.stringify({ type: "ready", shell: "Test shell", cwd: "Q:\\example", hasControl: true, restored: false, viewers: 1 }));
+  });
+  await setup(page);
+  const children = await expand(page, "a");
+  await children.getByRole("button", { name: /Builder/ }).click();
+  const prompt = page.getByRole("textbox", { name: "Message Builder", exact: true });
+  await prompt.fill("Child draft");
+  await prompt.press("Control+Shift+t");
+  await expect(page.locator(".terminal-pane")).toBeVisible();
+  await expect(page.locator(".xterm-helper-textarea")).toBeFocused();
+  await page.keyboard.press("Control+Shift+t");
+  await expect(page.locator(".terminal-pane")).toHaveCount(0);
+  await expect(prompt).toBeFocused();
+  await expect(prompt).toHaveValue("Child draft");
+});
+
+test("shortcut focus waits for lazy terminal mounting and does not steal focus on later renders", async ({ page }) => {
+  let release!: () => void;
+  const loading = new Promise<void>((resolve) => { release = resolve; });
+  await page.route(/\/assets\/TerminalPane-.*\.js$/, async (route) => {
+    await loading;
+    await route.continue();
+  });
+  await page.routeWebSocket((url) => url.pathname === "/api/terminal", (socket) => {
+    socket.send(JSON.stringify({ type: "ready", shell: "Test shell", cwd: "Q:\\example", hasControl: true, restored: false, viewers: 1 }));
+  });
+  await setup(page);
+  const composer = page.locator(".parent-session-view .composer textarea");
+  await composer.fill("Saved draft");
+  await composer.press("Control+Shift+t");
+  await expect(page.locator(".terminal-loading")).toBeVisible();
+  release();
+  await expect(page.locator(".xterm-helper-textarea")).toBeFocused();
+  await composer.click();
+  await composer.fill("A newer draft");
+  await page.getByRole("button", { name: "Terminal beside chat", exact: true }).click();
+  await composer.click();
+  await expect(composer).toBeFocused();
+  await expect(composer).toHaveValue("A newer draft");
+  await page.keyboard.press("Control+Shift+t");
+  await expect(page.locator(".terminal-pane")).toHaveCount(0);
+  await expect(composer).toBeFocused();
+});
+
+test("saved delivery defaults persist and explicit send shortcuts override them for one message", async ({ page }) => {
+  await setup(page);
+  const sends: Record<string, unknown>[] = [];
+  await page.route("**/api/send_message", (route) => {
+    sends.push(route.request().postDataJSON());
+    return route.fulfill({ json: "accepted" });
+  });
+  const mode = page.getByRole("combobox", { name: "Message delivery", exact: true });
+  const composer = page.locator(".parent-session-view .composer textarea");
+  await expect(mode).toHaveValue("enqueue");
+  await page.locator(".daemon-state").click();
+  await page.locator(".workflow-settings summary").click();
+  await page.getByRole("combobox", { name: "Default message delivery" }).selectOption("immediate");
+  await page.getByRole("button", { name: "Close settings" }).click();
+  await expect(mode).toHaveValue("immediate");
+  expect(sends).toHaveLength(0);
+  await page.reload();
+  await expect(composer).toBeEnabled();
+  await expect(mode).toHaveValue("immediate");
+  await composer.fill("Use saved default");
+  await composer.press("Enter");
+  await expect.poll(() => sends.length).toBe(1);
+  expect(sends[0].deliveryMode).toBe("immediate");
+  await composer.fill("Explicit queue");
+  await composer.press("Control+q");
+  await expect.poll(() => sends.length).toBe(2);
+  expect(sends[1].deliveryMode).toBe("enqueue");
+  await expect(mode).toHaveValue("immediate");
+  await mode.selectOption("enqueue");
+  await composer.fill("Explicit steering");
+  await composer.press("Control+Enter");
+  await expect.poll(() => sends.length).toBe(3);
+  expect(sends[2].deliveryMode).toBe("immediate");
+  await expect(mode).toHaveValue("enqueue");
+  expect(await page.evaluate(() => localStorage.getItem("copilot-sessions.default-delivery"))).toBe("immediate");
+  await page.reload();
+  await expect(mode).toHaveValue("immediate");
+});
+
+test("delivery preference changes sync between tabs without discarding a local override", async ({ page, context }) => {
+  await setup(page);
+  const second = await context.newPage();
+  await setup(second);
+  const firstMode = page.getByRole("combobox", { name: "Message delivery", exact: true });
+  const otherMode = second.getByRole("combobox", { name: "Message delivery", exact: true });
+  await page.locator(".daemon-state").click();
+  await page.locator(".workflow-settings summary").click();
+  await page.getByRole("combobox", { name: "Default message delivery" }).selectOption("immediate");
+  await expect(otherMode).toHaveValue("immediate");
+  await otherMode.selectOption("enqueue");
+  await second.evaluate(() => window.dispatchEvent(new StorageEvent("storage", {
+    key: "copilot-sessions.default-delivery", newValue: "immediate", storageArea: localStorage,
+  })));
+  await expect(otherMode).toHaveValue("enqueue");
+  await expect(firstMode).toHaveValue("immediate");
+  await page.getByRole("combobox", { name: "Default message delivery" }).selectOption("enqueue");
+  await expect(otherMode).toHaveValue("enqueue");
+  await second.close();
+});
+
+test("delivery storage failures remain visible while the in-window default stays usable", async ({ page }) => {
+  await page.addInitScript(() => {
+    const original = Storage.prototype.setItem;
+    Storage.prototype.setItem = function (key, value) {
+      if (key === "copilot-sessions.default-delivery") throw new Error("Preference storage denied");
+      original.call(this, key, value);
+    };
+  });
+  await setup(page);
+  await page.locator(".daemon-state").click();
+  await page.locator(".workflow-settings summary").click();
+  await page.getByRole("combobox", { name: "Default message delivery" }).selectOption("immediate");
+  await page.locator(".workflow-settings summary").click();
+  await expect(page.locator(".settings-panel [role='alert']")).toContainText("Preference storage denied");
+  await page.getByRole("button", { name: "Close settings" }).click();
+  await expect(page.getByRole("combobox", { name: "Message delivery", exact: true })).toHaveValue("immediate");
+  await expect(page.locator(".composer [role='alert']")).toContainText("applies only to this window");
+  expect(await page.evaluate(() => localStorage.getItem("copilot-sessions.default-delivery"))).toBeNull();
+});
+
+test("invalid delivery defaults safely fall back to queue and removal syncs to other tabs", async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem("copilot-sessions.default-delivery", "invalid"));
+  await setup(page);
+  const mode = page.getByRole("combobox", { name: "Message delivery", exact: true });
+  await expect(mode).toHaveValue("enqueue");
+  await expect(page.locator(".composer [role='alert']")).toContainText("invalid");
+  await page.evaluate(() => window.dispatchEvent(new StorageEvent("storage", {
+    key: "copilot-sessions.default-delivery", newValue: "immediate", storageArea: localStorage,
+  })));
+  await expect(mode).toHaveValue("immediate");
+  await page.evaluate(() => window.dispatchEvent(new StorageEvent("storage", {
+    key: "copilot-sessions.default-delivery", newValue: null, storageArea: localStorage,
+  })));
+  await expect(mode).toHaveValue("enqueue");
+  await expect(page.locator(".composer [role='alert']")).toHaveCount(0);
+});
+
+test("Settings exposes a keyboard shortcut popup with the terminal and copy shortcuts", async ({ page }) => {
+  await setup(page);
+  await page.locator(".daemon-state").click();
+  const button = page.getByRole("button", { name: /^Keyboard shortcuts/ });
+  await expect(button).toBeVisible();
+  await button.click();
+  const popup = page.getByRole("dialog", { name: "Keyboard shortcuts", exact: true });
+  await expect(popup).toBeVisible();
+  await expect(popup).toContainText("Ctrl Shift T");
+  await expect(popup).toContainText("copy selected text");
+  await expect(popup).not.toContainText("Alt T");
+  await expect(popup.getByRole("button", { name: "Close", exact: true })).toBeFocused();
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await popup.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+  await popup.getByRole("button", { name: "Close", exact: true }).click();
+  await expect(popup).toHaveCount(0);
+  await expect(page.locator(".parent-session-view .composer textarea")).toBeFocused();
+});
+
+test("Ctrl+C copies selected terminal text, preserves bare interrupts and reports clipboard failures", async ({ page }) => {
+  await page.addInitScript(() => {
+    const state = { values: [] as string[], fail: false };
+    Object.defineProperty(window, "testClipboard", { value: state });
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: {
+      writeText: async (text: string) => {
+        if (state.fail) throw new Error("Clipboard denied");
+        state.values.push(text);
+      },
+    } });
+  });
+  const inputs: string[] = [];
+  let send = (_message: string) => {};
+  await page.routeWebSocket((url) => url.pathname === "/api/terminal", (socket) => {
+    send = (message) => socket.send(message);
+    socket.send(JSON.stringify({ type: "ready", shell: "Copy test", cwd: "Q:\\example", hasControl: true, restored: false, viewers: 1 }));
+    socket.send(JSON.stringify({ type: "output", data: "COPY_THIS_TEXT\r\n" }));
+    socket.onMessage((message) => {
+      const value = JSON.parse(String(message));
+      if (value.type === "input") inputs.push(value.data);
+    });
+  });
+  await setup(page);
+  await page.getByTitle("Open terminal", { exact: true }).click();
+  const firstLine = page.locator(".xterm-rows > div").first();
+  await expect(firstLine).toContainText("COPY_THIS_TEXT");
+  const textSpan = firstLine.locator("span").first();
+  const box = (await textSpan.boundingBox())!;
+  await page.mouse.move(box.x + 1, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width, box.y + box.height / 2, { steps: 10 });
+  await page.mouse.up();
+  const copy = page.getByRole("button", { name: "Copy terminal selection", exact: true });
+  await expect(copy).toBeEnabled();
+  const terminalInput = page.locator(".xterm-helper-textarea");
+  await terminalInput.press("Control+c");
+  await expect.poll(() => page.evaluate(() => (window as unknown as { testClipboard: { values: string[] } }).testClipboard.values.length)).toBe(1);
+  expect(await page.evaluate(() => (window as unknown as { testClipboard: { values: string[] } }).testClipboard.values[0])).toBe("COPY_THIS_TEXT");
+  expect(inputs).toEqual([]);
+  send(JSON.stringify({ type: "control_changed", controller: null, viewers: 2 }));
+  await expect(page.getByTitle("Take terminal control", { exact: true })).toBeVisible();
+  await copy.click();
+  await expect.poll(() => page.evaluate(() => (window as unknown as { testClipboard: { values: string[] } }).testClipboard.values.length)).toBe(2);
+  await page.evaluate(() => { (window as unknown as { testClipboard: { fail: boolean } }).testClipboard.fail = true; });
+  await terminalInput.press("Control+c");
+  await expect(page.locator(".terminal-pane [role='alert']")).toContainText("Clipboard denied");
+  await expect(copy).toBeEnabled();
+  expect(inputs).toEqual([]);
+  send(JSON.stringify({ type: "ready", shell: "Copy test", cwd: "Q:\\example", hasControl: true, restored: false, viewers: 1 }));
+  await expect(page.getByTitle("Release terminal control", { exact: true })).toBeVisible();
+  await page.locator(".xterm-screen").click({ position: { x: 5, y: 5 } });
+  await expect(copy).toBeDisabled();
+  await terminalInput.press("Control+c");
+  await expect.poll(() => inputs.includes("\u0003")).toBe(true);
+});
+
 test("deleting the parent while viewing a child restores the empty main workspace", async ({ page }) => {
   await setup(page);
   const a = await expand(page, "a");

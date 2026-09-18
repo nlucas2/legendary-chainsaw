@@ -1,7 +1,7 @@
 import type { SessionEvent } from "./types.ts";
 
 export interface MessageOrigin {
-  kind: "human" | "agent" | "skill" | "unknown";
+  kind: "human" | "agent" | "skill" | "scheduled" | "unknown";
   label: string;
   description: string;
 }
@@ -19,6 +19,9 @@ export function messageOrigin(source: unknown, subagentConversation = false): Me
   }
   if (typeof source === "string" && source.startsWith("skill-") && source.length > 6) {
     return { kind: "skill", label: "Skill instructions", description: `Injected skill context. Source: ${source}` };
+  }
+  if (typeof source === "string" && /^schedule-\d+$/.test(source)) {
+    return { kind: "scheduled", label: "Scheduled task", description: `Sent by a saved schedule, not typed by you. Source: ${source}` };
   }
   return {
     kind: "unknown", label: "Input",

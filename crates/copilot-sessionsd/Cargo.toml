@@ -6,6 +6,10 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+uuid = { version = "1", features = ["v4"] }
 axum.workspace = true
 copilot-sessions-core = { path = "../copilot-sessions-core" }
 futures-util.workspace = true

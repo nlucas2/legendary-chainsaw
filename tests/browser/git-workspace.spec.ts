@@ -381,6 +381,51 @@ test("manual scrolling cancels a pending distant jump and late previews cannot p
   await expect(list.locator("[aria-current='location']")).toHaveAttribute("title", "staged file.txt");
 });
 
+test("review header follows long diffs and Back to top preserves loaded files and notes", async ({ page }) => {
+  const { state, requests } = await setup(page);
+  state.workspace.untracked = [];
+  state.workspace.unstaged = Array.from({ length: 4 }, (_, index) => change(`file-${index}.txt`));
+  state.overrideDiff = { patch: "@@ -1,100 +1,100 @@\n-old\n+new\n" + " context\n".repeat(99) };
+  await open(page);
+  await page.getByRole("button", { name: "Continuous diffs", exact: true }).click();
+  const panel = page.getByRole("dialog", { name: "Git workspace" });
+  const first = panel.getByRole("article", { name: "Diff for file-0.txt", exact: true });
+  await first.getByLabel("Local review comment", { exact: true }).fill("Keep this unsaved note");
+  await panel.evaluate((element) => { element.scrollTop = element.scrollHeight; });
+  await expect(panel.locator(".git-file-review")).toHaveCount(4);
+  await expect(panel.getByRole("button", { name: "Back to top", exact: true })).toBeInViewport();
+  await expect(panel.getByRole("button", { name: "Close Git workspace", exact: true })).toBeInViewport();
+  const list = (await panel.locator(".git-panel-files").boundingBox())!;
+  const header = (await panel.locator(".git-panel-header").boundingBox())!;
+  expect(list.y).toBeGreaterThanOrEqual(header.y + header.height);
+  const reads = requests.filter((request) => request.command === "git_diff").length;
+  await panel.getByRole("button", { name: "Back to top", exact: true }).click();
+  await expect.poll(() => panel.evaluate((element) => element.scrollTop)).toBe(0);
+  await expect(panel.getByRole("button", { name: "Continuous diffs", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(first.getByLabel("Local review comment", { exact: true })).toHaveValue("Keep this unsaved note");
+  expect(requests.filter((request) => request.command === "git_diff")).toHaveLength(reads);
+  await panel.getByRole("button", { name: "Close Git workspace", exact: true }).click();
+  await expect(panel).toHaveCount(0);
+});
+
+test("Back to top cancels alignment to an in-flight distant preview", async ({ page }) => {
+  const { state, requests } = await setup(page);
+  state.workspace.untracked = [];
+  state.workspace.unstaged = Array.from({ length: 20 }, (_, index) => change(`file-${index}.txt`));
+  state.overrideDiff = { patch: "@@ -1,100 +1,100 @@\n-old\n+new\n" + " context\n".repeat(99) };
+  state.delayedPath = "file-15.txt";
+  state.delay = 800;
+  await open(page);
+  await page.getByRole("button", { name: "Continuous diffs", exact: true }).click();
+  const panel = page.getByRole("dialog", { name: "Git workspace" });
+  await panel.locator(".git-panel-files").getByTitle("file-15.txt", { exact: true }).click();
+  await expect.poll(() => requests.some((request) => request.args.path === "file-15.txt")).toBe(true);
+  await panel.getByRole("button", { name: "Back to top", exact: true }).focus();
+  await page.keyboard.press("Enter");
+  await page.waitForTimeout(950);
+  expect(await panel.evaluate((element) => element.scrollTop)).toBe(0);
+});
+
 test("whole-file context requests are explicit, reversible, and display truncation", async ({ page }) => {
   const { state, requests } = await setup(page);
   await open(page);
@@ -530,6 +575,8 @@ test.describe("mobile Git layout", () => {
       expect(box.x).toBeGreaterThanOrEqual(0);
       expect(box.x + box.width).toBeLessThanOrEqual(width);
       expect(await panel.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+      await expect(panel.getByRole("button", { name: "Back to top", exact: true })).toBeInViewport();
+      await expect(panel.getByRole("button", { name: "Close Git workspace", exact: true })).toBeInViewport();
     }
     await target.selectOption("refs/heads/main");
     await expect(page.locator(".git-mobile-options")).not.toHaveAttribute("open");
@@ -600,6 +647,8 @@ test.describe("mobile Git layout", () => {
     await page.getByRole("button", { name: "Previous file", exact: true }).tap();
     await expect(page.getByRole("heading", { name: pathFor(5), exact: true })).toBeInViewport();
     await expect(page.getByRole("combobox", { name: "Diff layout" })).toHaveValue("continuous");
+    await page.getByRole("button", { name: "Back to top", exact: true }).tap();
+    await expect.poll(() => panel.evaluate((element) => element.scrollTop)).toBe(0);
   });
 
   test("mobile comparison controls work by keyboard and close without hiding file navigation", async ({ page }) => {

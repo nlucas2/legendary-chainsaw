@@ -42,7 +42,7 @@ export const GitDiffFeed = memo(function GitDiffFeed({ files, scrollRoot, naviga
     setLoaded((previous) => previous.has(path) ? previous : new Set(previous).add(path));
   }, []);
   useEffect(() => {
-    if (!navigation) return;
+    if (!navigation) { pendingJump.current = null; return; }
     const index = files.findIndex((file) => file.path === navigation.path);
     if (index < 0) return;
     pendingJump.current = { path: navigation.path, stableFrames: 0 };

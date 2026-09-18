@@ -1,4 +1,5 @@
 mod terminal;
+mod scheduler;
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -50,6 +51,7 @@ impl DaemonConfig {
 #[derive(Clone)]
 struct DaemonState {
     service: Arc<SessionService>,
+    scheduler: Arc<scheduler::Scheduler>,
     terminals: TerminalManager,
     checkpoint_path: PathBuf,
     access_token: Option<String>,
@@ -66,8 +68,11 @@ pub async fn serve(
     if let Err(error) = terminals.load_checkpoints(&checkpoint_path) {
         tracing::warn!(%error, "could not load terminal checkpoints");
     }
+    let scheduler = scheduler::Scheduler::open(Arc::clone(&service));
+    let _scheduler_loop = scheduler.start();
     let state = DaemonState {
         service,
+        scheduler,
         terminals,
         checkpoint_path,
         access_token: config.access_token,
@@ -222,6 +227,7 @@ async fn command(
         Err(error) => {
             let status = match error {
                 ServiceError::SessionNotActive(_)
+                | ServiceError::SessionNotReady { .. }
                 | ServiceError::SessionProcessing(_)
                 | ServiceError::PermissionNotPending(_)
                 | ServiceError::InteractionNotPending(_) => StatusCode::CONFLICT,
@@ -239,13 +245,49 @@ async fn command(
     }
 }
 
+async fn dispatch_scheduled_command(
+    scheduler: &scheduler::Scheduler,
+    command: &str,
+    body: &Value,
+) -> Result<Option<Value>, ServiceError> {
+    let result = match command {
+        "list_scheduled_tasks" => json!({ "tasks": scheduler.list()? }),
+        "save_scheduled_task" => json_result(scheduler.save(decode(body.clone())?).await?)?,
+        "set_scheduled_task_enabled" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Request { id: String, enabled: bool }
+            let request: Request = decode(body.clone())?;
+            json_result(scheduler.set_enabled(&request.id, request.enabled)?)?
+        }
+        "run_scheduled_task" => json_result(scheduler.run_now(&string_arg(body, "id")?)?)?,
+        "delete_scheduled_task" => {
+            scheduler.delete(&string_arg(body, "id")?)?;
+            json!({ "ok": true })
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(result))
+}
+
 async fn dispatch(state: &DaemonState, command: &str, body: Value) -> Result<Value, ServiceError> {
+    if let Some(result) = dispatch_scheduled_command(&state.scheduler, command, &body).await? {
+        return Ok(result);
+    }
     let service = &state.service;
     match command {
         "list_sessions" => json_result(service.list_sessions().await?),
         "create_session" => {
             let request: NewSession = decode(body)?;
             json_result(service.create_session(request).await?)
+        }
+        "session_initialization" => {
+            let session_id = string_arg(&body, "sessionId")?;
+            json_result(service.session_initialization(&session_id).await?)
+        }
+        "retry_session_initialization" => {
+            let session_id = string_arg(&body, "sessionId")?;
+            json_result(service.retry_session_initialization(&session_id).await?)
         }
         "ask_session" => json_result(service.ask_session(decode::<AskSessionRequest>(body)?).await?),
         "fork_session" => json_result(service.fork_session(decode::<ForkSessionRequest>(body)?).await?),

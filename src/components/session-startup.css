@@ -1,0 +1,6 @@
+.session-startup { display: flex; align-items: flex-start; gap: 10px; flex-shrink: 0; padding: 12px 20px; border-bottom: 1px solid var(--line); color: var(--text); background: var(--surface-1); font-size: 13px; }
+.session-startup > svg { flex-shrink: 0; margin-top: 3px; color: var(--accent); }
+.session-startup > div { flex: 1; min-width: 0; }
+.session-startup p { margin: 5px 0 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.session-startup[role="alert"] { border-color: var(--danger); }
+@media (max-width: 600px) { .session-startup { flex-wrap: wrap; padding: 10px 12px; } }

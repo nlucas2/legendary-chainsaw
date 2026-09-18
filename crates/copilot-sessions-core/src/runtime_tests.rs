@@ -21,9 +21,34 @@ struct MockRuntime {
     processing: Arc<AtomicBool>,
     future_tool: Arc<AtomicBool>,
     missing_metadata: Arc<AtomicBool>,
+    held_methods: Arc<Mutex<HashSet<String>>>,
 }
 
 impl MockRuntime {
+    fn hold(&self, method: &str) {
+        self.held_methods.lock().unwrap().insert(method.into());
+    }
+
+    fn requests(&self, method: &str) -> Vec<Value> {
+        self.calls.lock().unwrap().iter().filter(|call| call["method"] == method).cloned().collect()
+    }
+
+    async fn request(&self, method: &str, count: usize) -> Value {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let calls = self.requests(method);
+                if calls.len() >= count {
+                    return calls[count - 1].clone();
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }).await.unwrap_or_else(|_| panic!("missing {method} request {count}"))
+    }
+
+    async fn reply(&self, request: &Value, result: Value) {
+        self.inject(json!({"jsonrpc":"2.0", "id": request["id"], "result": result})).await;
+    }
+
     async fn inject(&self, value: Value) {
         let bytes = serde_json::to_vec(&value).unwrap();
         let mut writer = self.writer.lock().await;
@@ -33,6 +58,811 @@ impl MockRuntime {
             .unwrap();
         writer.write_all(&bytes).await.unwrap();
     }
+}
+
+fn new_session(deferred: bool) -> NewSession {
+        serde_json::from_value(json!({
+            "cwd": ".", "model": "requested-model", "deferInitialization": deferred,
+        })).unwrap()
+    }
+
+    async fn scheduled_event(runtime: &MockRuntime, sid: &str, kind: &str, agent: Option<&str>, data: Value) {
+        runtime.inject(json!({
+            "jsonrpc":"2.0", "method":"session.event",
+            "params":{"sessionId":sid, "event":{
+                "id":format!("test-{kind}"), "timestamp":"2026-09-17T12:00:00Z",
+                "type":kind, "agentId":agent, "data":data
+            }}
+        })).await;
+    }
+
+    #[tokio::test]
+    async fn scheduled_prompt_uses_normal_permissions_interactive_enqueue_and_actual_root_completion() {
+        let runtime = mock_runtime();
+        runtime.processing.store(false, Ordering::Relaxed);
+        let service = runtime.service.clone();
+        let delivery = tokio::spawn(async move {
+            service.deliver_scheduled_prompt("a".into(), "Use skill example and summarize changes".into(), "schedule-123".into()).await
+        });
+        let sent = runtime.request("session.send", 1).await;
+        assert_eq!(sent["params"]["agentMode"], "interactive");
+        assert_eq!(sent["params"]["mode"], "enqueue");
+        assert_eq!(sent["params"]["source"], "schedule-123");
+        assert_eq!(sent["params"]["prompt"], "Use skill example and summarize changes");
+        assert!(!delivery.is_finished(), "acceptance is not turn completion");
+        let resume = runtime.request("session.resume", 1).await;
+        assert_eq!(resume["params"]["continuePendingWork"], false);
+        for handler in ["requestPermission", "requestUserInput", "requestElicitation", "requestExitPlanMode", "requestAutoModeSwitch"] {
+            assert_eq!(resume["params"][handler], true);
+        }
+        assert!(runtime.requests("session.commands.invoke").is_empty());
+        scheduled_event(&runtime, "a", "session.idle", None, json!({})).await;
+        scheduled_event(&runtime, "a", "assistant.turn_start", None, json!({})).await;
+        scheduled_event(&runtime, "a", "session.idle", Some("child"), json!({})).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!delivery.is_finished(), "stale idle and child idle must not complete root");
+        scheduled_event(&runtime, "a", "permission.requested", None, json!({
+            "requestId":"scheduled-permission", "permissionRequest":{"kind":"shell", "fullCommandText":"example"}
+        })).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while runtime.service.pending_permissions().is_empty() { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        assert!(runtime.requests("session.permissions.handlePendingPermissionRequest").is_empty(), "scheduler must not auto-approve");
+        runtime.service.decide_permission(PermissionDecision {
+            request_id:"scheduled-permission".into(), approved:false,
+        }).await.unwrap();
+        let rejected = runtime.request("session.permissions.handlePendingPermissionRequest", 1).await;
+        assert!(!rejected.to_string().contains("approved"));
+        scheduled_event(&runtime, "a", "session.idle", None, json!({})).await;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), delivery).await.unwrap().unwrap().unwrap(),
+            ScheduledDelivery::Completed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn scheduled_prompt_defers_processing_steering_background_tasks_and_drain() {
+        let runtime = mock_runtime();
+        assert!(matches!(runtime.service.deliver_scheduled_prompt("a".into(), "not sent".into(), "schedule-123".into()).await.unwrap(), ScheduledDelivery::Deferred(_)));
+        assert!(runtime.requests("session.send").is_empty());
+        runtime.processing.store(false, Ordering::Relaxed);
+        runtime.hold("session.queue.pendingItems");
+        let service = runtime.service.clone();
+        let delivery = tokio::spawn(async move { service.deliver_scheduled_prompt("a".into(), "not sent".into(), "schedule-123".into()).await });
+        let queue = runtime.request("session.queue.pendingItems", 1).await;
+        runtime.reply(&queue, json!({"items":[], "steeringMessages":["existing work"]})).await;
+        assert!(matches!(delivery.await.unwrap().unwrap(), ScheduledDelivery::Deferred(_)));
+        runtime.held_methods.lock().unwrap().remove("session.queue.pendingItems");
+        runtime.hold("session.tasks.list");
+        let service = runtime.service.clone();
+        let delivery = tokio::spawn(async move { service.deliver_scheduled_prompt("a".into(), "not sent".into(), "schedule-123".into()).await });
+        let tasks = runtime.request("session.tasks.list", 1).await;
+        runtime.reply(&tasks, json!({"tasks":[{"id":"child","status":"running","type":"agent"}]})).await;
+        assert!(matches!(delivery.await.unwrap().unwrap(), ScheduledDelivery::Deferred(_)));
+        runtime.service.accepting_work.store(false, Ordering::Relaxed);
+        assert!(matches!(runtime.service.deliver_scheduled_prompt("a".into(), "not sent".into(), "schedule-123".into()).await, Err(ServiceError::Draining)));
+        assert!(runtime.requests("session.send").is_empty());
+    }
+
+    #[tokio::test]
+    async fn scheduled_prompt_idle_check_and_send_share_gate_and_recheck_drain() {
+        let runtime = mock_runtime();
+        runtime.processing.store(false, Ordering::Relaxed);
+        runtime.hold("session.tasks.list");
+        let service = runtime.service.clone();
+        let delivery = tokio::spawn(async move { service.deliver_scheduled_prompt("a".into(), "not sent".into(), "schedule-123".into()).await });
+        let tasks = runtime.request("session.tasks.list", 1).await;
+        let gate = runtime.service.turn_gate("a").await;
+        assert!(gate.try_lock().is_err(), "idle check lost per-session ordering");
+        assert!(runtime.service.lifecycle_gate.try_write().is_err(), "admission must exclude drain");
+        runtime.service.accepting_work.store(false, Ordering::Relaxed);
+        runtime.reply(&tasks, json!({"tasks":[]})).await;
+        assert!(matches!(delivery.await.unwrap(), Err(ServiceError::Draining)));
+        assert!(runtime.requests("session.send").is_empty());
+    }
+
+    #[tokio::test]
+    async fn scheduled_prompt_awaiting_completion_does_not_block_lifecycle_or_user_turn_gate() {
+        let runtime = mock_runtime();
+        runtime.processing.store(false, Ordering::Relaxed);
+        let service = runtime.service.clone();
+        let delivery = tokio::spawn(async move { service.deliver_scheduled_prompt("a".into(), "test".into(), "schedule-123".into()).await });
+        runtime.request("session.send", 1).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(runtime.service.turn_gate("a").await.try_lock().is_ok());
+        assert!(runtime.service.lifecycle_gate.try_write().is_ok());
+        let session = runtime.service.active.read().await["a"].clone();
+        session.disconnect().await.unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), delivery).await.unwrap().unwrap().unwrap(),
+            ScheduledDelivery::Uncertain(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn scheduled_session_is_dedicated_organized_and_durable_before_warmup() {
+        let runtime = mock_runtime();
+        runtime.hold("session.tools.initializeAndValidate");
+        let id = runtime.service.create_scheduled_session("Daily briefing", ".".into(), Some("requested-model".into())).await.unwrap();
+        let metadata = load_metadata(&runtime.service.metadata_path);
+        assert_eq!(metadata[&id].title.as_deref(), Some("Daily briefing"));
+        assert!(metadata[&id].pinned);
+        assert_eq!(metadata[&id].folder.as_deref(), Some("Scheduled"));
+        assert_eq!(metadata[&id].tags, ["scheduled"]);
+        assert!(metadata[&id].prevent_pending_work);
+        assert!(runtime.service.validate_scheduled_target(&id).await.is_ok());
+        assert!(runtime.service.validate_scheduled_target("missing").await.is_err());
+        assert_eq!(runtime.requests("session.create").len(), 1);
+        assert!(runtime.requests("session.send").is_empty());
+    }
+
+    #[tokio::test]
+    async fn scheduled_prompt_lost_acceptance_is_uncertain_not_retryable() {
+        let runtime = mock_runtime();
+        runtime.processing.store(false, Ordering::Relaxed);
+        runtime.hold("session.send");
+        let service = runtime.service.clone();
+        let delivery = tokio::spawn(async move { service.deliver_scheduled_prompt("a".into(), "test".into(), "schedule-123".into()).await });
+        let send = runtime.request("session.send", 1).await;
+        runtime.inject(json!({"jsonrpc":"2.0", "id":send["id"], "error":{"code":-32000, "message":"lost acknowledgement"}})).await;
+        assert!(matches!(delivery.await.unwrap().unwrap(), ScheduledDelivery::Uncertain(_)));
+        assert_eq!(runtime.requests("session.send").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn scheduled_prompt_never_inherits_autopilot_or_plan_permission_posture() {
+        for mode in ["autopilot", "plan"] {
+            let runtime = mock_runtime();
+            runtime.processing.store(false, Ordering::Relaxed);
+            runtime.hold("session.mode.get");
+            let service = runtime.service.clone();
+            let delivery = tokio::spawn(async move { service.deliver_scheduled_prompt("a".into(), "not sent".into(), "schedule-123".into()).await });
+            let get = runtime.request("session.mode.get", 1).await;
+            runtime.reply(&get, json!(mode)).await;
+            assert!(matches!(delivery.await.unwrap().unwrap(), ScheduledDelivery::Deferred(reason) if reason.contains("interactive")));
+            assert!(runtime.requests("session.send").is_empty());
+            assert!(runtime.requests("session.mode.set").is_empty(), "do not silently change user-selected session mode");
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduled_prompt_defers_queued_items_and_pending_ask_user() {
+        let runtime = mock_runtime();
+        runtime.processing.store(false, Ordering::Relaxed);
+        runtime.hold("session.queue.pendingItems");
+        let service = runtime.service.clone();
+        let delivery = tokio::spawn(async move { service.deliver_scheduled_prompt("a".into(), "not sent".into(), "schedule-123".into()).await });
+        let queue = runtime.request("session.queue.pendingItems", 1).await;
+        runtime.reply(&queue, json!({"items":[{
+            "id":"queued", "kind":"message", "displayText":"Prior request", "agentMode":"interactive"
+        }], "steeringMessages":[]})).await;
+        assert!(matches!(delivery.await.unwrap().unwrap(), ScheduledDelivery::Deferred(_)));
+        runtime.held_methods.lock().unwrap().remove("session.queue.pendingItems");
+        runtime.service.interactions.observe_native_event("a", &json!({
+            "id":"ask", "type":"user_input.requested", "ephemeral":true,
+            "data":{"requestId":"ask", "question":"Continue?", "choices":["Yes","No"], "allowFreeform":false, "toolCallId":"t"}
+        }));
+        assert!(matches!(
+            runtime.service.deliver_scheduled_prompt("a".into(), "not sent".into(), "schedule-123".into()).await.unwrap(),
+            ScheduledDelivery::Deferred(reason) if reason.contains("user input")
+        ));
+        assert!(runtime.requests("session.send").is_empty());
+    }
+
+    async fn initialization_phase(runtime: &MockRuntime, id: &str, phase: InitializationPhase) -> SessionInitialization {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let state = runtime.service.session_initialization(id).await.unwrap();
+                if state.initialization.phase == phase {
+                    return state;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }).await.expect("initialization phase was not reached")
+    }
+
+    #[tokio::test]
+    async fn deferred_creation_returns_real_durable_attached_session_then_singleflight_readiness() {
+        let runtime = mock_runtime();
+        runtime.hold("session.tools.initializeAndValidate");
+        runtime.hold("session.model.getCurrent");
+        let mut events = runtime.service.subscribe(None);
+        let created = tokio::time::timeout(
+            Duration::from_millis(500), runtime.service.create_session(new_session(true)),
+        ).await.expect("creation waited for warmup").unwrap();
+        let id = &created.session_id;
+        let request = runtime.request("session.create", 1).await;
+        assert_eq!(id, request["params"]["sessionId"].as_str().unwrap());
+        assert!(created.is_active);
+        assert_eq!(serde_json::to_value(&created.initialization).unwrap(), json!({"phase":"initializing", "stage":"tools"}));
+        assert_eq!(load_metadata(&runtime.service.metadata_path)[id].model.as_deref(), Some("requested-model"));
+        let tools = runtime.request("session.tools.initializeAndValidate", 1).await;
+        let before = runtime.calls.lock().unwrap().len();
+        let snapshot = runtime.service.session_initialization(id).await.unwrap();
+        assert_eq!(snapshot.initialization.phase, InitializationPhase::Initializing);
+        assert!(snapshot.session.is_none());
+        // Polling has no native RPC; ignore independently running event log reads.
+        assert!(runtime.calls.lock().unwrap()[before..].iter().all(|call| call["method"] == "session.eventLog.read"));
+        assert!(matches!(runtime.service.submit_message(serde_json::from_value(json!({
+            "sessionId":id, "content":"do not submit this while pending",
+        })).unwrap()).await, Err(ServiceError::SessionNotReady { .. })));
+        assert!(runtime.service.switch_model(id, "other".into(), None, None, None).await.is_err());
+        assert!(runtime.service.execute_command(id, "test".into(), "".into()).await.is_err());
+        assert!(runtime.requests("session.send").is_empty());
+        assert!(runtime.requests("session.model.switchTo").is_empty());
+        assert!(runtime.requests("session.commands.invoke").is_empty());
+
+        let first = {
+            let service = runtime.service.clone();
+            let id = id.clone();
+            tokio::spawn(async move { service.resume_session(id).await })
+        };
+        let second = {
+            let service = runtime.service.clone();
+            let id = id.clone();
+            tokio::spawn(async move { service.resume_session(id).await })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!first.is_finished() && !second.is_finished());
+        assert_eq!(runtime.requests("session.tools.initializeAndValidate").len(), 1);
+        assert!(runtime.requests("session.resume").is_empty());
+        let archived = runtime.service.set_session_archived(SetSessionArchived { session_id: id.clone(), archived: true }).await.unwrap();
+        assert!(archived.archived);
+        let organized = runtime.service.organize_session(OrganizationUpdate {
+            session_id: id.clone(), pinned: true, folder: Some("Projects".into()), tags: vec!["new".into()],
+        }).await.unwrap();
+        assert!(organized.pinned && organized.archived);
+        assert!(organized.initialization.is_some());
+        assert!(runtime.service.list_sessions().await.unwrap().iter().any(|item| item.session_id == *id));
+        runtime.reply(&tools, json!({})).await;
+        let model = runtime.request("session.model.getCurrent", 1).await;
+        let state = runtime.service.session_initialization(id).await.unwrap();
+        assert_eq!(state.initialization.stage, InitializationStage::Model);
+        assert_eq!(state.initialization.phase, InitializationPhase::Initializing);
+        runtime.reply(&model, json!({"modelId":"resolved-model"})).await;
+        let ready = initialization_phase(&runtime, id, InitializationPhase::Ready).await;
+        let summary = ready.session.unwrap();
+        assert_eq!(summary.model.as_deref(), Some("resolved-model"));
+        assert!(summary.pinned && summary.archived && summary.is_active);
+        assert_eq!(summary.tags, ["new"]);
+        assert_eq!(load_metadata(&runtime.service.metadata_path)[id].model.as_deref(), Some("resolved-model"));
+        assert!(first.await.unwrap().unwrap().initialization.is_some());
+        assert_eq!(second.await.unwrap().unwrap().model.as_deref(), Some("resolved-model"));
+        let cached = runtime.service.list_sessions().await.unwrap().into_iter().find(|item| item.session_id == *id).unwrap();
+        assert_eq!(cached.model, summary.model);
+        let mut stages = vec![];
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let AppEvent::SessionInitializationChanged { session_id, initialization } = events.recv().await.unwrap().event {
+                    assert_eq!(session_id, *id);
+                    stages.push(initialization.stage);
+                    if initialization.phase == InitializationPhase::Ready { break; }
+                }
+            }
+        }).await.unwrap();
+        assert_eq!(stages, [InitializationStage::Tools, InitializationStage::Model, InitializationStage::Ready]);
+        runtime.service.submit_message(serde_json::from_value(json!({
+            "sessionId":id, "content":"explicit user submission",
+        })).unwrap()).await.unwrap();
+        assert_eq!(runtime.requests("session.send").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deferred_initialization_failure_and_retry_keep_id_and_deduplicate() {
+        let runtime = mock_runtime();
+        runtime.hold("session.tools.initializeAndValidate");
+        let summary = runtime.service.create_session(new_session(true)).await.unwrap();
+        let id = &summary.session_id;
+        let tools = runtime.request("session.tools.initializeAndValidate", 1).await;
+        runtime.inject(json!({"jsonrpc":"2.0","id":tools["id"],"error":{"code":-32000,"message":"tools unavailable"}})).await;
+        let failed = initialization_phase(&runtime, id, InitializationPhase::Failed).await;
+        assert_eq!(failed.session_id, *id);
+        assert_eq!(failed.initialization.stage, InitializationStage::Tools);
+        assert!(failed.initialization.error.unwrap().contains("tools unavailable"));
+        assert!(runtime.service.resume_session(id.clone()).await.is_err());
+        let (one, two) = tokio::join!(
+            runtime.service.retry_session_initialization(id),
+            runtime.service.retry_session_initialization(id),
+        );
+        for response in [one.unwrap(), two.unwrap()] {
+            assert_eq!(response.session_id, *id);
+            assert_eq!(response.initialization.phase, InitializationPhase::Initializing);
+        }
+        let retry_tools = runtime.request("session.tools.initializeAndValidate", 2).await;
+        assert_eq!(runtime.requests("session.tools.initializeAndValidate").len(), 2);
+        runtime.reply(&retry_tools, json!({})).await;
+        initialization_phase(&runtime, id, InitializationPhase::Ready).await;
+        assert_eq!(runtime.requests("session.create").len(), 1);
+        assert!(runtime.requests("session.resume").is_empty());
+        assert!(runtime.requests("session.send").is_empty());
+        let ready = runtime.service.retry_session_initialization(id).await.unwrap();
+        assert_eq!(ready.initialization.phase, InitializationPhase::Ready);
+        assert_eq!(runtime.requests("session.tools.initializeAndValidate").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn deferred_create_survives_caller_cancellation_before_sdk_reply() {
+        let runtime = mock_runtime();
+        runtime.hold("session.create");
+        runtime.hold("session.tools.initializeAndValidate");
+        let service = runtime.service.clone();
+        let caller = tokio::spawn(async move { service.create_session(new_session(true)).await });
+        let create = runtime.request("session.create", 1).await;
+        let id = create["params"]["sessionId"].as_str().unwrap();
+        caller.abort();
+        let _ = caller.await;
+        runtime.reply(&create, json!({"sessionId":id})).await;
+        let tools = runtime.request("session.tools.initializeAndValidate", 1).await;
+        assert!(load_metadata(&runtime.service.metadata_path).contains_key(id));
+        assert!(runtime.service.active.read().await.contains_key(id));
+        runtime.reply(&tools, json!({})).await;
+        initialization_phase(&runtime, id, InitializationPhase::Ready).await;
+        assert!(runtime.requests("session.send").is_empty());
+    }
+
+    #[tokio::test]
+    async fn deferred_delete_and_late_index_model_replies_cannot_resurrect_session() {
+        let runtime = mock_runtime();
+        runtime.hold("session.model.getCurrent");
+        runtime.hold("session.list");
+        let created = runtime.service.create_session(new_session(true)).await.unwrap();
+        let id = &created.session_id;
+        let model = runtime.request("session.model.getCurrent", 1).await;
+        let service = runtime.service.clone();
+        let listing = tokio::spawn(async move { service.list_sessions().await });
+        let list = runtime.request("session.list", 1).await;
+        runtime.service.delete_session(id).await.unwrap();
+        runtime.reply(&model, json!({"modelId":"late-model"})).await;
+        runtime.reply(&list, json!({"sessions":[{"sessionId":id,"summary":"stale-index"}]})).await;
+        assert!(!listing.await.unwrap().unwrap().iter().any(|item| item.session_id == *id));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!runtime.service.metadata.read().await.contains_key(id));
+        assert!(!load_metadata(&runtime.service.metadata_path).contains_key(id));
+        assert!(!runtime.service.warmed.read().await.contains(id));
+        assert!(!runtime.service.active.read().await.contains_key(id));
+        assert!(runtime.service.session_initialization(id).await.is_err());
+        assert!(runtime.service.retry_session_initialization(id).await.is_err());
+        let events = &runtime.service.events.state.lock().unwrap().history;
+        let deleted = events.iter().position(|event| matches!(&event.event, AppEvent::SessionDeleted { session_id } if session_id == id)).unwrap();
+        assert!(!events.iter().skip(deleted + 1).any(|event| matches!(&event.event, AppEvent::SessionInitializationChanged { .. })));
+    }
+
+    #[tokio::test]
+    async fn deferred_drain_cancels_warmup_without_waiting_for_resume_or_tools() {
+        for force in [false, true] {
+            let runtime = mock_runtime();
+            runtime.processing.store(false, Ordering::Relaxed);
+            runtime.hold("session.tools.initializeAndValidate");
+            let created = runtime.service.create_session(new_session(true)).await.unwrap();
+            let tools = runtime.request("session.tools.initializeAndValidate", 1).await;
+            let service = runtime.service.clone();
+            let id = created.session_id.clone();
+            let resume = tokio::spawn(async move { service.resume_session(id).await });
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let drained = tokio::time::timeout(Duration::from_secs(2),
+                runtime.service.drain(Duration::ZERO, force),
+            ).await.expect("drain waited for native warmup").unwrap();
+            assert!(drained.complete);
+            assert_eq!(drained.disconnected_sessions, 1);
+            assert!(resume.await.unwrap().is_err());
+            let state = runtime.service.session_initialization(&created.session_id).await.unwrap();
+            assert_eq!(state.initialization.phase, InitializationPhase::Failed);
+            assert!(state.session.is_none());
+            assert!(runtime.service.active.read().await.is_empty());
+            assert!(runtime.service.warmed.read().await.is_empty());
+            assert!(!runtime.service.runtime_status().await.connected);
+            assert!(runtime.service.list_sessions().await.unwrap().iter().all(|item| !item.is_active));
+            assert!(runtime.requests("session.model.getCurrent").is_empty());
+            // Closing a stopped duplex transport is expected; the held response
+            // cannot be delivered, and no background initializer survives drain.
+            assert_eq!(tools["params"]["sessionId"], created.session_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_late_list_reads_merge_current_metadata_and_initialization() {
+        let runtime = mock_runtime();
+        runtime.hold("session.list");
+        runtime.hold("session.tools.initializeAndValidate");
+        let service = runtime.service.clone();
+        let listing = tokio::spawn(async move { service.list_sessions().await });
+        let list = runtime.request("session.list", 1).await;
+        let created = runtime.service.create_session(new_session(true)).await.unwrap();
+        runtime.service.set_session_archived(SetSessionArchived { session_id: created.session_id.clone(), archived: true }).await.unwrap();
+        runtime.reply(&list, json!({"sessions":[]})).await;
+        let summaries = listing.await.unwrap().unwrap();
+        let cached = summaries.iter().find(|item| item.session_id == created.session_id).unwrap();
+        assert!(cached.archived && cached.is_active);
+        assert_eq!(cached.model, created.model);
+        assert_eq!(cached.initialization.as_ref().unwrap().phase, InitializationPhase::Initializing);
+    }
+
+    #[tokio::test]
+    async fn default_create_still_waits_for_initialization_and_unknown_readiness_is_explicit() {
+        let runtime = mock_runtime();
+        let request: NewSession = serde_json::from_value(json!({"cwd":"."})).unwrap();
+        assert!(!request.defer_initialization);
+        assert!(runtime.service.session_initialization("a").await.is_err());
+        runtime.hold("session.tools.initializeAndValidate");
+        let service = runtime.service.clone();
+        let create = tokio::spawn(async move { service.create_session(request).await });
+        let tools = runtime.request("session.tools.initializeAndValidate", 1).await;
+        assert!(!create.is_finished());
+        runtime.reply(&tools, json!({})).await;
+        let created = create.await.unwrap().unwrap();
+        assert!(created.initialization.is_none());
+        assert_eq!(runtime.requests("session.model.getCurrent").len(), 1);
+        let state = runtime.service.session_initialization(&created.session_id).await.unwrap();
+        assert_eq!(state.initialization.phase, InitializationPhase::Ready);
+    }
+
+#[tokio::test]
+async fn deferred_model_failure_retries_without_losing_preferences_or_accepting_work() {
+    let runtime = mock_runtime();
+    runtime.hold("session.model.getCurrent");
+    let created = runtime.service.create_session(new_session(true)).await.unwrap();
+    let id = &created.session_id;
+    let model = runtime.request("session.model.getCurrent", 1).await;
+    runtime.inject(json!({"jsonrpc":"2.0","id":model["id"],"error":{"code":-32000,"message":"model discovery failed"}})).await;
+    let failed = initialization_phase(&runtime, id, InitializationPhase::Failed).await;
+    assert_eq!(failed.initialization.stage, InitializationStage::Model);
+    assert!(failed.initialization.error.unwrap().contains("model discovery failed"));
+    assert!(!runtime.service.warmed.read().await.contains(id));
+    assert!(runtime.service.submit_message(serde_json::from_value(json!({
+        "sessionId":id,"content":"blocked during failure",
+    })).unwrap()).await.is_err());
+    runtime.service.retry_session_initialization(id).await.unwrap();
+    let retry = runtime.request("session.model.getCurrent", 2).await;
+    runtime.reply(&retry, json!({"modelId":"resolved-after-retry"})).await;
+    let ready = initialization_phase(&runtime, id, InitializationPhase::Ready).await;
+    assert_eq!(ready.session.unwrap().model.as_deref(), Some("resolved-after-retry"));
+    assert_eq!(runtime.requests("session.create").len(), 1);
+    assert!(runtime.requests("session.send").is_empty());
+}
+
+#[tokio::test]
+async fn deferred_incomplete_drain_cancels_job_and_same_id_retry_ignores_late_reply() {
+    let runtime = mock_runtime();
+    runtime.hold("session.tools.initializeAndValidate");
+    let created = runtime.service.create_session(new_session(true)).await.unwrap();
+    let id = &created.session_id;
+    let original = runtime.request("session.tools.initializeAndValidate", 1).await;
+    let drained = tokio::time::timeout(Duration::from_secs(1),
+        runtime.service.drain(Duration::ZERO, false),
+    ).await.unwrap().unwrap();
+    assert!(!drained.complete);
+    assert_eq!(drained.processing_sessions, [id.clone()]);
+    assert_eq!(runtime.service.session_initialization(id).await.unwrap().initialization.phase, InitializationPhase::Failed);
+    assert!(runtime.service.retry_session_initialization(id).await.is_err());
+    runtime.service.cancel_drain().await.unwrap();
+    runtime.service.retry_session_initialization(id).await.unwrap();
+    let retry = runtime.request("session.tools.initializeAndValidate", 2).await;
+    runtime.reply(&original, json!({})).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(runtime.requests("session.model.getCurrent").is_empty());
+    assert!(!runtime.service.warmed.read().await.contains(id));
+    runtime.reply(&retry, json!({})).await;
+    initialization_phase(&runtime, id, InitializationPhase::Ready).await;
+    assert_eq!(runtime.requests("session.create").len(), 1);
+}
+
+#[tokio::test]
+async fn deferred_disconnect_downgrades_ready_and_explicit_resume_never_replays_pending_work() {
+    let runtime = mock_runtime();
+    let created = runtime.service.create_session(new_session(true)).await.unwrap();
+    let id = &created.session_id;
+    initialization_phase(&runtime, id, InitializationPhase::Ready).await;
+    let session = runtime.service.session(id).await.unwrap();
+    session.disconnect().await.unwrap();
+    initialization_phase(&runtime, id, InitializationPhase::Failed).await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while runtime.service.active.read().await.contains_key(id) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }).await.unwrap();
+    assert!(!runtime.service.list_sessions().await.unwrap().into_iter().find(|item| item.session_id == *id).unwrap().is_active);
+    let resumed = runtime.service.resume_session(id.clone()).await.unwrap();
+    assert!(resumed.is_active);
+    assert_eq!(runtime.request("session.resume", 1).await["params"]["continuePendingWork"], false);
+    assert_eq!(runtime.service.session_initialization(id).await.unwrap().initialization.phase, InitializationPhase::Ready);
+    assert_eq!(runtime.requests("session.create").len(), 1);
+    assert!(runtime.requests("session.send").is_empty());
+}
+
+#[tokio::test]
+async fn deferred_readiness_registered_before_attach_and_retry_survives_caller_cancellation() {
+    let runtime = mock_runtime();
+    runtime.hold("session.eventLog.tail");
+    runtime.hold("session.tools.initializeAndValidate");
+    let service = runtime.service.clone();
+    let creation = tokio::spawn(async move { service.create_session(new_session(true)).await });
+    let tail = runtime.request("session.eventLog.tail", 1).await;
+    let id = tail["params"]["sessionId"].as_str().unwrap();
+    assert_eq!(runtime.service.session_initialization(id).await.unwrap().initialization.phase, InitializationPhase::Initializing);
+    assert!(runtime.service.session(id).await.is_err());
+    assert!(!runtime.service.active.read().await.contains_key(id));
+    assert!(runtime.requests("session.tools.initializeAndValidate").is_empty());
+    runtime.reply(&tail, json!({"cursor":"tail"})).await;
+    assert!(creation.await.unwrap().unwrap().is_active);
+    let tools = runtime.request("session.tools.initializeAndValidate", 1).await;
+    runtime.inject(json!({"jsonrpc":"2.0","id":tools["id"],"error":{"code":-32000,"message":"retryable"}})).await;
+    initialization_phase(&runtime, id, InitializationPhase::Failed).await;
+    let lifecycle = runtime.service.lifecycle_gate.write().await;
+    let service = runtime.service.clone();
+    let retry_id = id.to_owned();
+    let caller = tokio::spawn(async move { service.retry_session_initialization(&retry_id).await });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    caller.abort();
+    let _ = caller.await;
+    drop(lifecycle);
+    let retry = runtime.request("session.tools.initializeAndValidate", 2).await;
+    runtime.reply(&retry, json!({})).await;
+    initialization_phase(&runtime, id, InitializationPhase::Ready).await;
+    assert_eq!(runtime.requests("session.create").len(), 1);
+}
+
+#[tokio::test]
+async fn deferred_safe_reads_remain_available_without_duplicate_tool_initialization() {
+    let runtime = mock_runtime();
+    runtime.hold("session.tools.initializeAndValidate");
+    let created = runtime.service.create_session(new_session(true)).await.unwrap();
+    let id = &created.session_id;
+    let tools = runtime.request("session.tools.initializeAndValidate", 1).await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        assert!(runtime.service.history(id, None).await.unwrap().events.is_empty());
+        assert!(runtime.service.recent_history(id).await.unwrap().events.is_empty());
+        assert!(runtime.service.subagent_context(id).await.unwrap().is_empty());
+        runtime.service.session_state(id).await.unwrap();
+        runtime.service.reference_section(id, "tools").await.unwrap();
+        runtime.service.mcp_tools(id).await.unwrap();
+    }).await.expect("safe reads waited for initialization");
+    assert!(runtime.service.tool_controls(id).await.is_err());
+    assert!(runtime.service.submit_message(serde_json::from_value(json!({
+        "sessionId":id,"content":"still blocked",
+    })).unwrap()).await.is_err());
+    assert_eq!(runtime.requests("session.tools.initializeAndValidate").len(), 1);
+    assert!(runtime.requests("session.send").is_empty());
+    runtime.reply(&tools, json!({})).await;
+    initialization_phase(&runtime, id, InitializationPhase::Ready).await;
+}
+
+#[tokio::test]
+async fn deferred_ready_status_survives_cancelled_drain_then_downgrades_on_disconnect() {
+    let runtime = mock_runtime();
+    let created = runtime.service.create_session(new_session(true)).await.unwrap();
+    let id = &created.session_id;
+    initialization_phase(&runtime, id, InitializationPhase::Ready).await;
+    let incomplete = runtime.service.drain(Duration::ZERO, false).await.unwrap();
+    assert!(!incomplete.complete);
+    assert_eq!(runtime.service.session_initialization(id).await.unwrap().initialization.phase, InitializationPhase::Ready);
+    assert!(runtime.service.submit_message(serde_json::from_value(json!({
+        "sessionId":id,"content":"blocked by admission despite readiness",
+    })).unwrap()).await.is_err());
+    runtime.service.cancel_drain().await.unwrap();
+    assert_eq!(runtime.service.session_initialization(id).await.unwrap().initialization.phase, InitializationPhase::Ready);
+    assert!(runtime.service.session(id).await.is_ok());
+    runtime.processing.store(false, Ordering::Relaxed);
+    assert!(runtime.service.drain(Duration::ZERO, false).await.unwrap().complete);
+    let disconnected = runtime.service.session_initialization(id).await.unwrap();
+    assert_eq!(disconnected.initialization.phase, InitializationPhase::Failed);
+    assert!(disconnected.session.is_none());
+    assert!(runtime.service.session(id).await.is_err());
+    assert!(runtime.requests("session.send").is_empty());
+}
+
+#[tokio::test]
+async fn deferred_recovery_retry_reattaches_disconnected_ready_and_pending_sessions_once() {
+    for pending in [false, true] {
+        let runtime = mock_runtime();
+        if pending {
+            runtime.hold("session.tools.initializeAndValidate");
+        }
+        let created = runtime.service.create_session(new_session(true)).await.unwrap();
+        let id = &created.session_id;
+        let original = runtime.request("session.tools.initializeAndValidate", 1).await;
+        if !pending {
+            initialization_phase(&runtime, id, InitializationPhase::Ready).await;
+        }
+        // Even a previously used session must never replay pending work on Retry.
+        runtime.service.metadata.write().await.get_mut(id).unwrap().prevent_pending_work = false;
+        let session = runtime.service.active.read().await[id].clone();
+        session.disconnect().await.unwrap();
+        initialization_phase(&runtime, id, InitializationPhase::Failed).await;
+        runtime.hold("session.resume");
+        runtime.hold("session.tools.initializeAndValidate");
+        let service = runtime.service.clone();
+        let first_id = id.clone();
+        let first = tokio::spawn(async move { service.retry_session_initialization(&first_id).await });
+        let native_resume = runtime.request("session.resume", 1).await;
+        let service = runtime.service.clone();
+        let second_id = id.clone();
+        let second = tokio::spawn(async move { service.retry_session_initialization(&second_id).await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(runtime.requests("session.resume").len(), 1);
+        assert_eq!(native_resume["params"]["sessionId"], *id);
+        assert_eq!(native_resume["params"]["continuePendingWork"], false);
+        assert_eq!(native_resume["params"]["excludedTools"], json!([]));
+        assert_eq!(runtime.service.session_initialization(id).await.unwrap().initialization.phase, InitializationPhase::Failed);
+        runtime.reply(&native_resume, json!({"sessionId":id})).await;
+        for response in [first.await.unwrap().unwrap(), second.await.unwrap().unwrap()] {
+            assert_eq!(response.session_id, *id);
+            assert_eq!(response.initialization.phase, InitializationPhase::Initializing);
+        }
+        let retry_tools = runtime.request("session.tools.initializeAndValidate", 2).await;
+        if pending {
+            runtime.reply(&original, json!({})).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert!(runtime.requests("session.model.getCurrent").is_empty());
+        }
+        runtime.reply(&retry_tools, json!({})).await;
+        let ready = initialization_phase(&runtime, id, InitializationPhase::Ready).await;
+        assert!(ready.session.unwrap().is_active);
+        assert_eq!(runtime.requests("session.create").len(), 1);
+        assert_eq!(runtime.requests("session.resume").len(), 1);
+        assert!(runtime.requests("session.send").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn deferred_recovery_deleted_tombstones_block_queued_retry_and_stale_registry() {
+    let runtime = mock_runtime();
+    let created = runtime.service.create_session(new_session(true)).await.unwrap();
+    let id = &created.session_id;
+    initialization_phase(&runtime, id, InitializationPhase::Ready).await;
+    let stale = runtime.service.initializations.read().await.runs[id].clone();
+    runtime.service.active.read().await[id].disconnect().await.unwrap();
+    initialization_phase(&runtime, id, InitializationPhase::Failed).await;
+    runtime.hold("session.delete");
+    let service = runtime.service.clone();
+    let delete_id = id.clone();
+    let deleting = tokio::spawn(async move { service.delete_session(&delete_id).await });
+    let deletion = runtime.request("session.delete", 1).await;
+    let service = runtime.service.clone();
+    let retry_id = id.clone();
+    let retry = tokio::spawn(async move { service.retry_session_initialization(&retry_id).await });
+    runtime.reply(&deletion, json!({})).await;
+    deleting.await.unwrap().unwrap();
+    assert!(retry.await.unwrap().is_err());
+    // Even an erroneous late record insertion is not authority to resurrect.
+    runtime.service.initializations.write().await.runs.insert(id.clone(), stale);
+    assert!(runtime.service.retry_session_initialization(id).await.is_err());
+    assert!(runtime.service.resume_session(id.clone()).await.is_err());
+    assert!(!runtime.service.list_sessions().await.unwrap().iter().any(|item| item.session_id == *id));
+    assert!(runtime.requests("session.resume").is_empty());
+    assert_eq!(runtime.requests("session.create").len(), 1);
+}
+
+#[tokio::test]
+async fn deferred_recovery_failed_delete_restores_visibility_preferences_and_retry() {
+    for pending in [false, true] {
+        let runtime = mock_runtime();
+        if pending {
+            runtime.hold("session.tools.initializeAndValidate");
+        }
+        let created = runtime.service.create_session(new_session(true)).await.unwrap();
+        let id = &created.session_id;
+        let original = runtime.request("session.tools.initializeAndValidate", 1).await;
+        if !pending {
+            initialization_phase(&runtime, id, InitializationPhase::Ready).await;
+        }
+        runtime.hold("session.delete");
+        runtime.hold("session.tools.initializeAndValidate");
+        let service = runtime.service.clone();
+        let delete_id = id.clone();
+        let deleting = tokio::spawn(async move { service.delete_session(&delete_id).await });
+        let deletion = runtime.request("session.delete", 1).await;
+        assert!(runtime.service.initializations.read().await.deleted.contains(id));
+        // Local organization remains editable during native deletion.
+        runtime.service.set_session_archived(SetSessionArchived {
+            session_id: id.clone(), archived: true,
+        }).await.unwrap();
+        runtime.inject(json!({"jsonrpc":"2.0","id":deletion["id"],"error":{"code":-32000,"message":"delete denied"}})).await;
+        assert!(deleting.await.unwrap().is_err());
+        assert!(!runtime.service.initializations.read().await.deleted.contains(id));
+        assert!(load_metadata(&runtime.service.metadata_path)[id].archived);
+        let listed = runtime.service.list_sessions().await.unwrap();
+        let matches = listed.iter().filter(|item| item.session_id == *id).collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].is_active && matches[0].archived);
+        assert_eq!(matches[0].initialization.as_ref().unwrap().phase, InitializationPhase::Failed);
+        assert!(runtime.service.session_initialization(id).await.unwrap().initialization.error.unwrap().contains("delete denied"));
+        if pending {
+            runtime.reply(&original, json!({})).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert!(runtime.requests("session.model.getCurrent").is_empty());
+        }
+        runtime.service.retry_session_initialization(id).await.unwrap();
+        let retry = runtime.request("session.tools.initializeAndValidate", 2).await;
+        runtime.reply(&retry, json!({})).await;
+        assert!(initialization_phase(&runtime, id, InitializationPhase::Ready).await.session.unwrap().archived);
+        assert!(runtime.requests("session.resume").is_empty());
+        assert_eq!(runtime.requests("session.create").len(), 1);
+        assert!(runtime.requests("session.send").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn deferred_recovery_failed_delete_rolls_back_after_http_caller_cancels() {
+    let runtime = mock_runtime();
+    let created = runtime.service.create_session(new_session(true)).await.unwrap();
+    let id = &created.session_id;
+    initialization_phase(&runtime, id, InitializationPhase::Ready).await;
+    runtime.hold("session.delete");
+    let service = runtime.service.clone();
+    let delete_id = id.clone();
+    let caller = tokio::spawn(async move { service.delete_session(&delete_id).await });
+    let deletion = runtime.request("session.delete", 1).await;
+    caller.abort();
+    let _ = caller.await;
+    runtime.inject(json!({"jsonrpc":"2.0","id":deletion["id"],"error":{"code":-32000,"message":"retry deletion later"}})).await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while runtime.service.initializations.read().await.deleted.contains(id) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }).await.unwrap();
+    assert!(runtime.service.list_sessions().await.unwrap().iter().any(|item| item.session_id == *id));
+    runtime.service.retry_session_initialization(id).await.unwrap();
+    initialization_phase(&runtime, id, InitializationPhase::Ready).await;
+}
+
+#[tokio::test]
+async fn deferred_recovery_retry_after_drain_uses_reconnected_mock_client_without_create() {
+    for pending in [false, true] {
+        let runtime = mock_runtime();
+        runtime.processing.store(false, Ordering::Relaxed);
+        if pending {
+            runtime.hold("session.tools.initializeAndValidate");
+        }
+        let created = runtime.service.create_session(new_session(true)).await.unwrap();
+        let id = &created.session_id;
+        runtime.request("session.tools.initializeAndValidate", 1).await;
+        if !pending {
+            initialization_phase(&runtime, id, InitializationPhase::Ready).await;
+        }
+        assert!(runtime.service.drain(Duration::ZERO, false).await.unwrap().complete);
+        assert!(runtime.service.retry_session_initialization(id).await.is_err());
+        // Replace only the mocked transport; never launch a real SDK runtime.
+        let reconnected = mock_runtime();
+        *runtime.service.client.write().await = Some(reconnected.service.client().await.unwrap());
+        runtime.service.accepting_work.store(true, Ordering::Relaxed);
+        runtime.service.retry_session_initialization(id).await.unwrap();
+        initialization_phase(&runtime, id, InitializationPhase::Ready).await;
+        let resumed = reconnected.request("session.resume", 1).await;
+        assert_eq!(resumed["params"]["sessionId"], *id);
+        assert_eq!(resumed["params"]["continuePendingWork"], false);
+        assert_eq!(runtime.requests("session.create").len(), 1);
+        assert!(reconnected.requests("session.create").is_empty());
+        assert!(reconnected.requests("session.send").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn deferred_recovery_failed_reattach_stays_retryable_with_same_id() {
+    let runtime = mock_runtime();
+    let created = runtime.service.create_session(new_session(true)).await.unwrap();
+    let id = &created.session_id;
+    initialization_phase(&runtime, id, InitializationPhase::Ready).await;
+    runtime.service.active.read().await[id].disconnect().await.unwrap();
+    initialization_phase(&runtime, id, InitializationPhase::Failed).await;
+    runtime.hold("session.resume");
+    let service = runtime.service.clone();
+    let retry_id = id.clone();
+    let retry = tokio::spawn(async move { service.retry_session_initialization(&retry_id).await });
+    let first = runtime.request("session.resume", 1).await;
+    runtime.inject(json!({"jsonrpc":"2.0","id":first["id"],"error":{"code":-32000,"message":"reattach unavailable"}})).await;
+    assert!(retry.await.unwrap().is_err());
+    let failed = runtime.service.session_initialization(id).await.unwrap();
+    assert_eq!(failed.initialization.phase, InitializationPhase::Failed);
+    assert!(failed.initialization.error.unwrap().contains("reattach unavailable"));
+    let service = runtime.service.clone();
+    let retry_id = id.clone();
+    let retry = tokio::spawn(async move { service.retry_session_initialization(&retry_id).await });
+    let second = runtime.request("session.resume", 2).await;
+    runtime.reply(&second, json!({"sessionId":id})).await;
+    retry.await.unwrap().unwrap();
+    initialization_phase(&runtime, id, InitializationPhase::Ready).await;
+    assert_eq!(runtime.requests("session.create").len(), 1);
+    assert!(runtime.requests("session.send").is_empty());
 }
 
 impl Drop for MockRuntime {
@@ -70,6 +900,8 @@ fn mock_runtime_with_mcp(mcp: bool) -> MockRuntime {
     let runtime_future_tool = future_tool.clone();
     let missing_metadata = Arc::new(AtomicBool::new(false));
     let runtime_missing_metadata = missing_metadata.clone();
+    let held_methods = Arc::new(Mutex::new(HashSet::<String>::new()));
+    let runtime_held_methods = held_methods.clone();
     let task = tokio::spawn(async move {
         let mut read = BufReader::new(read);
         let mut modes = HashMap::<String, Value>::new();
@@ -98,6 +930,9 @@ fn mock_runtime_with_mcp(mcp: bool) -> MockRuntime {
             }
             let method = request["method"].as_str().unwrap_or("");
             let sid = request["params"]["sessionId"].as_str().unwrap_or("");
+            if runtime_held_methods.lock().unwrap().contains(method) {
+                continue;
+            }
             let result = match method {
                 "session.list" => json!({"sessions":[]}),
                 "session.create" => {
@@ -120,6 +955,7 @@ fn mock_runtime_with_mcp(mcp: bool) -> MockRuntime {
                     json!({"sessionId":sid})
                 }
                 "session.skills.reload" | "session.tools.initializeAndValidate" => json!({}),
+                "session.delete" | "session.disconnect" | "session.destroy" | "session.abort" => json!({}),
                 "session.model.getCurrent" => json!({}),
                 "session.eventLog.tail" => json!({"cursor":"tail"}),
                 "session.eventLog.read" => {
@@ -142,6 +978,8 @@ fn mock_runtime_with_mcp(mcp: bool) -> MockRuntime {
                     json!({"status":"success","modelChanged":false,"deferImplementation":true,"armInteractiveContinuation":true,"message":"native update"})
                 }
                 "session.send" => json!({"messageId":"accepted-without-reply"}),
+                "session.queue.pendingItems" => json!({"items":[], "steeringMessages":[]}),
+                "session.tasks.list" => json!({"tasks":[]}),
                 "session.tools.getCurrentMetadata"
                     if runtime_missing_metadata.load(Ordering::Relaxed) =>
                 {
@@ -223,6 +1061,7 @@ fn mock_runtime_with_mcp(mcp: bool) -> MockRuntime {
         accepting_work: AtomicBool::new(true),
         active: RwLock::new(HashMap::new()),
         warmed: RwLock::new(HashSet::new()),
+        initializations: RwLock::new(Default::default()),
         turn_gates: RwLock::new(HashMap::new()),
         ask_gates: RwLock::new(HashMap::new()),
         last_submissions: RwLock::new(HashMap::new()),
@@ -244,6 +1083,7 @@ fn mock_runtime_with_mcp(mcp: bool) -> MockRuntime {
                     archived: false,
                     folder: None,
                     tags: vec![],
+                    initialization: None,
                 })
                 .into(),
         ),
@@ -276,6 +1116,7 @@ fn mock_runtime_with_mcp(mcp: bool) -> MockRuntime {
         processing,
         future_tool,
         missing_metadata,
+        held_methods,
     }
 }
 
@@ -488,6 +1329,7 @@ async fn newly_created_sessions_have_editable_known_app_defaults() {
             reasoning_effort: None,
             reasoning_summary: None,
             context_tier: None,
+            defer_initialization: false,
         })
         .await
         .unwrap();
@@ -576,6 +1418,7 @@ async fn concurrent_session_creation_is_rejected_before_reaching_the_runtime() {
             reasoning_effort: None,
             reasoning_summary: None,
             context_tier: None,
+            defer_initialization: false,
         })
         .await
         .unwrap_err();

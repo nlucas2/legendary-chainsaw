@@ -126,7 +126,7 @@ impl SessionService {
         validate_id("sessionId", &request.session_id)?;
         let _lifecycle = self.lifecycle_gate.read().await;
         // A sidebar read must never create/resume a runtime session.
-        self.session(&request.session_id).await?;
+        self.attached_session(&request.session_id).await?;
         Ok(AgentTasks {
             tasks: self.parent_agent_tasks(&request.session_id).await?,
             session_id: request.session_id,
@@ -183,7 +183,7 @@ impl SessionService {
             ));
         }
         let _lifecycle = self.lifecycle_gate.read().await;
-        self.session(&request.session_id).await?;
+        self.attached_session(&request.session_id).await?;
         let task = self
             .parent_agent_task(&request.session_id, &request.task_id)
             .await?;
@@ -221,7 +221,7 @@ impl SessionService {
     }
 
     async fn parent_agent_tasks(&self, session_id: &str) -> Result<Vec<AgentTask>> {
-        let session = self.session(session_id).await?;
+        let session = self.attached_session(session_id).await?;
         let result = session.rpc().tasks().list().await?;
         let mut ids = HashSet::new();
         let mut agents = Vec::new();

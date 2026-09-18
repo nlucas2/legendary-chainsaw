@@ -18,6 +18,10 @@ const mocks = {
       globalThis.__typographyTestRuntime.terminals.push(this); }
     loadAddon(addon) { addon.terminal = this; }
     open() {}
+    attachCustomKeyEventHandler() {}
+    hasSelection() { return false; }
+    focus() { this.focused = true; }
+    onSelectionChange() { return { dispose() {} }; }
     onData() { return { dispose() {} }; }
     onResize(callback) { this.resize = callback; return { dispose() {} }; }
     refresh() {}
@@ -34,7 +38,7 @@ const mocks = {
       }
     }
   };`,
-  "lucide-react": `export const ChevronDown = "icon", Link2 = "icon", LockKeyhole = "icon",
+  "lucide-react": `export const ChevronDown = "icon", Copy = "icon", Link2 = "icon", LockKeyhole = "icon",
     Power = "icon", Unlink = "icon", Users = "icon", X = "icon";`,
   "../lib/daemon": `export const daemonClientId = () => "client";
     export const daemonWebSocketUrl = () => "ws://localhost/api/terminal";`,

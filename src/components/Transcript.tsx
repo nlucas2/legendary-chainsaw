@@ -3,6 +3,7 @@ import { MarkdownContent as Markdown } from "./MarkdownContent";
 import {
   Bot,
   Brain,
+  CalendarClock,
   CheckCircle2,
   ChevronRight,
   CircleDot,
@@ -250,7 +251,8 @@ const MessageEntry = memo(function MessageEntry({
       <div className={showAvatar ? "message-avatar" : "message-avatar placeholder"}>
         {role === "assistant" || userOrigin?.kind === "agent" ? <Bot size={17} />
           : userOrigin?.kind === "human" ? <User size={16} />
-            : userOrigin?.kind === "skill" ? <Wrench size={16} /> : <CircleDot size={16} />}
+            : userOrigin?.kind === "skill" ? <Wrench size={16} />
+              : userOrigin?.kind === "scheduled" ? <CalendarClock size={16} /> : <CircleDot size={16} />}
       </div>
       <div className="message-content">
         {(role === "user" || showAvatar) && (

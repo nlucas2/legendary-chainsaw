@@ -1,5 +1,44 @@
 import { test, expect } from "@playwright/test";
 
+test("deferred creation shows the real workspace before warmup and never resumes it a second time", async ({ page, request }) => {
+  test.setTimeout(150_000);
+  let created: { sessionId: string; title: string } | undefined;
+  const resumes: string[] = [];
+  await page.route("**/api/list_sessions", (route) => route.fulfill({ json: created ? [created] : [] }));
+  page.on("request", (request) => {
+    if (request.url().endsWith("/api/resume_session")) resumes.push(request.postDataJSON().sessionId);
+  });
+  try {
+    await page.goto("/");
+    await page.getByRole("button", { name: /New session/ }).first().click();
+    const dialog = page.getByRole("dialog", { name: "New session", exact: true });
+    await dialog.getByRole("textbox").first().fill(process.cwd());
+    const response = page.waitForResponse((response) => response.url().endsWith("/api/create_session"));
+    const started = Date.now();
+    await dialog.getByRole("button", { name: "Create session", exact: true }).click();
+    const result = await response;
+    expect(result.ok(), await result.text()).toBe(true);
+    created = await result.json();
+    expect(result.request().postDataJSON().deferInitialization).toBe(true);
+    const returned = Date.now();
+    await expect(dialog).toHaveCount(0, { timeout: 1500 });
+    await expect(page.getByRole("heading", { name: "New session", exact: true })).toBeVisible();
+    const composer = page.locator(".parent-session-view .composer textarea");
+    await expect(composer).toBeEnabled();
+    await composer.fill("Keep this unsent startup draft");
+    await expect(page.locator(".session-startup")).toHaveCount(0, { timeout: 100_000 });
+    await expect(page.locator(".composer-status strong")).toHaveText("Session attached · idle");
+    await expect(composer).toHaveValue("Keep this unsent startup draft");
+    expect(resumes).toEqual([]);
+    console.info(`Deferred startup: create returned in ${returned - started} ms; ready in ${Date.now() - started} ms.`);
+  } finally {
+    if (created) {
+      const deleted = await request.post("/api/delete_session", { data: { sessionId: created.sessionId }, timeout: 30_000 });
+      expect(deleted.ok(), await deleted.text()).toBe(true);
+    }
+  }
+});
+
 test("native ask leaves history untouched, rename persists, and fork copies context independently", async ({ page, request }) => {
   test.setTimeout(180_000);
   const owned: string[] = [];

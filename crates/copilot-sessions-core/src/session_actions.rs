@@ -200,6 +200,7 @@ impl SessionService {
                 archived: false,
                 folder: None,
                 tags: Vec::new(),
+                initialization: None,
             };
             service
                 .metadata

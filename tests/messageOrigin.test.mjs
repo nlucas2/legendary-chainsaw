@@ -24,6 +24,17 @@ test("legacy session users stay human, while unattributed subagent inputs remain
   assert.equal(messageOrigin("user", true).label, "You");
 });
 
+test("native scheduled prompts are explicitly labeled without claiming human authorship", () => {
+  for (const source of ["schedule-123", "schedule-340282366920938463463374607431768211455"]) {
+    assert.equal(messageOrigin(source).kind, "scheduled");
+    assert.equal(messageOrigin(source, true).label, "Scheduled task");
+    assert.equal(isHumanMessage({ type: "user.message", data: { source } }), false);
+  }
+  for (const source of ["schedule-", "schedule-fake", "schedule-123-extra"]) {
+    assert.equal(messageOrigin(source).kind, "unknown");
+  }
+});
+
 test("only root human inputs qualify as human messages, never guesses based on their text", () => {
   const event = { type: "user.message", data: { content: "Instructions that look like an agent wrote them" } };
   assert.equal(isHumanMessage(event), true);

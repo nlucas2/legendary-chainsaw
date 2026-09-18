@@ -2,10 +2,11 @@ import { useEffect, useRef, useState } from "react";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
-import { ChevronDown, Link2, LockKeyhole, Power, Unlink, Users, X } from "lucide-react";
+import { ChevronDown, Copy, Link2, LockKeyhole, Power, Unlink, Users, X } from "lucide-react";
 import { daemonClientId, daemonWebSocketUrl } from "../lib/daemon";
 import type { TerminalServerMessage } from "../lib/types";
 import { normalizeTypography, terminalTypography, type TypographySettings } from "../lib/typography";
+import { isTerminalCopy } from "../lib/shortcuts";
 
 interface TerminalPaneProps {
   sessionId: string;
@@ -15,6 +16,8 @@ interface TerminalPaneProps {
   onCwdChange: (cwd: string) => void;
   onClose: () => void;
   typography?: TypographySettings;
+  autoFocus?: boolean;
+  onAutoFocus?: () => void;
 }
 
 export function TerminalPane({
@@ -25,6 +28,8 @@ export function TerminalPane({
   onCwdChange,
   onClose,
   typography,
+  autoFocus = false,
+  onAutoFocus,
 }: TerminalPaneProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const socketRef = useRef<WebSocket | null>(null);
@@ -42,6 +47,9 @@ export function TerminalPane({
   const [restored, setRestored] = useState(false);
   const [hasControl, setHasControl] = useState(false);
   const [viewers, setViewers] = useState(1);
+  const [selectionAvailable, setSelectionAvailable] = useState(false);
+  const [clipboardError, setClipboardError] = useState("");
+  const copyPending = useRef(false);
   const initialCwd = useRef(cwd);
   const clientId = useRef(daemonClientId());
 
@@ -49,6 +57,21 @@ export function TerminalPane({
     followCwdRef.current = followCwd;
     onCwdChangeRef.current = onCwdChange;
   }, [followCwd, onCwdChange]);
+
+  async function copySelection(terminal: Terminal) {
+    const text = terminal.getSelection();
+    if (!text || copyPending.current) return;
+    copyPending.current = true;
+    setClipboardError("");
+    try {
+      if (!navigator.clipboard?.writeText) {
+        throw new Error("Clipboard access is unavailable. Use the desktop app or an HTTPS/localhost connection.");
+      }
+      await navigator.clipboard.writeText(text);
+    } catch (cause) {
+      if (terminalRef.current === terminal) setClipboardError(`Could not copy terminal selection: ${String(cause)}`);
+    } finally { copyPending.current = false; }
+  }
 
   useEffect(() => {
     if (!hostRef.current) return;
@@ -59,6 +82,14 @@ export function TerminalPane({
       theme: terminalTheme(),
     });
     terminalRef.current = terminal;
+    terminal.attachCustomKeyEventHandler((event) => {
+      if (!isTerminalCopy(event, terminal.hasSelection())) return true;
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.type === "keydown" && !event.repeat) void copySelection(terminal);
+      return false;
+    });
+    const selectionDisposable = terminal.onSelectionChange(() => setSelectionAvailable(terminal.hasSelection()));
     const fit = new FitAddon();
     fitRef.current = fit;
     terminal.loadAddon(fit);
@@ -138,6 +169,7 @@ export function TerminalPane({
       window.removeEventListener("copilot-sessions-theme", updateTheme);
       dataDisposable.dispose();
       resizeDisposable.dispose();
+      selectionDisposable.dispose();
       socket.close();
       terminal.dispose();
       socketRef.current = null;
@@ -145,6 +177,12 @@ export function TerminalPane({
       fitRef.current = null;
     };
   }, [sessionId]);
+
+  useEffect(() => {
+    if (!autoFocus || !terminalRef.current) return;
+    terminalRef.current.focus();
+    onAutoFocus?.();
+  }, [autoFocus, onAutoFocus, sessionId]);
 
   // Font changes resize the existing terminal; they never recreate the socket or PTY.
   useEffect(() => {
@@ -174,6 +212,11 @@ export function TerminalPane({
           <ChevronDown size={13} />
         </div>
         <div className="terminal-actions">
+          <button type="button" className="icon-button" disabled={!selectionAvailable}
+            title="Copy terminal selection (Ctrl+C / Cmd+C)" aria-label="Copy terminal selection"
+            onClick={() => { if (terminalRef.current) void copySelection(terminalRef.current); }}>
+            <Copy size={14} />
+          </button>
           <button
             className={hasControl ? "icon-button active" : "icon-button"}
             title={hasControl ? "Release terminal control" : "Take terminal control"}
@@ -224,6 +267,7 @@ export function TerminalPane({
       <div className="terminal-cwd" title={terminalCwd}>
         {terminalCwd}
       </div>
+      {clipboardError && <p className="terminal-clipboard-error" role="alert">{clipboardError}</p>}
       <div className="terminal-host" ref={hostRef} />
     </section>
   );

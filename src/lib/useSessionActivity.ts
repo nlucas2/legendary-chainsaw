@@ -15,7 +15,8 @@ export function useSessionActivity(sessions: SessionSummary[], connected: boolea
   const [states, setStates] = useState<Record<string, SessionActivity>>({});
   const [limit] = useState(() => createRequestLimiter<ActivityRead>(4));
   const readers = useRef(new Map<string, ReturnType<typeof createSingleflightReader<ActivityRead>>>());
-  const signature = JSON.stringify(sessions.filter((session) => session.isActive).map((session) => session.sessionId).sort());
+  const signature = JSON.stringify(sessions.filter((session) => session.isActive &&
+    (!session.initialization || session.initialization.phase === "ready")).map((session) => session.sessionId).sort());
   const publish = useCallback(() => setStates(tracker.snapshot()), [tracker]);
 
   useEffect(() => {
