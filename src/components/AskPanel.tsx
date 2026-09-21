@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { MarkdownContent } from "./MarkdownContent";
 import { askRequests, normalizeAskResult } from "../lib/ask";
 import { daemonInvoke } from "../lib/daemon";
+import { submitsComposer } from "../lib/composerInput";
+import { useMobileInput } from "../lib/useMobileInput";
 import { continueReviewConversation, quickAskQuestion, type ReviewChatContext } from "../lib/reviewChat";
 import { ReviewContextChip } from "./ReviewContextChip";
 import "./ask-panel.css";
@@ -22,6 +24,7 @@ export function AskPanel(props: AskPanelProps) {
 
 function SessionAskPanel({ sessionId, onClose, initialQuestion = "", submitOnOpen = false, reviewContext, onContinue }: AskPanelProps) {
   const [question, setQuestion] = useState(initialQuestion);
+  const mobileInput = useMobileInput();
   const [submittedQuestion, setSubmittedQuestion] = useState("");
   const [submittedContext, setSubmittedContext] = useState<ReviewChatContext>();
   const [answer, setAnswer] = useState<string | null>(null);
@@ -81,16 +84,16 @@ function SessionAskPanel({ sessionId, onClose, initialQuestion = "", submitOnOpe
     <form onSubmit={(event) => { event.preventDefault(); void submit(question); }}>
       <label htmlFor={`ask-question-${sessionId}`}>Question</label>
       <textarea ref={input} id={`ask-question-${sessionId}`} value={question} disabled={busy}
-        placeholder="Ask about this conversation…" rows={3}
+        placeholder="Ask about this conversation…" rows={3} enterKeyHint={mobileInput ? "enter" : "send"}
         onChange={(event) => setQuestion(event.currentTarget.value)}
         onKeyDown={(event) => {
-          if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+          if (submitsComposer({ ...event, isComposing: event.nativeEvent.isComposing }, mobileInput)) {
             event.preventDefault();
             void submit(question);
           }
         }} />
       <div className="ask-panel-actions">
-        <small>Enter to ask · Shift+Enter for a new line</small>
+        <small>{mobileInput ? "Enter for a new line · tap Ask" : "Enter to ask · Shift+Enter for a new line"}</small>
         <button type="submit" className="button primary" disabled={busy || !question.trim()}>
           {busy ? "Asking…" : "Ask"}
         </button>

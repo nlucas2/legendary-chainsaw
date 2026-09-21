@@ -122,6 +122,43 @@ test("child navigation preserves the parent draft and routes direct messages by 
   expect(state.sent[1].sessionId).toBe("b");
 });
 
+test.describe("mobile multiline chat", () => {
+  test.use({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  test("Enter adds lines in parent and subagent composers, and only Send submits", async ({ page }) => {
+    const state = await setup(page);
+    const rootSends: Record<string, unknown>[] = [];
+    await page.route("**/api/send_message", (route) => {
+      rootSends.push(route.request().postDataJSON());
+      return route.fulfill({ json: { messageId: "mobile-message" } });
+    });
+    const parent = page.locator(".parent-session-view .composer textarea");
+    await parent.fill("First line");
+    await parent.press("Enter");
+    await parent.pressSequentially("Second line");
+    await parent.press("Shift+Enter");
+    await parent.pressSequentially("Third line");
+    await expect(parent).toHaveValue("First line\nSecond line\nThird line");
+    await expect(parent).toHaveAttribute("enterkeyhint", "enter");
+    expect(rootSends).toHaveLength(0);
+    await page.getByRole("button", { name: "Send message", exact: true }).tap();
+    await expect.poll(() => rootSends.length).toBe(1);
+    expect(rootSends[0].content).toBe("First line\nSecond line\nThird line");
+    await page.getByRole("button", { name: "Open sessions", exact: true }).tap();
+    const children = await expand(page, "a");
+    await children.getByRole("button", { name: /Builder/ }).tap();
+    const child = page.getByRole("textbox", { name: "Message Builder", exact: true });
+    await child.fill("Child first line");
+    await child.press("Enter");
+    await child.pressSequentially("Child second line");
+    await expect(child).toHaveValue("Child first line\nChild second line");
+    expect(state.sent).toHaveLength(0);
+    await page.getByRole("button", { name: "Send to Builder", exact: true }).tap();
+    await expect.poll(() => state.sent.length).toBe(1);
+    expect(state.sent[0].message).toBe("Child first line\nChild second line");
+    expect(rootSends).toHaveLength(1);
+  });
+});
+
 test("live child events exclude parent/sibling output and failed sends keep drafts", async ({ page }) => {
   const state = await setup(page);
   const a = await expand(page, "a");

@@ -1,4 +1,5 @@
 import type { DaemonEvent } from "./types";
+import { isTunnelAuthentication } from "./authentication";
 
 const LOCAL_DAEMON = "http://127.0.0.1:3847";
 const CLIENT_ID_KEY = "copilot-sessions.client-id";
@@ -37,6 +38,7 @@ export class DaemonError extends Error {
   constructor(
     message: string,
     public readonly status: number,
+    public readonly tunnelAuthentication = false,
   ) {
     super(message);
   }
@@ -58,7 +60,8 @@ export async function daemonInvoke<T>(
     },
   );
   if (!response.ok) {
-    throw new DaemonError((await response.text()) || response.statusText, response.status);
+    throw new DaemonError((await response.text()) || response.statusText, response.status,
+      isTunnelAuthentication(response.status, response.headers.get("www-authenticate")));
   }
   const text = await response.text();
   return (text ? JSON.parse(text) : undefined) as T;
@@ -72,7 +75,8 @@ export async function daemonLogin(token: string): Promise<void> {
     body: JSON.stringify({ token }),
   });
   if (!response.ok) {
-    throw new DaemonError((await response.text()) || response.statusText, response.status);
+    throw new DaemonError((await response.text()) || response.statusText, response.status,
+      isTunnelAuthentication(response.status, response.headers.get("www-authenticate")));
   }
 }
 

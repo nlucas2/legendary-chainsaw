@@ -4,6 +4,8 @@ import type { SessionEvent } from "./types.ts";
 export interface SessionActivity {
   kind: "working" | "idle" | "unknown";
   reason?: string;
+  runningSubagents?: number;
+  subagentError?: string;
 }
 
 export function processingActivity(value: unknown): SessionActivity {
@@ -11,14 +13,29 @@ export function processingActivity(value: unknown): SessionActivity {
   return { kind: value ? "working" : "idle" };
 }
 
+export function subagentActivity(activity?: SessionActivity) {
+  if (activity?.kind !== "idle") return null;
+  if (activity.subagentError) {
+    return { state: "unknown", label: "Subagent status unavailable", description: activity.subagentError };
+  }
+  const count = activity.runningSubagents ?? 0;
+  return count > 0 ? {
+    state: "delegating",
+    label: `${count} subagent${count === 1 ? "" : "s"} working`,
+    description: `The parent is idle, but ${count} subagent${count === 1 ? " is" : "s are"} still working. You can message the parent without steering a running parent turn.`,
+  } : null;
+}
+
 export function sessionActivityIndicator(attached: boolean, connected: boolean, activity?: SessionActivity) {
   if (!attached) return { kind: "inactive", label: "Not attached", description: "Not attached to this daemon. No background status query is made." };
   if (!connected) return { kind: "unknown", label: "Status unavailable", description: "Session status unavailable while disconnected." };
   if (!activity) return { kind: "unknown", label: "Checking status", description: "Checking this attached session's activity." };
   if (activity.kind === "unknown") return { kind: "unknown", label: "Status unavailable", description: activity.reason ?? "Session status is unavailable." };
+  const children = subagentActivity(activity);
+  if (children) return { kind: children.state, label: children.label, description: children.description };
   return activity.kind === "working"
     ? { kind: "working", label: "Working", description: "Working — this attached session is processing a turn." }
-    : { kind: "idle", label: "Idle", description: "Idle — this attached session is ready for a message. Subagents have separate activity." };
+    : { kind: "idle", label: "Idle", description: "Idle — this attached session is ready for a message, with no known running subagents." };
 }
 
 export class SessionActivityTracker {
@@ -30,7 +47,8 @@ export class SessionActivityTracker {
 
   private write(sessionId: string, next: SessionActivity): boolean {
     const current = this.states.get(sessionId);
-    if (current?.kind === next.kind && current.reason === next.reason) return false;
+    if (current?.kind === next.kind && current.reason === next.reason
+      && current.runningSubagents === next.runningSubagents && current.subagentError === next.subagentError) return false;
     this.states.set(sessionId, next);
     return true;
   }
@@ -40,6 +58,10 @@ export class SessionActivityTracker {
   }
 
   observe(sessionId: string, event: SessionEvent): boolean {
+    if (changesSubagentActivity(event)) {
+      this.versions.set(sessionId, this.version(sessionId) + 1);
+      return false;
+    }
     const activity: ChatActivity = { phase: this.states.get(sessionId)?.kind === "working" ? "working" : "idle" };
     const next = activityFromEvent(activity, event, Date.now());
     if (next === activity) return false;
@@ -47,11 +69,16 @@ export class SessionActivityTracker {
     this.versions.set(sessionId, this.version(sessionId) + 1);
     return this.write(sessionId, next.phase === "error"
       ? { kind: "unknown", reason: next.error }
-      : { kind: next.phase === "idle" ? "idle" : "working" });
+      : { ...this.states.get(sessionId), kind: next.phase === "idle" ? "idle" : "working", reason: undefined });
   }
 
   invalidate(sessionId: string): boolean {
     this.versions.set(sessionId, this.version(sessionId) + 1);
     return this.states.delete(sessionId);
   }
+}
+
+export function changesSubagentActivity(event: SessionEvent): boolean {
+  return event.type.startsWith("subagent.") || event.type.startsWith("task.")
+    || (!!event.agentId && ["assistant.turn_start", "session.idle", "session.error"].includes(event.type));
 }

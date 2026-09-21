@@ -26,7 +26,7 @@ export function useTerminalLayout() {
     return () => clearTimeout(timer);
   }, [layout, ready]);
   return {
-    layout, setLayout, error,
+    layout, setLayout, error, viewport,
     width: resizedTerminal("right", layout.width, 0, viewport.width, viewport.height),
     height: resizedTerminal("bottom", layout.height, 0, viewport.width, viewport.height),
   };

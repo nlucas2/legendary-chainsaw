@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { processingActivity, sessionActivityIndicator, SessionActivityTracker } from "../src/lib/sessionActivity.ts";
+import { processingActivity, sessionActivityIndicator, SessionActivityTracker, subagentActivity } from "../src/lib/sessionActivity.ts";
 
 const event = (type, data = {}, agentId) => ({ id: type, type, data, agentId, timestamp: "" });
 
@@ -57,4 +57,37 @@ test("unrelated metadata does not invent activity and disconnect invalidation re
   tracker.observe("a", event("session.error", { message: "Runtime failed" }));
   assert.equal(tracker.snapshot().a.kind, "unknown");
   assert.equal(tracker.snapshot().a.reason, "Runtime failed");
+});
+
+test("idle parents with running subagents have a distinct display, without changing root processing", () => {
+  const activity = { kind: "idle", runningSubagents: 2 };
+  const indicator = sessionActivityIndicator(true, true, activity);
+  assert.equal(indicator.kind, "delegating");
+  assert.equal(indicator.label, "2 subagents working");
+  assert.match(indicator.description, /parent is idle/i);
+  assert.equal(activity.kind, "idle");
+  assert.equal(subagentActivity({ ...activity, kind: "working" }), null);
+  assert.equal(subagentActivity({ kind: "idle", runningSubagents: 0 }), null);
+  assert.equal(sessionActivityIndicator(true, false, activity).label, "Status unavailable");
+  assert.equal(sessionActivityIndicator(false, true, activity).label, "Not attached");
+  assert.equal(sessionActivityIndicator(true, true, { ...activity, kind: "working" }).label, "Working");
+  assert.equal(subagentActivity({ kind: "idle", subagentError: "Unavailable" }).state, "unknown");
+});
+
+test("subagent lifecycle signals invalidate stale counts and root idle retains last known child work", () => {
+  const tracker = new SessionActivityTracker();
+  tracker.accept("a", 0, { kind: "working", runningSubagents: 1 });
+  tracker.observe("a", event("session.idle"));
+  assert.equal(subagentActivity(tracker.snapshot().a).label, "1 subagent working");
+  const before = tracker.version("a");
+  tracker.observe("a", event("subagent.started", { toolCallId: "call" }, "different-agent-id"));
+  assert.equal(tracker.accept("a", before, { kind: "idle", runningSubagents: 0 }), false);
+  tracker.accept("a", tracker.version("a"), { kind: "idle", runningSubagents: 2 });
+  const beforeCompletion = tracker.version("a");
+  tracker.observe("a", event("subagent.completed", { toolCallId: "call" }, "different-agent-id"));
+  assert.equal(tracker.accept("a", beforeCompletion, { kind: "idle", runningSubagents: 2 }), false);
+  tracker.accept("a", tracker.version("a"), { kind: "idle", runningSubagents: 0 });
+  assert.equal(subagentActivity(tracker.snapshot().a), null);
+  tracker.invalidate("a");
+  assert.equal(subagentActivity(tracker.snapshot().a), null);
 });

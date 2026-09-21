@@ -23,6 +23,8 @@ import {
   Bot,
   ChevronDown,
   ChevronRight,
+  ChevronsDown,
+  ChevronsUp,
   Eye,
   EyeOff,
   FolderCog,
@@ -63,8 +65,13 @@ import { RenameSession } from "./components/RenameSession";
 import { GitWorkspaceButton } from "./components/GitWorkspaceButton";
 import { ForkSession } from "./components/ForkSession";
 import { useTerminalLayout } from "./lib/useTerminalLayout";
+import { useSidebarWidth } from "./lib/useSidebarWidth";
+import { SidebarResizer } from "./components/SidebarResizer";
 import { useTypography } from "./lib/useTypography";
 import { useChatWidth } from "./lib/useChatWidth";
+import { useChatHeader } from "./lib/useChatHeader";
+import { useMobileInput } from "./lib/useMobileInput";
+import { submitsComposer } from "./lib/composerInput";
 import { useSessionStartup } from "./lib/useSessionStartup";
 import { SessionStartupBanner } from "./components/SessionStartupBanner";
 import { useDeliveryDefault } from "./lib/useDeliveryDefault";
@@ -110,7 +117,7 @@ import { chatDraftReducer, EMPTY_SESSION_DRAFTS } from "./lib/chatDrafts";
 import { mergeEvents, mergeHistoryEvents, reconcileOptimisticUserEvents } from "./lib/history";
 import { useSessionOperation } from "./lib/useSessionOperation";
 import { useSessionActivity } from "./lib/useSessionActivity";
-import { sessionActivityIndicator, type SessionActivity } from "./lib/sessionActivity";
+import { sessionActivityIndicator, subagentActivity, type SessionActivity } from "./lib/sessionActivity";
 import { filterSessions, groupSessions, SessionArchiveChanges, type SessionView } from "./lib/sessionList";
 import type {
   AgentMode,
@@ -202,7 +209,7 @@ function App() {
     return tracked;
   }, [expandedSessions, selectedAgent?.sessionId]);
   const agentTasks = useAgentTasks(sessions, trackedAgentSessions, runtimeStatus?.connected !== false);
-  const [needsLogin, setNeedsLogin] = useState(false);
+  const [needsLogin, setNeedsLogin] = useState<boolean | "tunnel">(false);
   const [loading, setLoading] = useState(true);
   const [historyState, setHistoryState] = useState<HistoryState>("idle");
   const [sessionAttached, setSessionReady] = useState(false);
@@ -309,11 +316,15 @@ function App() {
     if (!terminalOpen || terminalFocusSession !== activeSession?.sessionId) setTerminalFocusSession(null);
   }, [terminalOpen, terminalFocusSession, activeSession?.sessionId]);
   const terminalLayout = useTerminalLayout();
-  const terminalWidth = terminalLayout.width;
+  const sidebarWidth = useSidebarWidth(terminalLayout.viewport.width, terminalOpen && terminalLayout.layout.dock === "right");
+  const terminalWidth = resizedTerminal("right", terminalLayout.layout.width, 0,
+    terminalLayout.viewport.width, terminalLayout.viewport.height, sidebarWidth.width);
   const terminalDrag = useRef<{ x: number; y: number; size: number } | null>(null);
   const [followCwd, setFollowCwd] = useState(true);
   const [trackedCwd, setTrackedCwd] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const chatHeader = useChatHeader();
+  const mobileInput = useMobileInput();
   const activeIdRef = useRef<string | null>(null);
   const createSessionPendingRef = useRef(false);
   const historyCursorRef = useRef<string | null>(null);
@@ -1808,6 +1819,7 @@ function App() {
       ),
     [events, subagentContext],
   );
+  const delegatedActivity = subagentActivity(activeSession ? sidebarActivity.states[activeSession.sessionId] : undefined);
   const sessionActivity = useMemo(
     () =>
       catchingUp
@@ -1820,8 +1832,9 @@ function App() {
               : { state: "detached", label: "Session detached" }
             : (sessionProcessing ?? isSessionProcessing(events))
               ? { state: "working", label: "Copilot working" }
-              : { state: "idle", label: "Attached · idle" },
-    [catchingUp, events, runtimeStatus?.connected, sessionProcessing, sessionReady, sessionStartup.status],
+              : delegatedActivity ?? { state: "idle", label: "Attached · idle" },
+    [catchingUp, events, runtimeStatus?.connected, sessionProcessing, sessionReady, sessionStartup.status,
+      delegatedActivity?.state, delegatedActivity?.label, delegatedActivity?.description],
   );
 
   async function loadEarlierHistory() {
@@ -1862,7 +1875,7 @@ function App() {
   function resizeTerminal(delta: number, start?: number) {
     const dock = terminalLayout.layout.dock;
     const size = resizedTerminal(dock, start ?? (dock !== "right" ? terminalLayout.height : terminalWidth),
-      delta, window.innerWidth, window.innerHeight);
+      delta, window.innerWidth, window.innerHeight, sidebarWidth.width);
     terminalLayout.setLayout((current) => ({ ...current, [dock !== "right" ? "height" : "width"]: size }));
   }
 
@@ -1975,7 +1988,7 @@ function App() {
               })}>
               {expandedSessions.has(session.sessionId) ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
             </button>
-          <SessionRow session={session} active={activeSession?.sessionId === session.sessionId}
+          <SessionRow session={session} active={activeSession?.sessionId === session.sessionId} showFolder={!!group.pinned}
             activity={sidebarActivity.states[session.sessionId]} activityConnected={activityConnected}
             onOpen={() => { setSelectedAgent(null); void openSession(session); }}
             onTogglePin={() => void organizeSession(session, {
@@ -2003,57 +2016,67 @@ function App() {
   }), [sessionGroups, collapsedGroups, activeSession?.sessionId, expandedSessions, agentTasks.states, selectedAgent, selectAgent, runtimeStatus?.connected, setSessionArchived, archiveOperation.revision, sidebarActivity.states, activityConnected]);
 
   if (needsLogin) {
-    return <LoginScreen onLoggedIn={loadSessions} />;
+    return <LoginScreen tunnel={needsLogin === "tunnel"} onTunnelAuth={() => setNeedsLogin("tunnel")} onLoggedIn={loadSessions} />;
   }
 
   return (
     <main
       className={`app-shell ${terminalOpen ? "terminal-visible" : ""} terminal-${terminalLayout.layout.dock}`}
       data-chat-width={chatWidth.width}
-      style={{ "--terminal-width": `${terminalWidth}px`, "--terminal-height": `${terminalLayout.height}px` } as CSSProperties}
+      style={{ "--terminal-width": `${terminalWidth}px`, "--terminal-height": `${terminalLayout.height}px`,
+        "--workspace-sidebar-width": `${sidebarWidth.width}px` } as CSSProperties}
     >
-      <aside className={sidebarOpen ? "sidebar open" : "sidebar"}>
+      <aside className={sidebarOpen ? "sidebar open" : "sidebar"} data-header-collapsed={chatHeader.collapsed}>
         <div className="brand">
+          <button
+            className="icon-button mobile-only"
+            onClick={() => {
+              setSidebarOpen(false);
+              document.querySelector<HTMLButtonElement>(".workspace-header .mobile-menu")?.focus();
+            }}
+            aria-label="Close sessions"
+          >
+            <X size={19} />
+          </button>
           <div className="brand-mark">
             <Bot size={20} />
           </div>
-          <div>
+          <div className="brand-title">
             <strong>Copilot Sessions</strong>
             <span>daemon workspace</span>
           </div>
-          <button
-            className="icon-button mobile-only"
-            onClick={() => setSidebarOpen(false)}
-            aria-label="Close sessions"
-          >
-            <X size={18} />
+        </div>
+        <div className="session-quick-actions">
+          <button className="new-session-button" onClick={openNewSession}>
+            <MessageSquarePlus size={17} />
+            New session
+            <span>⌘ N</span>
+          </button>
+          <button type="button" className="scheduled-nav-button" onClick={() => setSchedulesOpen(true)}>
+            <CalendarClock size={16} />Scheduled tasks
           </button>
         </div>
-        <button className="new-session-button" onClick={openNewSession}>
-          <MessageSquarePlus size={17} />
-          New session
-          <span>⌘ N</span>
-        </button>
-        <button type="button" className="scheduled-nav-button" onClick={() => setSchedulesOpen(true)}>
-          <CalendarClock size={16} />Scheduled tasks
-        </button>
-        <label className="session-search">
-          <Search size={15} />
-          <input
-            value={search}
-            onChange={(event) => setSearch(event.currentTarget.value)}
-            placeholder="Search sessions"
-          />
-        </label>
-        <div className="session-list-controls">
-          <span className="sidebar-label">Sessions</span>
-          <select ref={sessionViewControl} aria-label="Session view" value={sessionView}
-            onChange={(event) => setSessionView(event.target.value as SessionView)}>
-            <option value="current">Current ({sessions.length - archivedCount})</option>
-            <option value="archived">Archived ({archivedCount})</option>
-            <option value="all">All ({sessions.length})</option>
-          </select>
+        <div className="session-browse-controls">
+          <label className="session-search">
+            <Search size={15} />
+            <input
+              value={search}
+              onChange={(event) => setSearch(event.currentTarget.value)}
+              placeholder="Search sessions"
+              aria-label="Search sessions"
+            />
+          </label>
+          <div className="session-list-controls">
+            <span className="sidebar-label">Sessions</span>
+            <select ref={sessionViewControl} aria-label="Session view" value={sessionView}
+              onChange={(event) => setSessionView(event.target.value as SessionView)}>
+              <option value="current">Current ({sessions.length - archivedCount})</option>
+              <option value="archived">Archived ({archivedCount})</option>
+              <option value="all">All ({sessions.length})</option>
+            </select>
+          </div>
         </div>
+        {sidebarWidth.error && <p className="session-archive-error" role="alert">{sidebarWidth.error}</p>}
         {archiveError && archiveErrorLocation === "sidebar" && <p className="session-archive-error" role="alert">{archiveError}</p>}
         {archiveNotice && <div className="session-archive-notice" role="status">
           <span>{archiveNotice.archived ? "Archived" : "Restored"} "{archiveNotice.title}".</span>
@@ -2105,6 +2128,7 @@ function App() {
           </span>
           <Settings2 size={14} />
         </button>
+        <SidebarResizer width={sidebarWidth.width} min={sidebarWidth.min} max={sidebarWidth.max} onChange={sidebarWidth.setWidth} />
       </aside>
 
       {sidebarOpen && (
@@ -2122,7 +2146,8 @@ function App() {
           <button type="button" disabled={!!archiveOperation.operations.get(activeSession.sessionId)}
             onClick={() => void setSessionArchived(activeSession.sessionId, false, activeSession.title)}>Restore session</button>
         </div>}
-        <header className="workspace-header">
+        <header className="workspace-header" data-collapsed={chatHeader.collapsed}>
+          <div className="workspace-heading-row">
           <button
             className="icon-button mobile-menu"
             onClick={() => setSidebarOpen(true)}
@@ -2132,11 +2157,11 @@ function App() {
           </button>
           <div className="session-heading">
             <div className="session-title-line">
-              <h1>{activeSession?.title ?? "Copilot Sessions"}</h1>
+              <h1 title={activeSession?.title ?? "Copilot Sessions"}>{activeSession?.title ?? "Copilot Sessions"}</h1>
               {activeSession && <button type="button" className="icon-button" aria-label="Rename session"
-                title="Rename session" onClick={() => setRenamingSession(activeSession)}><Pencil size={15} /></button>}
+                hidden={chatHeader.collapsed} title="Rename session" onClick={() => setRenamingSession(activeSession)}><Pencil size={15} /></button>}
             </div>
-            <div className="session-context">
+            <div id="session-metadata" className="session-context" hidden={chatHeader.collapsed}>
               {activeSession ? (
                 <>
                   <button
@@ -2159,7 +2184,17 @@ function App() {
               )}
             </div>
           </div>
-          <div className="header-actions">
+          {activeSession && <span className={`compact-session-activity session-activity ${sessionActivity.state}`}
+            hidden={!chatHeader.collapsed} role="img" aria-label={sessionActivity.label} title={sessionActivity.label}><b /></span>}
+          <button type="button" className="icon-button chat-header-toggle"
+            aria-label={chatHeader.collapsed ? "Expand chat header" : "Collapse chat header"}
+            title={chatHeader.collapsed ? "Show session details and tools" : "Collapse session details and tools"}
+            aria-expanded={!chatHeader.collapsed} aria-controls="session-metadata workspace-tools workspace-history"
+            onClick={() => chatHeader.setCollapsed(!chatHeader.collapsed)}>
+            {chatHeader.collapsed ? <ChevronsDown size={18} /> : <ChevronsUp size={18} />}
+          </button>
+          </div>
+          <div id="workspace-tools" className="header-actions" hidden={chatHeader.collapsed}>
             {activeSession?.cwd && <GitWorkspaceButton sessionId={activeSession.sessionId} cwd={activeSession.cwd} onOpen={() => setGitOpen(true)} />}
             <button type="button" className="icon-button" title="Ask about this conversation without tools or history changes"
               aria-label="Ask about conversation" disabled={!sessionReady || !!selectedAgent || runtimeStatus?.acceptingWork === false}
@@ -2238,6 +2273,7 @@ function App() {
             </div>}
           </div>
         </header>
+        {chatHeader.error && <p className="error-banner" role="alert">{chatHeader.error}</p>}
         {sessionStartup.status && !sessionStartup.ready && <SessionStartupBanner
           initialization={sessionStartup.status.initialization} error={sessionStartup.status.error}
           connected={activityConnected} retrying={sessionStartup.retrying}
@@ -2288,7 +2324,8 @@ function App() {
         )}
 
         {activeSession && (catchingUp || historyReceipt?.sessionId === activeSession.sessionId) && (
-          <div className={`sync-banner ${catchingUp ? "working" : "complete"}`}>
+          <div id="workspace-history" className={`sync-banner ${catchingUp ? "working" : "complete"}`}
+            hidden={chatHeader.collapsed && !catchingUp}>
             <RefreshCw className={catchingUp ? "spin" : undefined} size={14} />
             <span>
               {catchingUp ? (
@@ -2471,7 +2508,7 @@ function App() {
         {activeSession && (
           <div
             className={`composer-status ${
-              busy || sessionProcessing ? "working" : "idle"
+              busy || sessionProcessing ? "working" : delegatedActivity?.state ?? "idle"
             }`}
             aria-live="polite"
           >
@@ -2488,7 +2525,8 @@ function App() {
                   activity.phase === "submitting" ? "Sending message" :
                   activity.phase === "stopping" ? "Stopping turn" :
                   activity.phase === "error" ? "Session error" :
-                  sessionProcessing ? "Copilot is working" : "Session attached · idle"}
+                  sessionProcessing ? "Copilot is working" :
+                  delegatedActivity ? `Parent idle · ${delegatedActivity.label}` : "Session attached · idle"}
               </strong>
               <small>
                 {streamStalled
@@ -2596,7 +2634,7 @@ function App() {
               if (event.key === "Tab" && !event.altKey && !event.ctrlKey && !event.metaKey) {
                 event.preventDefault();
                 void changeMode(cycleAgentMode(agentMode, 1));
-              } else if (event.key === "Enter" && !event.shiftKey) {
+              } else if (submitsComposer(event, mobileInput)) {
                 event.preventDefault();
                 if (event.ctrlKey || event.metaKey) submitDeliveryRef.current = "immediate";
                 event.currentTarget.form?.requestSubmit();
@@ -2612,6 +2650,7 @@ function App() {
                   : "Select a session to start chatting"
             }
             disabled={!activeSession || (!sessionReady && !sessionStartup.status) || catchingUp}
+            enterKeyHint={mobileInput ? "enter" : "send"}
             rows={1}
           />
           <div className="composer-footer">
@@ -2640,12 +2679,13 @@ function App() {
             </select>
             <span>
               {readingAttachments ? "Reading files..." :
-                sessionProcessing && deliveryMode === "enqueue" ? "Enter to queue" : "Enter to send"}
-              {" · Shift+Enter newline"}
+                mobileInput ? "Enter for newline · tap Send" :
+                `${sessionProcessing && deliveryMode === "enqueue" ? "Enter to queue" : "Enter to send"} · Shift+Enter newline`}
             </span>
             <button
               className="send-button"
               type="submit"
+              aria-label="Send message"
               disabled={
                 !activeSession ||
                 !sessionReady ||
@@ -2667,8 +2707,8 @@ function App() {
         <>
           <div className="pane-resizer" role="separator" tabIndex={0} aria-label="Resize terminal"
             aria-orientation={terminalLayout.layout.dock !== "right" ? "horizontal" : "vertical"}
-            aria-valuemin={terminalSizeLimits(terminalLayout.layout.dock, window.innerWidth, window.innerHeight).min}
-            aria-valuemax={terminalSizeLimits(terminalLayout.layout.dock, window.innerWidth, window.innerHeight).max}
+            aria-valuemin={terminalSizeLimits(terminalLayout.layout.dock, window.innerWidth, window.innerHeight, sidebarWidth.width).min}
+            aria-valuemax={terminalSizeLimits(terminalLayout.layout.dock, window.innerWidth, window.innerHeight, sidebarWidth.width).max}
             aria-valuenow={terminalLayout.layout.dock !== "right" ? terminalLayout.height : terminalWidth}
             onPointerDown={startResize} onPointerMove={(event) => {
               const drag = terminalDrag.current;
@@ -3037,6 +3077,7 @@ function App() {
 function SessionRow({
   session,
   active,
+  showFolder,
   activity,
   activityConnected,
   onOpen,
@@ -3049,6 +3090,7 @@ function SessionRow({
 }: {
   session: SessionSummary;
   active: boolean;
+  showFolder: boolean;
   activity?: SessionActivity;
   activityConnected: boolean;
   onOpen: () => void;
@@ -3066,11 +3108,13 @@ function SessionRow({
       <button className="session-open" onClick={onOpen} aria-describedby={statusId}>
         {session.pinned && <Pin className="session-pin" size={12} />}
         <span className="session-main">
-          <strong>{session.title}</strong>
+          <strong title={session.title}>{session.title}</strong>
           {session.archived && <span className="session-archived-label"><Archive size={10} />Archived</span>}
-          <small>
-            {session.folder && <em>{session.folder}</em>}
-            {compactPath(session.cwd) || "No working directory"}
+          <small className="session-location">
+            {showFolder && session.folder && <em title={session.folder}>{session.folder}</em>}
+            <span className="session-cwd" title={session.cwd || "No working directory"}>
+              {session.cwd || "No working directory"}
+            </span>
           </small>
           {session.tags.length > 0 && (
             <span className="session-tags">
@@ -3129,7 +3173,11 @@ function SessionRow({
   );
 }
 
-function LoginScreen({ onLoggedIn }: { onLoggedIn: () => Promise<void> }) {
+function LoginScreen({ tunnel, onTunnelAuth, onLoggedIn }: {
+  tunnel: boolean;
+  onTunnelAuth: () => void;
+  onLoggedIn: () => Promise<void>;
+}) {
   const [token, setToken] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -3141,10 +3189,34 @@ function LoginScreen({ onLoggedIn }: { onLoggedIn: () => Promise<void> }) {
       await daemonLogin(token);
       await onLoggedIn();
     } catch (cause) {
+      if (cause instanceof DaemonError && cause.tunnelAuthentication) {
+        setToken("");
+        onTunnelAuth();
+      }
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
       setBusy(false);
     }
+  }
+  if (tunnel) {
+    return <main className="login-screen">
+      <section className="login-card" aria-label="Tunnel sign-in required">
+        <div className="brand-mark large"><Bot size={27} /></div>
+        <span className="login-kicker">Copilot Sessions</span>
+        <h1>Sign in to your tunnel</h1>
+        <p>Your tunnel sign-in has expired or is missing. Sign in with the Microsoft or GitHub account that owns this tunnel. This is not a daemon access-token request.</p>
+        <button type="button" className="button primary" onClick={() => {
+          const url = new URL("/", window.location.href);
+          url.searchParams.set("_reconnect", String(Date.now()));
+          window.location.assign(url.href);
+        }}>Sign in again</button>
+        <button type="button" className="button secondary" disabled={busy} onClick={async () => {
+          setBusy(true);
+          try { await onLoggedIn(); } finally { setBusy(false); }
+        }}>{busy ? "Reconnecting..." : "Retry connection"}</button>
+        <p>Signing in again reloads the page; unsent drafts may be lost. If you signed in in another tab, retry the connection instead.</p>
+      </section>
+    </main>;
   }
   return (
     <main className="login-screen">
@@ -3336,10 +3408,10 @@ function emptySessionReferences(): SessionReferences {
 function handleError(
   cause: unknown,
   setError: (value: string) => void,
-  setNeedsLogin: (value: boolean) => void,
+  setNeedsLogin: (value: boolean | "tunnel") => void,
 ) {
   if (cause instanceof DaemonError && cause.status === 401) {
-    setNeedsLogin(true);
+    setNeedsLogin(cause.tunnelAuthentication ? "tunnel" : true);
     return;
   }
   setError(cause instanceof Error ? cause.message : String(cause));
@@ -3399,12 +3471,6 @@ function readThemePreference(): ThemePreference {
     // Use the default when storage is unavailable.
   }
   return "auto";
-}
-
-function compactPath(path?: string): string {
-  if (!path) return "";
-  const parts = path.split(/[\\/]/).filter(Boolean);
-  return parts.length <= 2 ? path : `…/${parts.slice(-2).join("/")}`;
 }
 
 function relativeTime(timestamp: string): string {

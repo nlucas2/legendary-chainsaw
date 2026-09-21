@@ -36,7 +36,7 @@ async function mount(page: Page, props: Record<string, unknown> = {}) {
   // All requests are intercepted. This fixture never calls a real daemon or model.
   await page.route("**/api/**", (route) => route.fulfill({ status: 500, body: "Unexpected API request" }));
   await page.route("**/__ask-panel-fixture__", (route) => route.fulfill({
-    contentType: "text/html", body: '<!doctype html><html><body><main id="root"></main></body></html>',
+    contentType: "text/html", body: '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head><body><main id="root"></main></body></html>',
   }));
   await page.goto("/__ask-panel-fixture__");
   await page.addScriptTag({ content: bundle });
@@ -106,6 +106,7 @@ test("switching sessions does not expose a late answer; malformed responses rema
   await page.route("**/api/ask_session", (route) => {
     pending.set(route.request().postDataJSON().sessionId, route);
   });
+
   await page.getByLabel("Question", { exact: true }).fill("A question");
   await page.getByLabel("Question", { exact: true }).press("Enter");
   await expect.poll(() => pending.has("parent-a")).toBe(true);
@@ -120,4 +121,25 @@ test("switching sessions does not expose a late answer; malformed responses rema
   await expect(page.getByRole("alert")).toContainText("mismatched");
   await expect(page.getByText("WRONG PARENT")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Ask", exact: true })).toBeEnabled();
+});
+
+test.describe("mobile questions", () => {
+  test.use({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  test("Enter keeps a multiline question unsent until Ask is tapped", async ({ page }) => {
+    await mount(page);
+    const calls: Record<string, unknown>[] = [];
+    await page.route("**/api/ask_session", (route) => {
+      calls.push(route.request().postDataJSON());
+      return route.fulfill({ json: { sessionId: "parent-a", answer: "Fixture answer" } });
+    });
+    const input = page.getByLabel("Question", { exact: true });
+    await input.fill("First question");
+    await input.press("Enter");
+    await input.pressSequentially("With more context");
+    await expect(input).toHaveValue("First question\nWith more context");
+    expect(calls).toHaveLength(0);
+    await page.getByRole("button", { name: "Ask", exact: true }).tap();
+    await expect.poll(() => calls.length).toBe(1);
+    expect(calls[0].question).toBe("First question\nWith more context");
+  });
 });

@@ -1,4 +1,4 @@
-import { test, expect, type Page } from "@playwright/test";
+import { test, expect, type Page, type Route } from "@playwright/test";
 
 const longUrl = "https://example.com/" + "long-path-segment".repeat(30);
 const markdown = `Reviewed changes.
@@ -35,6 +35,8 @@ async function setup(page: Page) {
       case "resume_session": result = session; break;
       case "runtime_status": result = { connected: true, acceptingWork: true, activeSessions: 1 }; break;
       case "session_state": result = { sessionId: session.sessionId, processing: false, mode: "interactive" }; break;
+      case "session_processing": result = false; break;
+      case "agent_tasks": result = { sessionId: session.sessionId, tasks: [] }; break;
       case "pending_interactions": case "pending_permissions": case "subagent_context": result = []; break;
       case "queue_items": result = { items: [], steeringMessages: [] }; break;
       case "git_repository": result = { isRepository: false }; break;
@@ -52,6 +54,91 @@ async function setup(page: Page) {
   await page.goto("/?session=appearance");
   await expect(page.locator(".message.assistant")).toBeVisible();
 }
+
+test.describe("compact chat header on phones", () => {
+  test.use({ isMobile: true, hasTouch: true, colorScheme: "dark" });
+  for (const width of [320, 440]) {
+    test(`a ${width}px phone keeps title and menu in one row and gives the reclaimed height to chat`, async ({ page }, testInfo) => {
+      await page.setViewportSize({ width, height: 760 });
+      await setup(page);
+      const composer = page.locator(".parent-session-view .composer textarea");
+      await composer.fill("Keep this draft while changing the header");
+      const header = page.locator(".workspace-header");
+      const before = (await header.boundingBox())!.height;
+      const conversation = page.locator(".parent-session-view .conversation");
+      const beforeChat = (await conversation.boundingBox())!.height;
+      await header.getByRole("button", { name: "Collapse chat header", exact: true }).tap();
+      await expect(header).toHaveAttribute("data-collapsed", "true");
+      const compact = (await header.boundingBox())!;
+      expect(compact.height).toBeLessThanOrEqual(52);
+      expect(compact.height).toBeLessThan(before);
+      const menu = (await header.getByRole("button", { name: "Open sessions", exact: true }).boundingBox())!;
+      const title = (await header.getByRole("heading", { name: "Appearance preview", exact: true }).boundingBox())!;
+      expect(Math.abs(menu.y + menu.height / 2 - title.y - title.height / 2)).toBeLessThan(3);
+      expect(menu.height).toBeGreaterThanOrEqual(44);
+      expect(title.x).toBeGreaterThanOrEqual(menu.x + menu.width);
+      expect((await conversation.boundingBox())!.height).toBeGreaterThan(beforeChat + 40);
+      await expect(page.locator("#workspace-tools")).toBeHidden();
+      await expect(page.locator("#session-metadata")).toBeHidden();
+      await expect(page.locator("#workspace-history")).toBeHidden();
+      await expect(header.locator(".compact-session-activity")).toBeVisible();
+      expect(await header.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+      await expect(composer).toHaveValue("Keep this draft while changing the header");
+      await page.screenshot({ path: testInfo.outputPath(`compact-header-${width}.png`) });
+      await page.reload();
+      await expect(page.locator(".message.assistant")).toBeVisible();
+      await expect(header).toHaveAttribute("data-collapsed", "true");
+      await header.getByRole("button", { name: "Open sessions", exact: true }).tap();
+      await expect(page.locator(".sidebar")).toHaveClass("sidebar open");
+      await page.locator(".sidebar").getByRole("button", { name: "Close sessions", exact: true }).tap();
+      await header.getByRole("button", { name: "Expand chat header", exact: true }).tap();
+      await expect(page.locator("#workspace-tools")).toBeVisible();
+      await expect(page.locator("#session-metadata")).toBeVisible();
+      await expect(page.locator("#workspace-history")).toBeVisible();
+      await expect(header.getByRole("button", { name: "Ask about conversation", exact: true })).toBeVisible();
+    });
+  }
+});
+
+test("desktop compact header is keyboard accessible and syncs without hiding active catch-up or errors", async ({ page }) => {
+  await setup(page);
+  const toggle = page.getByRole("button", { name: "Collapse chat header", exact: true });
+  await toggle.focus();
+  await toggle.press("Enter");
+  const expand = page.getByRole("button", { name: "Expand chat header", exact: true });
+  await expect(expand).toBeFocused();
+  await expect(expand).toHaveAttribute("aria-expanded", "false");
+  await expect(page.locator("#workspace-tools")).toBeHidden();
+  await page.evaluate(() => window.dispatchEvent(new StorageEvent("storage", {
+    key: "copilot-sessions.chat-header", newValue: "expanded", storageArea: localStorage,
+  })));
+  await expect(page.locator("#workspace-tools")).toBeVisible();
+  let refresh: Route | undefined;
+  await page.route("**/api/refresh_session", (route) => { refresh = route; });
+  await page.getByTitle("Merge recent history without restarting Copilot or other sessions", { exact: true }).click();
+  await expect.poll(() => !!refresh).toBe(true);
+  await toggle.click();
+  await expect(page.locator("#workspace-history")).toBeVisible();
+  await expect(page.locator("#workspace-history")).toContainText("Catching up");
+  await refresh!.fulfill({ status: 503, body: "Refresh unavailable" });
+  await expect(page.locator(".parent-session-view .error-banner")).toContainText("Refresh unavailable");
+  await expect(page.locator(".workspace-header")).toHaveAttribute("data-collapsed", "true");
+});
+
+test("header persistence failures stay visible while compact mode still works locally", async ({ page }) => {
+  await page.addInitScript(() => {
+    const original = Storage.prototype.setItem;
+    Storage.prototype.setItem = function (key: string, value: string) {
+      if (key === "copilot-sessions.chat-header") throw new Error("Header storage blocked");
+      return original.call(this, key, value);
+    };
+  });
+  await setup(page);
+  await page.getByRole("button", { name: "Collapse chat header", exact: true }).click();
+  await expect(page.locator(".workspace-header")).toHaveAttribute("data-collapsed", "true");
+  await expect(page.locator(".workspace > [role='alert']")).toContainText("Header storage blocked");
+  expect(await page.evaluate(() => localStorage.getItem("copilot-sessions.chat-header"))).toBeNull();
+});
 
 test("font controls collapse by default, remain keyboard accessible, and preserve settings", async ({ page }) => {
   await setup(page);

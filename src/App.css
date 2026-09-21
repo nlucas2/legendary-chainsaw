@@ -73,7 +73,7 @@ button {
 
 .app-shell {
   display: grid;
-  grid-template-columns: 272px minmax(0, 1fr);
+  grid-template-columns: var(--workspace-sidebar-width, 272px) minmax(0, 1fr);
   width: 100%;
   height: 100%;
   background:
@@ -82,7 +82,7 @@ button {
 }
 
 .app-shell.terminal-visible {
-  grid-template-columns: 272px minmax(380px, 1fr) 5px var(--terminal-width);
+  grid-template-columns: var(--workspace-sidebar-width, 272px) minmax(380px, 1fr) 5px var(--terminal-width);
 }
 
 .sidebar {
@@ -96,6 +96,27 @@ button {
   overflow: hidden;
   border-right: 1px solid var(--line);
   background: var(--sidebar);
+}
+
+.sidebar-resizer {
+  position: absolute;
+  z-index: 2;
+  inset: 0 0 0 auto;
+  width: 6px;
+  cursor: col-resize;
+  touch-action: none;
+  user-select: none;
+}
+
+.sidebar-resizer:hover,
+.sidebar-resizer:focus-visible {
+  background: var(--accent-soft);
+  box-shadow: inset -2px 0 var(--accent);
+}
+
+.sidebar-resizer:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 .brand {
@@ -125,7 +146,7 @@ button {
   border-radius: 14px;
 }
 
-.brand > div:nth-child(2) {
+.brand-title {
   display: flex;
   min-width: 0;
   flex-direction: column;
@@ -166,6 +187,11 @@ button {
   margin-left: auto;
   color: #65758b;
   font-size: 10px;
+}
+
+.session-quick-actions,
+.session-browse-controls {
+  display: contents;
 }
 
 .session-search {
@@ -347,34 +373,37 @@ button {
 }
 
 .session-main strong {
-  overflow: hidden;
   color: #cdd7e4;
   font-size: 12px;
   font-weight: 550;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .session-main small {
   display: flex;
-  align-items: center;
-  gap: 5px;
-  overflow: hidden;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
   margin-top: 4px;
   color: #68788d;
   font-size: 10px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.4;
+  white-space: normal;
+}
+
+.session-cwd {
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 
 .session-main small em {
-  max-width: 90px;
-  overflow: hidden;
+  max-width: 100%;
   padding: 1px 4px;
   border-radius: 3px;
   color: var(--accent-bright);
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
   background: var(--accent-soft);
   font-style: normal;
 }
@@ -411,6 +440,12 @@ button {
 .session-activity-dot { display: inline-block; flex: 0 0 8px; width: 8px; height: 8px; box-sizing: border-box; border-radius: 50%; background: var(--muted); }
 .session-activity-dot.working { background: var(--accent-bright); animation: session-working-pulse 1.8s ease-in-out infinite; }
 .session-activity-dot.idle { background: #34d399; }
+.session-activity-dot.delegating { background: #fbbf24; }
+.session-activity.delegating b, .composer-status.delegating > span > i { background: #fbbf24; }
+:root[data-theme="light"] .session-activity-dot.delegating,
+:root[data-theme="light"] .session-activity.delegating b,
+:root[data-theme="light"] .composer-status.delegating > span > i { background: #946000; }
+.composer-status.unknown > span > i { background: var(--muted); }
 :root[data-theme="light"] .session-activity-dot.idle { background: #247c52; }
 .session-activity-dot.unknown { background: transparent; border: 1px solid var(--muted); }
 .session-activity-dot.inactive { background: transparent; border: 1px solid var(--muted); opacity: .4; }
@@ -3456,11 +3491,11 @@ details[open] > summary .details-chevron {
 
 @media (max-width: 1120px) {
   .app-shell.terminal-visible {
-    grid-template-columns: 230px minmax(330px, 1fr) 5px minmax(340px, var(--terminal-width));
+    grid-template-columns: var(--workspace-sidebar-width, 230px) minmax(330px, 1fr) 5px var(--terminal-width);
   }
 
   .app-shell {
-    grid-template-columns: 230px minmax(0, 1fr);
+    grid-template-columns: var(--workspace-sidebar-width, 230px) minmax(0, 1fr);
   }
 }
 
@@ -3469,6 +3504,7 @@ details[open] > summary .details-chevron {
   .app-shell.terminal-visible {
     display: flex;
     flex-direction: column;
+    height: 100dvh;
   }
 
   .sidebar {
@@ -3479,6 +3515,7 @@ details[open] > summary .details-chevron {
     transform: translateX(-102%);
     box-shadow: 20px 0 60px rgba(0, 0, 0, 0.4);
     transition: transform 180ms ease;
+    height: 100dvh;
   }
 
   .sidebar.open {
@@ -3507,7 +3544,8 @@ details[open] > summary .details-chevron {
     height: 100%;
   }
 
-  .pane-resizer {
+  .pane-resizer,
+  .sidebar-resizer {
     display: none;
   }
 
@@ -3581,8 +3619,26 @@ details[open] > summary .details-chevron {
     display: inline-flex;
   }
 
-  .brand .mobile-only {
-    margin-left: auto;
+  .sidebar .brand {
+    flex: 0 0 60px;
+    height: auto;
+    gap: 8px;
+    padding: 8px;
+  }
+
+  .sidebar[data-header-collapsed="true"] .brand {
+    flex-basis: 49px;
+    padding-block: 2px 3px;
+  }
+
+  .sidebar .brand-mark {
+    display: none;
+  }
+
+  .sidebar .brand .mobile-only {
+    width: 44px;
+    height: 44px;
+    flex-shrink: 0;
   }
 
   .workspace-header {
@@ -3606,6 +3662,134 @@ details[open] > summary .details-chevron {
 
   .desktop-label {
     display: none;
+  }
+}
+
+@media (max-width: 600px) {
+  .sidebar {
+    width: 100%;
+    border-right: 0;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+    box-shadow: none;
+  }
+
+  .sidebar .brand span,
+  .session-quick-actions .new-session-button span,
+  .session-browse-controls .sidebar-label {
+    display: none;
+  }
+
+  .sidebar .brand .icon-button {
+    width: 44px;
+    height: 44px;
+    flex-shrink: 0;
+  }
+
+  .session-quick-actions,
+  .session-browse-controls {
+    display: grid;
+    flex-shrink: 0;
+    gap: 8px;
+    padding: 0 12px 8px;
+  }
+
+  .session-quick-actions {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .session-quick-actions > button {
+    justify-content: center;
+    min-width: 0;
+    min-height: 44px;
+    margin: 0;
+    padding: 8px;
+    font-size: 13px;
+  }
+
+  .session-quick-actions > button svg,
+  .session-browse-controls svg {
+    flex-shrink: 0;
+  }
+
+  .session-browse-controls {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .session-browse-controls .session-search {
+    min-width: 0;
+    min-height: 44px;
+    margin: 0;
+    padding: 8px;
+  }
+
+  .session-browse-controls input {
+    font-size: 16px;
+  }
+
+  .session-browse-controls .session-list-controls {
+    padding: 0;
+  }
+
+  .session-browse-controls select {
+    max-width: 100%;
+    min-height: 44px;
+    font-size: 16px;
+  }
+
+  .sidebar .session-group-items {
+    margin-left: 2px;
+    padding-left: 2px;
+  }
+
+  .sidebar .session-group-heading {
+    min-height: 44px;
+  }
+
+  .sidebar .session-expander {
+    flex-basis: 44px;
+    min-height: 44px;
+  }
+
+  .sidebar .session-open {
+    min-height: 44px;
+  }
+
+  .sidebar .session-main strong {
+    font-size: 13px;
+  }
+
+  .sidebar .session-tags i {
+    font-size: 9px;
+  }
+
+  .sidebar .session-item .session-action {
+    display: grid;
+    place-items: center;
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  .sidebar .session-item.active {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .sidebar .session-item.active .session-meta {
+    display: contents;
+  }
+
+  .sidebar .session-item.active .session-meta-time {
+    align-self: start;
+  }
+
+  .sidebar .session-item.active .session-row-actions {
+    grid-column: 1 / -1;
+    max-width: none;
+  }
+
+  .sidebar .daemon-state {
+    flex-shrink: 0;
+    min-height: 44px;
   }
 }
 

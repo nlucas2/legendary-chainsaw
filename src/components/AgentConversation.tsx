@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, Send } from "lucide-react";
 import { daemonInvoke } from "../lib/daemon";
+import { submitsComposer } from "../lib/composerInput";
+import { useMobileInput } from "../lib/useMobileInput";
 import { agentEventMatches, agentRootEvents, type AgentHistory, type AgentTask } from "../lib/agentTasks";
 import { mergeHistoryEvents } from "../lib/history";
 import type { SessionEvent, SessionSummary } from "../lib/types";
@@ -38,6 +40,7 @@ export function AgentConversation({
   const [revision, setRevision] = useState(0);
   const [notice, setNotice] = useState("");
   const [inputError, setInputError] = useState("");
+  const mobileInput = useMobileInput();
   const mounted = useRef(false);
   const scroll = useRef<HTMLDivElement>(null);
   const follow = useRef(true);
@@ -150,14 +153,14 @@ export function AgentConversation({
             setInputError("Direct subagent messages currently support text only; attachments are not supported by this runtime API.");
           }
         }}
-        placeholder={`Message ${effective.name}...`} disabled={!!unavailable} rows={2}
+        placeholder={`Message ${effective.name}...`} disabled={!!unavailable} rows={2} enterKeyHint={mobileInput ? "enter" : "send"}
         onKeyDown={(event) => {
-          if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+          if (submitsComposer({ ...event, isComposing: event.nativeEvent.isComposing }, mobileInput)) {
             event.preventDefault(); event.currentTarget.form?.requestSubmit();
           }
         }} />
       <div className="composer-footer">
-        <small>Direct subagent message · Enter to send · Shift+Enter for newline</small>
+        <small>Direct subagent message · {mobileInput ? "Enter for newline · tap Send" : "Enter to send · Shift+Enter for newline"}</small>
         <button className="send-button" type="submit" aria-label={`Send to ${effective.name}`}
           disabled={busy || !!unavailable || !text.trim()}><Send size={15} /></button>
       </div>

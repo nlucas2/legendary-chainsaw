@@ -69,6 +69,9 @@ Mobile/web browser ──┘                                  │
   turn for this browser/desktop client. It applies immediately and after reload, but does not
   change already queued work. The composer dropdown is a temporary override for the current window;
   Ctrl+Q and Ctrl+Enter still explicitly queue or steer a single submission.
+  On phones, touch-first devices, and the narrow mobile layout, Enter inserts a new line;
+  tap **Send** to submit. This also applies to subagent messages and the transient Ask panel.
+  Desktop Enter/Shift+Enter and explicit Ctrl/Cmd+Enter shortcuts keep their existing behavior.
   Selected files and pasted images are
   sent as SDK attachments only when the message is submitted. Draft text and files stay together
   per session while the client remains open; failed sends are restored or retained as separate unsent
@@ -108,11 +111,26 @@ Mobile/web browser ──┘                                  │
   offer Undo. An already-open archived conversation stays open with a Restore button.
   Folder groups have subtle separators and indentation; sessions outside a folder have an explicit,
   collapsible **Unfiled** group rather than appearing to belong to the preceding folder.
+  On phones, sessions use the full available viewport, with compact side-by-side action and search
+  controls to leave more room for the list. The close control stays in the menu's top-left position.
+  Session names and working directories wrap to the available width rather than being shortened
+  for a narrow sidebar; folder badges appear only in the mixed-folder Pinned group.
+  On desktop, drag the sidebar's right edge to resize it;
+  the width is remembered per browser/device and adapts to leave room for chat and the terminal.
+  Focus the divider and use Left/Right (Shift for larger steps), Home/End for its limits, or
+  double-click/press Enter to restore the responsive default.
+  Use **Collapse chat header** to keep just one compact row with the session title, activity dot,
+  and mobile menu. **Expand chat header** restores model/CWD details, tools, and history information.
+  This preference is saved per browser/device. Active catch-up progress, errors, and approval
+  requests remain visible even when the header is collapsed.
   A small sidebar dot shows attached session activity: pulsing accent color for **Working**,
   steady green for **Idle**, and hollow for **Not attached** or **Status unavailable** (hover for
   details). Live events update sessions even when another chat is selected; bounded, read-only
   status polling restores state after reconnects or missed events without opening saved sessions.
-  Indicators reflect the main session's processing state; subagents retain their own statuses.
+  An amber dot means the parent is idle but its runtime-reported subagents are still working;
+  the header and composer show their count. This is a display distinction, not a busy parent
+  turn: queue/steer and stop behavior still follow actual parent processing. Subagent-status
+  failures are shown as unavailable rather than pretending the work is done.
   The pulse respects reduced-motion preferences.
 - **Scheduled tasks** in the sidebar runs a saved prompt once or daily. For a daily briefing, create
   a schedule, specify the skill and sources to review, choose a time/time zone, and leave
@@ -325,6 +343,8 @@ agnostic about how that listener is published or forwarded.
 
 Set `COPILOT_SESSIONS_TOKEN` before starting the daemon to require login. If binding directly to a
 non-loopback address, the daemon refuses to start unless this token is configured.
+Dev Tunnel authentication is separate: a `WWW-Authenticate: tunnel` challenge offers provider
+sign-in/reconnection, not the daemon-token form. No application token is created automatically.
 
 | Variable | Default | Purpose |
 |---|---|---|

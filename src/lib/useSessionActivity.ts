@@ -2,7 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { createSingleflightReader, errorMessage } from "./context";
 import { daemonInvoke } from "./daemon";
 import { createRequestLimiter } from "./requestLimiter";
-import { processingActivity, SessionActivityTracker, type SessionActivity } from "./sessionActivity";
+import { normalizeAgentTasks } from "./agentTasks";
+import { changesSubagentActivity, processingActivity, SessionActivityTracker, type SessionActivity } from "./sessionActivity";
 import type { DaemonEvent, SessionSummary } from "./types";
 
 interface ActivityRead {
@@ -37,7 +38,18 @@ export function useSessionActivity(sessions: SessionSummary[], connected: boolea
           try {
             const value = await daemonInvoke("session_processing", { sessionId },
               AbortSignal.any([signal, AbortSignal.timeout(5000)]));
-            return { version, activity: processingActivity(value) };
+            const activity = processingActivity(value);
+            if (activity.kind === "idle") {
+              try {
+                const tasks = normalizeAgentTasks(await daemonInvoke("agent_tasks", { sessionId },
+                  AbortSignal.any([signal, AbortSignal.timeout(5000)])), sessionId);
+                activity.runningSubagents = tasks.tasks.filter((task) => task.status === "running").length;
+              } catch (cause) {
+                if (signal.aborted) throw cause;
+                activity.subagentError = `The parent is idle, but subagent activity could not be read: ${errorMessage(cause)}`;
+              }
+            }
+            return { version, activity };
           } catch (cause) {
             if (signal.aborted) throw cause;
             return { version, activity: { kind: "unknown", reason: `Session status unavailable: ${errorMessage(cause)}` } };
@@ -85,6 +97,9 @@ export function useSessionActivity(sessions: SessionSummary[], connected: boolea
       if (tracker.invalidate(event.sessionId)) publish();
     } else if (event.type === "session_event" && readers.current.has(event.sessionId)) {
       if (tracker.observe(event.sessionId, event.event)) publish();
+      if (!document.hidden && (changesSubagentActivity(event.event) || event.event.type === "session.idle")) {
+        void readers.current.get(event.sessionId)?.refresh();
+      }
     }
   }, [tracker, publish]);
 

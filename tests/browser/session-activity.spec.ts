@@ -22,6 +22,8 @@ async function setup(page: Page, options: { gate?: Promise<void>; count?: number
   const state = {
     processing: Object.fromEntries(sessions.map((session) => [session.sessionId, session.sessionId === "a"])),
     failures: {} as Record<string, string>,
+    taskFailures: {} as Record<string, string>,
+    tasks: {} as Record<string, { id: string; name: string; agentType: string; toolCallId: string; status: string; canMessage: boolean }[]>,
     malformed: new Set<string>(),
     requests: [] as { command: string; sessionId: string }[],
     activeReads: 0,
@@ -63,6 +65,9 @@ async function setup(page: Page, options: { gate?: Promise<void>; count?: number
       case "resume_session": result = sessions.find((session) => session.sessionId === args.sessionId); break;
       case "runtime_status": result = { connected: true, acceptingWork: true, activeSessions: sessions.filter((session) => session.isActive).length }; break;
       case "session_state": result = { sessionId: args.sessionId, processing: state.processing[args.sessionId], mode: "interactive" }; break;
+      case "agent_tasks":
+        if (state.taskFailures[args.sessionId]) return route.fulfill({ status: 500, body: state.taskFailures[args.sessionId] });
+        result = { sessionId: args.sessionId, tasks: state.tasks[args.sessionId] ?? [] }; break;
       case "session_processing": {
         const value = state.processing[args.sessionId];
         state.activeReads++;
@@ -186,4 +191,54 @@ test("background activity reads stay bounded for many attached sessions", async 
   await expect(page.locator(".session-activity-dot.idle")).toHaveCount(11);
   expect(state.maxReads).toBeLessThanOrEqual(4);
   expect(state.requests.filter((request) => request.command === "resume_session")).toHaveLength(1);
+});
+
+test("idle parents show running subagents in sidebar, full and compact headers, and composer without becoming busy", async ({ page }) => {
+  const { state, emit } = await setup(page);
+  state.tasks.a = [
+    { id: "task-one", name: "Builder", agentType: "task", toolCallId: "call-one", status: "running", canMessage: true },
+    { id: "task-two", name: "Reviewer", agentType: "task", toolCallId: "call-two", status: "running", canMessage: true },
+    { id: "task-three", name: "Idle agent", agentType: "task", toolCallId: "call-three", status: "idle", canMessage: true },
+  ];
+  state.processing.a = false;
+  await emit(liveEvent("a", "session.idle"));
+  const dot = page.locator("[data-session-id='a'] .session-activity-dot");
+  await expect(dot).toHaveAttribute("aria-label", "2 subagents working");
+  await expect(page.locator(".session-context .session-activity")).toHaveText("2 subagents working");
+  await expect(page.locator(".composer-status")).toContainText("Parent idle · 2 subagents working");
+  await expect(page.getByRole("button", { name: "Fork conversation", exact: true })).toBeEnabled();
+  await expect(page.locator(".composer-status").getByRole("button", { name: "Stop", exact: true })).toHaveCount(0);
+  await page.getByRole("button", { name: "Collapse chat header" }).click();
+  await expect(page.locator(".compact-session-activity")).toHaveAttribute("aria-label", "2 subagents working");
+  state.tasks.a[0].status = "completed";
+  await emit({ ...liveEvent("a", "subagent.completed", "unrelated-event-identity"),
+    event: { ...liveEvent("a", "subagent.completed").event, data: { toolCallId: "call-one" } } });
+  await expect(dot).toHaveAttribute("aria-label", "1 subagent working");
+  state.processing.a = true;
+  await emit(liveEvent("a", "assistant.turn_start"));
+  await expect(dot).toHaveAttribute("aria-label", "Working");
+  await expect(page.locator(".compact-session-activity")).toHaveAttribute("aria-label", "Copilot working");
+  state.tasks.a[1].status = "failed";
+  state.processing.a = false;
+  await emit(liveEvent("a", "session.idle"));
+  await expect(dot).toHaveAttribute("aria-label", "Idle");
+  expect(state.requests.some((request) => request.command === "agent_tasks" && request.sessionId === "cold")).toBe(false);
+  expect(state.requests.filter((request) => request.command === "resume_session")).toHaveLength(1);
+});
+
+test("subagent counts recover on reload and failures never pretend all child work is done", async ({ page }) => {
+  const { state, emit } = await setup(page);
+  state.processing.a = false;
+  state.tasks.a = [{ id: "one", name: "Builder", agentType: "task", toolCallId: "invocation", status: "running", canMessage: true }];
+  await page.reload();
+  const dot = page.locator("[data-session-id='a'] .session-activity-dot");
+  await expect(dot).toHaveAttribute("aria-label", "1 subagent working");
+  state.taskFailures.a = "Subagent lookup unavailable";
+  await emit(liveEvent("a", "subagent.completed"));
+  await expect(dot).toHaveAttribute("aria-label", "Subagent status unavailable");
+  await expect(dot).toHaveAttribute("title", /Subagent lookup unavailable/);
+  state.taskFailures.a = "";
+  state.tasks.a = [];
+  await emit(liveEvent("a", "task.updated"));
+  await expect(dot).toHaveAttribute("aria-label", "Idle");
 });
