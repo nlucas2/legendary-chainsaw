@@ -313,6 +313,7 @@ function App() {
   const [newSessionOpen, setNewSessionOpen] = useState(false);
   const [newSessionProfile, setNewSessionProfile] = useState<NewSessionProfileChoice>(DEFAULT_PROFILE_CHOICE);
   const [newCwd, setNewCwd] = useState("");
+  const [newSessionName, setNewSessionName] = useState("");
   const [newModel, setNewModel] = useState(DEFAULT_MODEL);
   const [newReasoningEffort, setNewReasoningEffort] = useState("");
   const [newReasoningSummary, setNewReasoningSummary] =
@@ -1167,6 +1168,7 @@ function App() {
     try {
       const session = await daemonInvoke<SessionSummary>("create_session", {
         cwd: newCwd.trim(),
+        ...(newSessionName.trim() ? { name: newSessionName.trim() } : {}),
         model: newModel || null,
         reasoningEffort: newReasoningEffort || null,
         reasoningSummary: newReasoningSummary,
@@ -1724,6 +1726,7 @@ function App() {
 
   function openNewSession() {
     if (createSessionPendingRef.current) return;
+    setNewSessionName("");
     setNewSessionProfile(DEFAULT_PROFILE_CHOICE);
     setCreationError("");
     setNewCwd(trackedCwd || activeSession?.cwd || "");
@@ -2970,6 +2973,12 @@ function App() {
                   ? "Tracking the terminal's current directory."
                   : "Copilot tools resolve relative paths from here."}
               </small>
+            </label>
+            <label>
+              Session name (optional)
+              <input aria-label="Session name (optional)" value={newSessionName} maxLength={100}
+                disabled={creatingSession} onChange={(event) => setNewSessionName(event.currentTarget.value)}
+                placeholder="Leave blank for the default name" />
             </label>
             <label>
               Model

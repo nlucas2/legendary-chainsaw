@@ -150,6 +150,7 @@ pub struct SessionSummary {
 #[serde(rename_all = "camelCase")]
 pub struct NewSession {
     pub cwd: String,
+    pub name: Option<String>,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub reasoning_summary: Option<String>,
@@ -754,6 +755,8 @@ impl SessionService {
         let _lifecycle = self.lifecycle_gate.read().await;
         self.require_accepting_work()?;
         validate_cwd(&request.cwd)?;
+        let name = request.name.as_deref().map(str::trim).filter(|name| !name.is_empty())
+            .map(session_actions::validate_name).transpose()?;
         let mut config = SessionConfig::default()
             .with_working_directory(&request.cwd)
             .with_streaming(true)
@@ -801,7 +804,7 @@ impl SessionService {
                 reasoning_effort: request.reasoning_effort.clone(),
                 reasoning_summary: request.reasoning_summary.clone(),
                 context_tier: request.context_tier.clone(),
-                title: None,
+                title: name.clone(),
                 pinned: false,
                 archived: false,
                 folder: None,
@@ -819,6 +822,7 @@ impl SessionService {
             return self.attach_deferred(session).await;
         }
         self.attach(session).await?;
+        self.sync_initial_session_name(&id).await?;
         self.initialize_environment(&id).await?;
         self.refresh_model(&id).await?;
         let metadata = self.metadata.read().await;
@@ -826,7 +830,7 @@ impl SessionService {
         let model = local.and_then(|meta| meta.model.clone());
         let summary = SessionSummary {
             session_id: id,
-            title: "New session".to_string(),
+            title: name.unwrap_or_else(|| "New session".to_string()),
             start_time: String::new(),
             modified_time: String::new(),
             cwd: Some(request.cwd),

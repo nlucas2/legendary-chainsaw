@@ -3,13 +3,14 @@ import type { SessionInitialization } from "../../src/lib/types";
 
 async function setup(page: Page) {
   const session = (sessionId: string, initialization?: SessionInitialization) => ({
-    sessionId, title: sessionId === "new" ? "New session" : "Existing session", cwd: "Q:\\example",
+    sessionId, title: sessionId === "new" ? state.createdName || "New session" : "Existing session", cwd: "Q:\\example",
     model: "requested-model", isActive: sessionId === "new" ? state.attached : true, isRemote: false, archived: false, pinned: false,
     tags: [], startTime: "", modifiedTime: "", initialization,
   });
   const state = {
     initialization: { phase: "initializing", stage: "tools" } as SessionInitialization,
     created: false, legacy: false, invalid: false, attached: true, resumeReady: false,
+    createdName: "",
     holdStatus: false, held: [] as Route[],
     holdCreate: false, heldCreates: [] as Route[],
     holdLists: false, heldLists: [] as Route[], omitCreated: false, staleAttachment: false,
@@ -53,6 +54,7 @@ async function setup(page: Page) {
         } else result = session(args.sessionId, args.sessionId === "new" ? state.initialization : undefined);
         break;
       case "create_session":
+        state.createdName = typeof args.name === "string" ? args.name : "";
         if (state.holdCreate) { state.heldCreates.push(route); return; }
         state.created = true;
         result = session("new", state.legacy ? undefined : state.initialization);
@@ -100,6 +102,52 @@ async function setup(page: Page) {
   } })));
   return { state, create, emit, snapshot, session, refreshList };
 }
+
+test("optional creation name appears immediately and survives warmup, navigation, and reload", async ({ page }) => {
+  const { state, emit } = await setup(page);
+  await page.getByRole("button", { name: /New session/ }).first().click();
+  const dialog = page.getByRole("dialog", { name: "New session", exact: true });
+  const name = dialog.getByRole("textbox", { name: "Session name (optional)", exact: true });
+  await expect(name).toHaveValue("");
+  await expect(name).toHaveAttribute("maxlength", "100");
+  await name.fill("  My new investigation  ");
+  await dialog.getByRole("button", { name: "Create session", exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "My new investigation", exact: true })).toBeVisible();
+  await expect(page.locator("[data-session-id='new'] .session-main strong")).toHaveText("My new investigation");
+  await expect(page.locator(".session-startup")).toContainText("Initializing");
+  await page.locator("[data-session-id='old'] .session-open").click();
+  await page.locator("[data-session-id='new'] .session-open").click();
+  await expect(page.getByRole("heading", { name: "My new investigation", exact: true })).toBeVisible();
+  state.initialization = { phase: "ready", stage: "ready" };
+  await emit();
+  await expect(page.locator(".session-startup")).toHaveCount(0);
+  await page.reload();
+  await expect(page.locator("[data-session-id='new'] .session-main strong")).toHaveText("My new investigation");
+  await page.locator("[data-session-id='new'] .session-open").click();
+  await expect(page.getByRole("heading", { name: "My new investigation", exact: true })).toBeVisible();
+  expect(state.requests.filter((request) => request.command === "create_session").map((request) => request.args.name)).toEqual(["My new investigation"]);
+  expect(state.requests.some((request) => ["rename_session", "send_message"].includes(request.command))).toBe(false);
+  await page.getByRole("button", { name: /New session/ }).first().click();
+  await expect(dialog.getByRole("textbox", { name: "Session name (optional)", exact: true })).toHaveValue("");
+});
+
+test("blank optional creation name keeps default naming and creation errors retain the entered name", async ({ page }) => {
+  const { state, create } = await setup(page);
+  await create();
+  expect(state.requests.find((request) => request.command === "create_session")!.args).not.toHaveProperty("name");
+  await page.getByRole("button", { name: /New session/ }).first().click();
+  const dialog = page.getByRole("dialog", { name: "New session", exact: true });
+  const name = dialog.getByRole("textbox", { name: "Session name (optional)", exact: true });
+  await name.fill("Keep this after failure");
+  state.holdCreate = true;
+  await dialog.getByRole("button", { name: "Create session", exact: true }).click();
+  await expect(name).toBeDisabled();
+  await expect.poll(() => state.heldCreates.length).toBe(1);
+  await state.heldCreates[0].fulfill({ status: 500, body: "Native creation failed" });
+  await expect(name).toBeEnabled();
+  await expect(name).toHaveValue("Keep this after failure");
+});
 
 test("new workspace opens before warmup completes without a second resume or empty-history read", async ({ page }) => {
   const { state, create, emit } = await setup(page);

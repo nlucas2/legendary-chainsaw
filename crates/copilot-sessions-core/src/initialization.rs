@@ -213,7 +213,7 @@ impl SessionService {
                 .ok_or_else(|| ServiceError::SessionNotActive(id.clone()))?;
             let summary = SessionSummary {
                 session_id: id.clone(),
-                title: "New session".into(),
+                title: meta.title.clone().unwrap_or_else(|| "New session".into()),
                 start_time: String::new(),
                 modified_time: String::new(),
                 cwd: meta.cwd.clone(),
@@ -462,6 +462,7 @@ impl SessionService {
 
     async fn initialize_deferred(&self, id: &str, run: &Arc<InitializationRun>) -> Result<()> {
         self.require_accepting_work()?;
+        self.sync_initial_session_name(id).await?;
         let client = self.client().await?;
         let params = Some(serde_json::json!({ "sessionId": id }));
         let started = Instant::now();

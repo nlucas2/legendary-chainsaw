@@ -71,6 +71,73 @@ fn new_session(deferred: bool) -> NewSession {
         })).unwrap()
     }
 
+    #[tokio::test]
+    async fn creation_name_is_persisted_and_published_before_native_name_sync_finishes() {
+        let runtime = mock_runtime();
+        runtime.hold("session.name.set");
+        let mut request = new_session(true);
+        request.name = Some("  Focused review  ".into());
+        let created = runtime.service.create_session(request).await.unwrap();
+        let id = created.session_id.clone();
+        assert_eq!(created.title, "Focused review");
+        assert_eq!(created.initialization.unwrap().phase, InitializationPhase::Initializing);
+        assert_eq!(load_metadata(&runtime.service.metadata_path)[&id].title.as_deref(), Some("Focused review"));
+        assert_eq!(runtime.service.list_sessions().await.unwrap().iter().find(|session| session.session_id == id).unwrap().title, "Focused review");
+        let naming = runtime.request("session.name.set", 1).await;
+        assert_eq!(naming["params"]["name"], "Focused review");
+        runtime.hold("session.name.get");
+        runtime.reply(&naming, json!({})).await;
+        let get = runtime.request("session.name.get", 1).await;
+        runtime.reply(&get, json!({"name":"Focused review"})).await;
+        initialization_phase(&runtime, &id, InitializationPhase::Ready).await;
+        assert_eq!(runtime.service.session_initialization(&id).await.unwrap().session.unwrap().title, "Focused review");
+        assert_eq!(runtime.requests("session.create").len(), 1);
+        assert!(runtime.requests("session.send").is_empty());
+    }
+
+    #[tokio::test]
+    async fn creation_name_sync_failure_retries_same_session_without_losing_local_name() {
+        let runtime = mock_runtime();
+        runtime.hold("session.name.set");
+        let mut request = new_session(true);
+        request.name = Some("Retry this name".into());
+        let created = runtime.service.create_session(request).await.unwrap();
+        let call = runtime.request("session.name.set", 1).await;
+        runtime.inject(json!({"jsonrpc":"2.0","id":call["id"],"error":{"code":-32000,"message":"Name temporarily unavailable"}})).await;
+        initialization_phase(&runtime, &created.session_id, InitializationPhase::Failed).await;
+        assert_eq!(load_metadata(&runtime.service.metadata_path)[&created.session_id].title.as_deref(), Some("Retry this name"));
+        runtime.held_methods.lock().unwrap().remove("session.name.set");
+        runtime.service.retry_session_initialization(&created.session_id).await.unwrap();
+        initialization_phase(&runtime, &created.session_id, InitializationPhase::Ready).await;
+        assert_eq!(runtime.requests("session.name.set").len(), 2);
+        assert_eq!(runtime.requests("session.create").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn creation_name_supports_synchronous_creation_and_blank_default() {
+        let runtime = mock_runtime();
+        let mut named = new_session(false);
+        named.name = Some("Named conversation".into());
+        let created = runtime.service.create_session(named).await.unwrap();
+        assert_eq!(created.title, "Named conversation");
+        assert_eq!(runtime.requests("session.name.set")[0]["params"]["name"], "Named conversation");
+        let mut blank = new_session(false);
+        blank.name = Some(" \t ".into());
+        assert_eq!(runtime.service.create_session(blank).await.unwrap().title, "New session");
+        assert_eq!(runtime.requests("session.name.set").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn creation_name_validation_rejects_invalid_names_before_native_creation() {
+        let runtime = mock_runtime();
+        for name in ["x".repeat(101), "line\nbreak".into(), "\u{1f680}".repeat(51)] {
+            let mut request = new_session(true);
+            request.name = Some(name);
+            assert!(matches!(runtime.service.create_session(request).await, Err(ServiceError::InvalidArgument(_))));
+        }
+        assert!(runtime.requests("session.create").is_empty());
+    }
+
     async fn scheduled_event(runtime: &MockRuntime, sid: &str, kind: &str, agent: Option<&str>, data: Value) {
         runtime.inject(json!({
             "jsonrpc":"2.0", "method":"session.event",
@@ -966,6 +1033,7 @@ fn mock_runtime_with_mcp(mcp: bool) -> MockRuntime {
     let runtime_held_methods = held_methods.clone();
     let task = tokio::spawn(async move {
         let mut read = BufReader::new(read);
+        let mut names = HashMap::<String, Value>::new();
         let mut modes = HashMap::<String, Value>::new();
         let mut profile_mcp = HashMap::<String, Value>::new();
         let mut excluded = HashMap::<String, Vec<Value>>::new();
@@ -997,6 +1065,11 @@ fn mock_runtime_with_mcp(mcp: bool) -> MockRuntime {
                 continue;
             }
             let result = match method {
+                "session.name.set" => {
+                    names.insert(sid.into(), request["params"]["name"].clone());
+                    json!({})
+                }
+                "session.name.get" => json!({"name":names.get(sid)}),
                 "session.list" => json!({"sessions":[]}),
                 "session.create" => {
                     if let Some(servers) = request["params"].get("mcpServers") {
@@ -1404,6 +1477,7 @@ async fn newly_created_sessions_have_editable_known_app_defaults() {
         .service
         .create_session(NewSession {
             cwd: ".".into(),
+            name: None,
             model: None,
             reasoning_effort: None,
             reasoning_summary: None,
@@ -1495,6 +1569,7 @@ async fn concurrent_session_creation_is_rejected_before_reaching_the_runtime() {
         .service
         .create_session(NewSession {
             cwd: ".".into(),
+            name: None,
             model: None,
             reasoning_effort: None,
             reasoning_summary: None,

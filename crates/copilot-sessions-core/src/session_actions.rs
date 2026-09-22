@@ -34,7 +34,7 @@ pub struct RenameSessionRequest {
     pub name: String,
 }
 
-fn validate_name(name: &str) -> Result<String> {
+pub(crate) fn validate_name(name: &str) -> Result<String> {
     let name = name.trim();
     if name.is_empty() || name.encode_utf16().count() > 100 || name.chars().any(char::is_control) {
         return Err(ServiceError::InvalidArgument(
@@ -44,7 +44,24 @@ fn validate_name(name: &str) -> Result<String> {
     Ok(name.to_owned())
 }
 
+async fn set_native_name(session: &github_copilot_sdk::session::Session, name: &str) -> Result<()> {
+    session.rpc().name().set(NameSetRequest { name: name.into() }).await?;
+    if session.rpc().name().get().await?.name.as_deref() != Some(name) {
+        return Err(ServiceError::CommandFailed("Native rename did not persist the requested name.".into()));
+    }
+    Ok(())
+}
+
 impl SessionService {
+    pub(crate) async fn sync_initial_session_name(&self, session_id: &str) -> Result<()> {
+        let name = self.metadata.read().await.get(session_id).and_then(|meta| meta.title.clone());
+        if let Some(name) = name {
+            let session = self.attached_session(session_id).await?;
+            set_native_name(&session, &name).await?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn allow_new_work_recovery(&self, session_id: &str) -> Result<()> {
         let changed = {
             let mut metadata = self.metadata.write().await;
@@ -241,16 +258,7 @@ impl SessionService {
             service.require_accepting_work()?;
             let session = service.session(&request.session_id).await?;
             let mut summary = service.action_summary(&request.session_id).await?;
-            session
-                .rpc()
-                .name()
-                .set(NameSetRequest { name: name.clone() })
-                .await?;
-            if session.rpc().name().get().await?.name.as_deref() != Some(&name) {
-                return Err(ServiceError::CommandFailed(
-                    "Native rename did not persist the requested name.".into(),
-                ));
-            }
+            set_native_name(&session, &name).await?;
             let mut metadata = service.metadata.write().await;
             let meta = metadata
                 .entry(request.session_id.clone())

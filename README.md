@@ -11,6 +11,9 @@ Creation progress is visible before the native session ID arrives. Once created,
 is revealed in **Unfiled**, stays near the top while native timestamps catch up, and survives stale
 sidebar refreshes. You can switch away and return while initialization continues, without
 starting another resume or waiting for background history/permission reads to finish.
+**New session → Session name (optional)** names the conversation immediately in the workspace
+and sidebar. Names are saved locally and synchronized to Copilot during initialization; leaving
+the field blank keeps the default naming behavior. You can still rename the session later.
 Failures keep the created session open with a same-session **Retry initialization** action.
 This avoids a redundant resume/history load for an empty new session; the initial SDK creation
 itself can still take time.

@@ -51,6 +51,7 @@ impl SessionService {
         let session = self
             .create_session(NewSession {
                 cwd,
+                name: None,
                 model,
                 reasoning_effort: None,
                 reasoning_summary: None,
