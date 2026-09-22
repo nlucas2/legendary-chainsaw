@@ -8,16 +8,21 @@ import {
   Puzzle,
   Search,
   ListTodo,
+  Layers,
   Wrench,
   X,
 } from "lucide-react";
 import type { SessionReferences } from "../lib/types";
 import type { SessionEvent } from "../lib/types";
 import { ContextToolsPanel } from "./ContextToolsPanel";
+import { SessionSkillsPanel } from "./SessionSkillsPanel";
+import { SessionProfilePanel } from "./SessionProfilePanel";
+import type { SessionProfileStatus } from "../lib/profiles";
 import { paginate } from "../lib/context";
 
 export interface ReferenceDrawerProps {
   sessionId?: string;
+  cwd?: string;
   revision?: number;
   references: SessionReferences | null;
   loading: boolean;
@@ -28,6 +33,11 @@ export interface ReferenceDrawerProps {
   sectionLoading: ReferenceSectionName | "";
   subagentEvents: SessionEvent[];
   onCancelTask: (action: TaskCancelAction) => void;
+  profileStatus?: SessionProfileStatus | null;
+  profileError?: string;
+  onProfileStatus?: (status: SessionProfileStatus) => void;
+  onRefreshProfile?: () => void;
+  onManageProfiles?: () => void;
 }
 
 type ReferenceItem = {
@@ -38,7 +48,8 @@ type ReferenceItem = {
     | "tool"
     | "instruction"
     | "context"
-    | "task";
+    | "task"
+    | "profile";
   name: string;
   description?: string;
   detail?: unknown;
@@ -63,6 +74,7 @@ export type ReferenceSectionName =
 
 const kindMeta = {
   context: { label: "Context", icon: Braces },
+  profile: { label: "Profile", icon: Layers },
   tool: { label: "Tools", icon: Wrench },
   task: { label: "Tasks", icon: ListTodo },
   command: { label: "Commands", icon: Command },
@@ -73,7 +85,6 @@ const kindMeta = {
 
 const directSections: Partial<Record<ReferenceItem["kind"], ReferenceSectionName>> = {
   command: "commands",
-  skill: "skills",
   mcp: "mcp",
   instruction: "instructions",
   task: "tasks",
@@ -81,6 +92,7 @@ const directSections: Partial<Record<ReferenceItem["kind"], ReferenceSectionName
 
 export function ReferenceDrawer({
   sessionId,
+  cwd,
   revision = 0,
   references,
   loading,
@@ -91,6 +103,11 @@ export function ReferenceDrawer({
   sectionLoading,
   subagentEvents,
   onCancelTask,
+  profileStatus,
+  profileError = "",
+  onProfileStatus,
+  onRefreshProfile,
+  onManageProfiles,
 }: ReferenceDrawerProps) {
   const drawer = useRef<HTMLElement>(null);
   const tabId = useId();
@@ -114,7 +131,7 @@ export function ReferenceDrawer({
   }, [filter, items, query]);
   const page = paginate(matching, limit);
   const visible = page.items;
-  const ownPanel = filter === "context" || filter === "tool";
+  const ownPanel = filter === "context" || filter === "tool" || filter === "skill" || filter === "profile";
   const direct = directSections[filter];
   const section = direct ? references?.[direct] : undefined;
   const waiting = loading || Boolean(direct && (!references || (section?.value === undefined && !section?.error) || sectionLoading === direct));
@@ -205,7 +222,15 @@ export function ReferenceDrawer({
         })}
       </div>
       <div className="reference-list" role="tabpanel" id={`${tabId}-panel`} aria-labelledby={`${tabId}-${filter}`}>
-        {ownPanel ? <ContextToolsPanel key={sessionId ?? "no-session"} sessionId={sessionId} revision={revision}
+        {filter === "profile" ? sessionId && onProfileStatus && onRefreshProfile && onManageProfiles
+          ? <SessionProfilePanel key={sessionId} sessionId={sessionId} cwd={cwd ?? ""} status={profileStatus ?? null}
+              statusError={profileError} onStatus={onProfileStatus} onRefresh={onRefreshProfile} onManage={onManageProfiles} />
+          : <p className="reference-placeholder">Select a session to manage its profile.</p>
+          : filter === "skill" ? sessionId
+          ? <SessionSkillsPanel key={sessionId} sessionId={sessionId} cwd={cwd} query={query} revision={revision}
+              refreshToken={refreshToken} onInsert={onInsert} />
+          : <p className="reference-placeholder">Select a session to read its skills.</p>
+          : ownPanel ? <ContextToolsPanel key={sessionId ?? "no-session"} sessionId={sessionId} revision={revision}
           tab={filter === "context" ? "context" : "tools"} query={query} refreshToken={refreshToken} /> : <>
         {waiting && (
           <div className="reference-placeholder" role="status">

@@ -216,6 +216,7 @@ impl MockRuntime {
             metadata_path: directory.join("metadata.json"),
             metadata: RwLock::new(metadata),
             metadata_write_gate: AsyncMutex::new(()),
+            profile_configuration: AsyncMutex::new(HashMap::new()),
         });
         for id in ["a", "b"] {
             let session = service

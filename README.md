@@ -7,6 +7,10 @@ processes, and event streams have one owner and remain available when an interfa
 New sessions open their workspace after native creation and attachment, without waiting for
 tool/MCP warm-up or model resolution. Initialization continues in the daemon with visible progress;
 you can draft immediately, but sending stays disabled until the session reports ready.
+Creation progress is visible before the native session ID arrives. Once created, the real session
+is revealed in **Unfiled**, stays near the top while native timestamps catch up, and survives stale
+sidebar refreshes. You can switch away and return while initialization continues, without
+starting another resume or waiting for background history/permission reads to finish.
 Failures keep the created session open with a same-session **Retry initialization** action.
 This avoids a redundant resume/history load for an empty new session; the initial SDK creation
 itself can still take time.
@@ -55,12 +59,48 @@ Mobile/web browser ──┘                                  │
   timings distinguish runtime/model latency from UI latency. Heavy diagnostic payloads are opt-in.
 - **Models** are resolved from the live session rather than labeled "default." The header opens the
   session-specific model catalog and switches via the Copilot runtime.
+- **Profiles and groups** are configured in Settings, not hardcoded launch aliases. Groups link
+  CLI-shaped MCP JSON files (`mcpServers`) and skill directories; profiles combine groups in an
+  explicit order. Existing linked files are read-only to the app. You can create new managed MCP
+  files or empty skill directories and choose a different profile-library directory on the daemon
+  computer. Switching library locations does not move or rewrite existing sources.
+  **New session → Session profile** resolves the selected stack before creation.
+  **Context → Profile** previews and applies a different stack to the same conversation.
+  Automatic user/repository discovery remains separate and additive; profiles are not sandboxes
+  or replacements for tool approvals. MCP name conflicts replace the whole earlier definition
+  with the later one and are shown in the preview. Skill directories keep their declared order;
+  native discovery determines which same-named skill wins.
+  **Apply profile now** succeeds only when the session is idle, including subagents, existing
+  native queued work, and pending input. Busy changes are rejected rather than queued: let the
+  work finish or use the existing Stop action, then explicitly try again.
+  Only that session is reconfigured; the shared daemon and terminals are not restarted.
+  During application, Send is disabled and the composer draft stays editable. Messages are not
+  accepted into a separate holding queue, and there is no profile-operation/message store.
+  Failures are shown explicitly; an unverified configuration blocks sending until repaired.
+  Changes to approved linked sources require another
+  preview rather than silently applying new definitions. MCP JSON and `SKILL.md` contents are
+  fingerprinted; auxiliary scripts/resources and automatically discovered sources are not frozen
+  snapshots. Existing conversation history, including
+  previously invoked skill instructions, remains part of the session.
 - **Context & Tools** shows runtime token attribution and session-scoped tool availability. Tool
   filters affect future offered tools, not in-flight execution; disabling an MCP server is separate
   from changing user-wide MCP configuration. The current tool list does not wait for full MCP
   catalogs: optional discovery uses a shared cache with bounded background requests and publishes updates
   through the daemon event bus. Slow or failing servers show warnings without hiding the controls.
   Reopening the drawer retains its last snapshot while refreshing authoritative state.
+- **Repository skills** use normal runtime configuration discovery when an app session is created
+  or resumed. With terminal **Track CWD** enabled, the recorded session directory follows the
+  terminal; the runtime can update its discovered repository skills on that directory change.
+  **Context → Skills** shows the runtime's actual session skill list, enabled/disabled state,
+  source, and path, rather than treating a global discovery catalog as active session state.
+  **Load skills from current directory** previews discoverable skill metadata; **Apply discovery
+  and reload** refreshes the selected idle session. This uses the same configuration policy as
+  create/resume and does not rewrite skill directories, disabled-skill selections, global config,
+  or other sessions. Normal discovery can also include supported user/repository instructions,
+  agents, and plugin sources; the preview is not a complete diff of those sources.
+  CWD changes invalidate pending previews, and active turns, background work, queued messages,
+  or pending approvals must finish before applying. Warnings and partial-load errors remain
+  visible. Reloading does not invoke skills or erase skill instructions already in chat history.
 - **Chat while working** supports FIFO queueing and explicit immediate steering. Queued messages can
   be edited, moved earlier, removed, or sent to the running turn. The queue uses compact preview rows
   with inline actions and a bounded scrolling list. Click its heading to collapse it to a count and

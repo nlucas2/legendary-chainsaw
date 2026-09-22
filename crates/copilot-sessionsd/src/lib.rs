@@ -358,6 +358,16 @@ async fn dispatch(state: &DaemonState, command: &str, body: Value) -> Result<Val
             request.validate_browser_attachments()?;
             json_result(service.submit_message(request).await?)
         }
+        "get_profile_library" => json_result(service.profile_library()?.snapshot()?),
+        "save_profile_group" => json_result(service.profile_library()?.save_group(decode(body)?)?),
+        "delete_profile_group" => json_result(service.profile_library()?.delete_group(decode(body)?)?),
+        "save_profile" => json_result(service.profile_library()?.save_profile(decode(body)?)?),
+        "delete_profile" => json_result(service.profile_library()?.delete_profile(decode(body)?)?),
+        "set_profile_library_directory" => json_result(service.profile_library()?.set_directory(decode(body)?)?),
+        "create_profile_source" => json_result(service.profile_library()?.create_source(decode(body)?)?),
+        "get_session_profile" => service.get_session_profile(&string_arg(&body, "sessionId")?).await,
+        "preview_session_profile" => service.preview_session_profile(decode(body)?).await,
+        "set_session_profile" => service.set_session_profile(decode(body)?).await,
         "session_state" => {
             let session_id = string_arg(&body, "sessionId")?;
             json_result(service.session_state(&session_id).await?)
@@ -445,6 +455,16 @@ async fn dispatch(state: &DaemonState, command: &str, body: Value) -> Result<Val
         "discover_skills" => {
             let session_id = string_arg(&body, "sessionId")?;
             json_result(service.discover_skills(&session_id).await?)
+        }
+        "session_skills" => {
+            let session_id = string_arg(&body, "sessionId")?;
+            json_result(service.session_skills(&session_id).await?)
+        }
+        "reload_session_skills" => {
+            json_result(service.reload_session_skills(decode(body)?).await?)
+        }
+        "preview_session_skills" => {
+            json_result(service.preview_session_skills(decode(body)?).await?)
         }
         "mcp_tools" => {
             let session_id = string_arg(&body, "sessionId")?;

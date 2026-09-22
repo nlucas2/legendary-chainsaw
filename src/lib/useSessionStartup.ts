@@ -33,6 +33,11 @@ export function useSessionStartup(session: SessionSummary | null, connected: boo
     return summary;
   }, [update]);
 
+  const reconcile = useCallback((summary: SessionSummary): SessionSummary => {
+    const known = current.current[summary.sessionId];
+    return known ? { ...summary, initialization: known.initialization } : summary;
+  }, []);
+
   const notify = useCallback((event: DaemonEvent) => {
     if (event.type === "runtime_status" && !event.status.connected) {
       for (const id of Object.keys(current.current)) generations.current.set(id, (generations.current.get(id) ?? 0) + 1);
@@ -98,7 +103,7 @@ export function useSessionStartup(session: SessionSummary | null, connected: boo
     } finally { operation.finish(id, token); }
   }
   return {
-    track, notify, status, retry, refresh: requestRefresh,
+    track, reconcile, notify, status, retry, refresh: requestRefresh,
     retrying: !!id && !!operation.operations.get(id),
     ready: !enabled || (connected && status?.verified === true && status.initialization.phase === "ready"),
   };

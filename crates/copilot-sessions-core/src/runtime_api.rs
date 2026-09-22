@@ -120,9 +120,11 @@ impl SessionService {
         crate::attachments::validate_attachments(&request.attachments, false)?;
         let _lifecycle = self.lifecycle_gate.read().await;
         self.require_accepting_work()?;
+        self.require_profile_ready(&request.session_id).await?;
         let gate = self.turn_gate(&request.session_id).await;
         let _guard = gate.lock().await;
         self.require_accepting_work()?;
+        self.require_profile_ready(&request.session_id).await?;
         let session = self.session(&request.session_id).await?;
         let mut options = MessageOptions::new(request.content)
             .with_mode(request.delivery_mode.unwrap_or(DeliveryMode::Enqueue))
@@ -165,6 +167,7 @@ impl SessionService {
         let gate = self.turn_gate(&request.session_id).await;
         let _guard = gate.lock().await;
         self.require_accepting_work()?;
+        self.require_profile_ready(&request.session_id).await?;
         let session = self.session(&request.session_id).await?;
         let mut result = session
             .rpc()
@@ -224,10 +227,14 @@ impl SessionService {
     pub async fn queue_action(&self, action: QueueAction) -> Result<Value> {
         let _lifecycle = self.lifecycle_gate.read().await;
         self.require_accepting_work()?;
-        self.session(action.session_id()).await?;
         let gate = self.turn_gate(action.session_id()).await;
         let _guard = gate.lock().await;
         self.require_accepting_work()?;
+        self.session(action.session_id()).await?;
+        if matches!(&action, QueueAction::SendNow { .. }) {
+            self.require_profile_ready(action.session_id()).await?;
+            self.last_submissions.write().await.insert(action.session_id().into(), tokio::time::Instant::now());
+        }
         let (method, params) = action.wire();
         Ok(self.client().await?.call(method, Some(params)).await?)
     }

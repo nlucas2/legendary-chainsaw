@@ -1,4 +1,4 @@
-import { Keyboard, Palette, Settings2, SlidersHorizontal, Wrench, X } from "lucide-react";
+import { Keyboard, Layers, Palette, Settings2, SlidersHorizontal, Wrench, X } from "lucide-react";
 import { useEffect, useId, useState } from "react";
 import {
   TYPOGRAPHY_LIMITS,
@@ -33,6 +33,7 @@ interface SettingsPanelProps {
   onDeliveryDefaultChange?: (value: MessageDelivery) => void;
   deliveryDefaultError?: string;
   onOpenShortcuts?: () => void;
+  onOpenProfiles?: () => void;
 }
 
 const schemes: {
@@ -74,6 +75,7 @@ export function SettingsPanel({
   onDeliveryDefaultChange,
   deliveryDefaultError,
   onOpenShortcuts,
+  onOpenProfiles,
 }: SettingsPanelProps) {
   return (
     <div className="settings-backdrop">
@@ -129,6 +131,13 @@ export function SettingsPanel({
           {chatWidthError && <p role="alert" className="typography-error">{chatWidthError}</p>}
         </div>
 
+        {onOpenProfiles && <div className="settings-section">
+          <button type="button" className="settings-navigation" onClick={onOpenProfiles}>
+            <span className="settings-navigation-icon"><Layers size={17} /></span>
+            <span><strong>Profiles and groups</strong><small>Compose MCP and skill sources; choose the library location</small></span>
+            <i>Open</i>
+          </button>
+        </div>}
         {typography && <TypographySection typography={typography} />}
 
         {onOpenShortcuts && <div className="settings-section">

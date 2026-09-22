@@ -56,6 +56,8 @@ impl SessionService {
                 reasoning_summary: None,
                 context_tier: None,
                 defer_initialization: true,
+                profile_id: None,
+                profile_revision: None,
             })
             .await?;
         {
@@ -93,6 +95,9 @@ impl SessionService {
     }
 
     async fn scheduled_busy_reason(&self, id: &str) -> Result<Option<String>> {
+        if self.require_profile_ready(id).await.is_err() {
+            return Ok(Some("Target session profile configuration is being applied or needs recovery".into()));
+        }
         self.session(id).await?;
         // Runtime processing may lag the immediately preceding acceptance.
         if self

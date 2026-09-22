@@ -149,6 +149,7 @@ impl SessionService {
         let gate = self.turn_gate(&request.session_id).await;
         let _guard = gate.lock().await;
         self.require_accepting_work()?;
+        self.require_profile_ready(&request.session_id).await?;
         let session = self.session(&request.session_id).await?;
         let task = self
             .parent_agent_task(&request.session_id, &request.task_id)
@@ -161,6 +162,7 @@ impl SessionService {
         }
         // Task IDs route messages; event agent IDs are a separate identity namespace.
         // Keep sent:false intact, including when an agent finishes during this RPC.
+        self.last_submissions.write().await.insert(request.session_id.clone(), tokio::time::Instant::now());
         Ok(session
             .rpc()
             .tasks()

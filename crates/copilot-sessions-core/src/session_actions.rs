@@ -62,7 +62,7 @@ impl SessionService {
         Ok(())
     }
 
-    async fn ask_gate(&self, session_id: &str) -> Arc<AsyncMutex<()>> {
+    pub(crate) async fn ask_gate(&self, session_id: &str) -> Arc<AsyncMutex<()>> {
         if let Some(gate) = self.ask_gates.read().await.get(session_id).cloned() {
             return gate;
         }
@@ -102,6 +102,7 @@ impl SessionService {
             let _query = gate;
             let _lifecycle = service.lifecycle_gate.read().await;
             service.require_accepting_work()?;
+            service.require_profile_ready(&request.session_id).await?;
             let session = service.session(&request.session_id).await?;
             let mut params = UIEphemeralQueryRequest::default();
             params.question = question;
@@ -132,6 +133,7 @@ impl SessionService {
                 .try_lock()
                 .map_err(|_| ServiceError::SessionProcessing(request.session_id.clone()))?;
             service.require_accepting_work()?;
+            service.require_profile_ready(&request.session_id).await?;
             service.session(&request.session_id).await?;
             if service.session_processing(&request.session_id).await? {
                 return Err(ServiceError::SessionProcessing(request.session_id));
@@ -183,6 +185,7 @@ impl SessionService {
                 reasoning_effort: source_meta.reasoning_effort,
                 reasoning_summary: source_meta.reasoning_summary,
                 context_tier: source_meta.context_tier,
+                profile: source_meta.profile,
                 title: Some(title.clone()),
                 prevent_pending_work: true,
                 ..StoredSessionMeta::default()

@@ -11,6 +11,9 @@ async function setup(page: Page) {
     initialization: { phase: "initializing", stage: "tools" } as SessionInitialization,
     created: false, legacy: false, invalid: false, attached: true, resumeReady: false,
     holdStatus: false, held: [] as Route[],
+    holdCreate: false, heldCreates: [] as Route[],
+    holdLists: false, heldLists: [] as Route[], omitCreated: false, staleAttachment: false,
+    holdPermissions: false, heldPermissions: [] as Route[], extraSessions: 0,
     requests: [] as { command: string; args: Record<string, unknown> }[],
   };
   await page.addInitScript(() => {
@@ -34,7 +37,14 @@ async function setup(page: Page) {
     state.requests.push({ command, args });
     let result: unknown;
     switch (command) {
-      case "list_sessions": result = [session("old"), ...(state.created ? [session("new", state.initialization)] : [])]; break;
+      case "get_profile_library": result = { directory: "Q:\\profiles", revision: "empty", groups: [], profiles: [] }; break;
+      case "get_session_profile": result = { sessionId: args.sessionId, profile: null, applying: false, configurationBlocked: false, requiresReconnect: false, error: null }; break;
+      case "list_sessions":
+        if (state.holdLists) { state.heldLists.push(route); return; }
+        result = [session("old"), ...Array.from({ length: state.extraSessions }, (_, index) => session(`older-${index}`)),
+          ...(state.created && !state.omitCreated
+            ? [state.staleAttachment ? { ...session("new"), isActive: false } : session("new", state.initialization)] : [])];
+        break;
       case "resume_session":
         if (args.sessionId === "new" && state.resumeReady) {
           state.attached = true;
@@ -43,6 +53,7 @@ async function setup(page: Page) {
         } else result = session(args.sessionId, args.sessionId === "new" ? state.initialization : undefined);
         break;
       case "create_session":
+        if (state.holdCreate) { state.heldCreates.push(route); return; }
         state.created = true;
         result = session("new", state.legacy ? undefined : state.initialization);
         break;
@@ -57,7 +68,10 @@ async function setup(page: Page) {
       case "session_state": result = { sessionId: args.sessionId, mode: "interactive", processing: false }; break;
       case "session_processing": result = false; break;
       case "queue_items": result = { items: [], steeringMessages: [] }; break;
-      case "pending_permissions": case "pending_interactions": case "subagent_context": result = []; break;
+      case "pending_permissions":
+        if (state.holdPermissions) { state.heldPermissions.push(route); return; }
+        result = []; break;
+      case "pending_interactions": case "subagent_context": result = []; break;
       case "git_repository": result = { isRepository: false }; break;
       case "session_history_window":
         result = {
@@ -81,7 +95,10 @@ async function setup(page: Page) {
     await expect(dialog).toHaveCount(0, { timeout: 1500 });
     await expect(page.getByRole("heading", { name: "New session", exact: true })).toBeVisible();
   };
-  return { state, create, emit, snapshot };
+  const refreshList = () => page.evaluate(() => window.dispatchEvent(new CustomEvent("startup-event", { detail: {
+    type: "session_attached", sessionId: "another-session",
+  } })));
+  return { state, create, emit, snapshot, session, refreshList };
 }
 
 test("new workspace opens before warmup completes without a second resume or empty-history read", async ({ page }) => {
@@ -221,4 +238,121 @@ test("explicit resume after disconnection clears stale failed startup UI", async
   await page.locator(".parent-session-view .composer textarea").press("Enter");
   await expect.poll(() => state.requests.filter((request) => request.command === "send_message").length).toBe(1);
   expect(state.requests.filter((request) => request.command === "create_session")).toHaveLength(1);
+});
+
+test("slow native creation has explicit pending status and no fake session or duplicate request", async ({ page }) => {
+  const { state, session } = await setup(page);
+  state.holdCreate = true;
+  await page.getByRole("button", { name: /New session/ }).first().click();
+  const dialog = page.getByRole("dialog", { name: "New session", exact: true });
+  await dialog.getByRole("button", { name: "Create session", exact: true }).click();
+  await expect(page.getByRole("status", { name: "Session creation" })).toContainText("Waiting for Copilot");
+  await expect(dialog.getByRole("button", { name: "Creating...", exact: true })).toBeDisabled();
+  await expect(page.locator("[data-session-id]")).toHaveCount(1);
+  expect(state.requests.filter((request) => request.command === "send_message")).toHaveLength(0);
+  await expect.poll(() => state.heldCreates.length).toBe(1);
+  state.created = true;
+  await state.heldCreates[0].fulfill({ json: session("new", state.initialization) });
+  await expect(dialog).toHaveCount(0);
+  await expect(page.getByRole("region", { name: "Unfiled sessions" }).locator("[data-session-id='new']")).toBeVisible();
+  expect(state.requests.filter((request) => request.command === "create_session")).toHaveLength(1);
+});
+
+test("stale list cannot erase a new real row and slow enrichment cannot keep creation busy", async ({ page }) => {
+  const { state, create, session, refreshList } = await setup(page);
+  state.holdLists = true;
+  await refreshList();
+  await expect.poll(() => state.heldLists.length).toBe(1);
+  state.holdPermissions = true;
+  await create();
+  await expect.poll(() => state.heldPermissions.length).toBe(1);
+  await state.heldLists[0].fulfill({ json: [session("old")] });
+  const row = page.locator("[data-session-id='new'] .session-open");
+  await expect(row).toBeVisible();
+  await page.locator(".parent-session-view .composer textarea").fill("Retained new draft");
+  await page.locator("[data-session-id='old'] .session-open").click();
+  await row.click();
+  await expect(page.locator(".session-startup")).toContainText("Initializing tools");
+  await expect(page.locator(".parent-session-view .composer textarea")).toHaveValue("Retained new draft");
+  expect(state.requests.filter((request) => request.command === "resume_session" && request.args.sessionId === "new")).toHaveLength(0);
+  expect(state.requests.filter((request) => request.command === "send_message")).toHaveLength(0);
+  await page.getByRole("button", { name: /New session/ }).first().click();
+  await expect(page.getByRole("dialog", { name: "New session", exact: true })
+    .getByRole("button", { name: "Create session", exact: true })).toBeEnabled();
+});
+
+test("stale attachment and activity reads cannot hide or resume the preparing session", async ({ page }) => {
+  const { state, create, refreshList } = await setup(page);
+  await create();
+  state.staleAttachment = true;
+  state.extraSessions = 150;
+  await refreshList();
+  await expect(page.getByLabel("Session view")).toContainText("152");
+  await expect(page.locator("[data-session-id='new'] .session-open")).toBeVisible();
+  await page.locator("[data-session-id='old'] .session-open").click();
+  await page.locator("[data-session-id='new'] .session-open").click();
+  await expect(page.locator(".session-startup")).toContainText("Initializing tools");
+  expect(state.requests.filter((request) => request.args.sessionId === "new"
+    && ["resume_session", "session_processing", "agent_tasks"].includes(request.command))).toHaveLength(0);
+});
+
+test("a real indexed session still attaching can be reopened without joining blocking resume", async ({ page }) => {
+  const { state, create, emit, refreshList } = await setup(page);
+  await create();
+  state.attached = false;
+  await refreshList();
+  await expect(page.locator("[data-session-id='new'] .session-activity-dot")).toHaveAttribute("aria-label", "Preparing session");
+  await page.locator("[data-session-id='old'] .session-open").click();
+  const beforeReopen = state.requests.length;
+  await page.locator("[data-session-id='new'] .session-open").click();
+  await expect(page.locator(".session-startup")).toContainText("Initializing tools");
+  expect(state.requests.filter((request) => request.command === "resume_session" && request.args.sessionId === "new")).toHaveLength(0);
+  expect(state.requests.slice(beforeReopen).some((request) => request.args.sessionId === "new"
+    && ["session_history_window", "subagent_context", "pending_interactions"].includes(request.command))).toBe(false);
+  state.attached = true;
+  state.initialization = { phase: "ready", stage: "ready" };
+  await emit();
+  await expect(page.locator(".session-startup")).toHaveCount(0);
+  await expect(page.locator("[data-session-id='new'] .session-activity-dot")).not.toHaveAttribute("aria-label", "Not attached");
+});
+
+test("creation reveals Unfiled from archived filters and a collapsed group", async ({ page }) => {
+  const { create } = await setup(page);
+  await page.getByRole("region", { name: "Unfiled sessions" }).getByRole("button", { name: /Unfiled/ }).click();
+  await page.getByLabel("Search sessions").fill("will-not-match");
+  await page.getByLabel("Session view").selectOption("archived");
+  await create();
+  await expect(page.getByLabel("Search sessions")).toHaveValue("");
+  await expect(page.getByLabel("Session view")).toHaveValue("current");
+  await expect(page.getByRole("region", { name: "Unfiled sessions" }).locator("[data-session-id='new']")).toBeVisible();
+});
+
+test("failed native creation remains actionable without publishing a phantom session", async ({ page }) => {
+  const { state } = await setup(page);
+  state.holdCreate = true;
+  await page.getByRole("button", { name: /New session/ }).first().click();
+  const dialog = page.getByRole("dialog", { name: "New session", exact: true });
+  await dialog.getByRole("button", { name: "Create session", exact: true }).click();
+  await expect.poll(() => state.heldCreates.length).toBe(1);
+  await state.heldCreates[0].fulfill({ status: 500, body: "Native creation failed" });
+  await expect(dialog.getByRole("alert")).toContainText("Native creation failed");
+  await expect(dialog.getByRole("button", { name: "Create session", exact: true })).toBeEnabled();
+  await expect(page.locator("[data-session-id]")).toHaveCount(1);
+  state.holdCreate = false;
+  await dialog.getByRole("button", { name: "Create session", exact: true }).click();
+  await expect(page.locator("[data-session-id='new']")).toBeVisible();
+});
+
+test("a deleted startup row cannot be resurrected by an older list response", async ({ page }) => {
+  const { state, create, session, refreshList } = await setup(page);
+  await create();
+  await page.locator("[data-session-id='old'] .session-open").click();
+  state.holdLists = true;
+  await refreshList();
+  await expect.poll(() => state.heldLists.length).toBe(1);
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent("startup-event", { detail: {
+    type: "session_deleted", sessionId: "new",
+  } })));
+  await state.heldLists[0].fulfill({ json: [session("old"), session("new", state.initialization)] });
+  await expect(page.locator("[data-session-id='new']")).toHaveCount(0);
 });

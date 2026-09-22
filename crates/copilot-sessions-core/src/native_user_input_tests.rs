@@ -156,6 +156,7 @@ impl Runtime {
             metadata_path: PathBuf::from("target").join("native-user-input-unused.json"),
             metadata: RwLock::new(HashMap::new()),
             metadata_write_gate: AsyncMutex::new(()),
+            profile_configuration: AsyncMutex::new(HashMap::new()),
         })
     }
 }

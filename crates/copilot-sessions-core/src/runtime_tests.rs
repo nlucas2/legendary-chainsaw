@@ -12,6 +12,11 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock};
 
 use crate::*;
 
+#[path = "session_skills_tests.rs"]
+mod session_skills;
+#[path = "session_profiles_tests.rs"]
+mod session_profiles;
+
 struct MockRuntime {
     service: Arc<SessionService>,
     calls: Arc<Mutex<Vec<Value>>>,
@@ -478,6 +483,63 @@ fn new_session(deferred: bool) -> NewSession {
     }
 
     #[tokio::test]
+    async fn deferred_local_index_is_visible_before_attach_and_ahead_of_native_history() {
+        let runtime = mock_runtime();
+        runtime.hold("session.eventLog.tail");
+        runtime.hold("session.tools.initializeAndValidate");
+        runtime.hold("session.list");
+        let service = runtime.service.clone();
+        let listing = tokio::spawn(async move { service.list_sessions().await });
+        let list = runtime.request("session.list", 1).await;
+        let service = runtime.service.clone();
+        let creation = tokio::spawn(async move { service.create_session(new_session(true)).await });
+        let tail = runtime.request("session.eventLog.tail", 1).await;
+        let id = tail["params"]["sessionId"].as_str().unwrap();
+        let rows: Vec<_> = (0..150).map(|index| json!({
+            "sessionId": format!("older-{index}"), "summary":"Existing session",
+            "modifiedTime":"2026-09-20T10:00:00Z",
+        })).collect();
+        runtime.reply(&list, json!({"sessions":rows})).await;
+        let indexed = listing.await.unwrap().unwrap();
+        assert_eq!(indexed[0].session_id, id, "the native ID must be on the first sidebar page");
+        assert_eq!(indexed[0].initialization.as_ref().unwrap().phase, InitializationPhase::Initializing);
+        assert!(!indexed[0].is_active, "do not claim the event stream is attached before tail completes");
+        assert!(!creation.is_finished(), "event-log attachment is still pending");
+        assert!(runtime.requests("session.resume").is_empty());
+        assert!(runtime.requests("session.send").is_empty());
+        runtime.reply(&tail, json!({"cursor":"tail"})).await;
+        creation.await.unwrap().unwrap();
+        assert_eq!(runtime.requests("session.list").len(), 1, "creation must not wait for native indexing");
+    }
+
+    #[tokio::test]
+    async fn deferred_create_gate_rejects_inflight_creation_but_does_not_wait_for_warmup() {
+        let runtime = mock_runtime();
+        runtime.hold("session.create");
+        runtime.hold("session.tools.initializeAndValidate");
+        let service = runtime.service.clone();
+        let first = tokio::spawn(async move { service.create_session(new_session(true)).await });
+        let create = runtime.request("session.create", 1).await;
+        let duplicate = tokio::time::timeout(
+            Duration::from_millis(500), runtime.service.create_session(new_session(true)),
+        ).await.expect("the create gate must reject, not queue");
+        assert!(matches!(duplicate, Err(ServiceError::SessionProcessing(_))));
+        assert_eq!(runtime.requests("session.create").len(), 1);
+        runtime.reply(&create, json!({"sessionId":create["params"]["sessionId"]})).await;
+        let first = first.await.unwrap().unwrap();
+        runtime.request("session.tools.initializeAndValidate", 1).await;
+        runtime.held_methods.lock().unwrap().remove("session.create");
+        let second = tokio::time::timeout(
+            Duration::from_millis(500), runtime.service.create_session(new_session(true)),
+        ).await.expect("another session's warmup must not hold the create gate").unwrap();
+        assert_ne!(first.session_id, second.session_id);
+        assert_eq!(runtime.requests("session.create").len(), 2);
+        assert!(runtime.requests("session.list").is_empty());
+        assert!(runtime.requests("session.resume").is_empty());
+        assert!(runtime.requests("session.send").is_empty());
+    }
+
+    #[tokio::test]
     async fn default_create_still_waits_for_initialization_and_unknown_readiness_is_explicit() {
         let runtime = mock_runtime();
         let request: NewSession = serde_json::from_value(json!({"cwd":"."})).unwrap();
@@ -905,6 +967,7 @@ fn mock_runtime_with_mcp(mcp: bool) -> MockRuntime {
     let task = tokio::spawn(async move {
         let mut read = BufReader::new(read);
         let mut modes = HashMap::<String, Value>::new();
+        let mut profile_mcp = HashMap::<String, Value>::new();
         let mut excluded = HashMap::<String, Vec<Value>>::new();
         let mut available = HashMap::<String, Vec<Value>>::new();
         loop {
@@ -936,6 +999,9 @@ fn mock_runtime_with_mcp(mcp: bool) -> MockRuntime {
             let result = match method {
                 "session.list" => json!({"sessions":[]}),
                 "session.create" => {
+                    if let Some(servers) = request["params"].get("mcpServers") {
+                        profile_mcp.insert(sid.into(), servers.clone());
+                    }
                     excluded.insert(
                         sid.into(),
                         request["params"]["excludedTools"]
@@ -946,6 +1012,9 @@ fn mock_runtime_with_mcp(mcp: bool) -> MockRuntime {
                     json!({"sessionId":sid})
                 }
                 "session.resume" => {
+                    if let Some(servers) = request["params"].get("mcpServers") {
+                        profile_mcp.insert(sid.into(), servers.clone());
+                    }
                     if let Some(values) = request["params"]["excludedTools"].as_array() {
                         excluded.insert(sid.into(), values.clone());
                     }
@@ -954,7 +1023,14 @@ fn mock_runtime_with_mcp(mcp: bool) -> MockRuntime {
                     }
                     json!({"sessionId":sid})
                 }
-                "session.skills.reload" | "session.tools.initializeAndValidate" => json!({}),
+                "session.skills.reload" => json!({"warnings":[], "errors":[]}),
+                "session.mcp.reload" | "session.cancelAllBackgroundAgents" => json!({}),
+                "session.skills.list" => json!({"skills":[
+                    {"name":"repo-review","description":"Review fixture code","enabled":true,"source":"project","path":"Q:\\fixture\\.github\\skills\\repo-review\\SKILL.md","userInvocable":true},
+                    {"name":"disabled-fixture","description":"Not enabled","enabled":false,"source":"project","userInvocable":false}
+                ]}),
+                "session.tools.initializeAndValidate" => json!({}),
+                "session.metadata.setWorkingDirectory" => json!({"workingDirectory":request["params"]["workingDirectory"]}),
                 "session.delete" | "session.disconnect" | "session.destroy" | "session.abort" => json!({}),
                 "session.model.getCurrent" => json!({}),
                 "session.eventLog.tail" => json!({"cursor":"tail"}),
@@ -1008,7 +1084,9 @@ fn mock_runtime_with_mcp(mcp: bool) -> MockRuntime {
                 "session.mcp.list" if mcp => json!({"servers":[
                     {"name":"fast","status":"connected"}, {"name":"slow","status":"connected"},
                 ]}),
-                "session.mcp.list" => json!({"servers":[]}),
+                "session.mcp.list" => json!({"servers":profile_mcp.get(sid)
+                    .and_then(Value::as_object).into_iter().flat_map(|servers| servers.keys())
+                    .map(|name| json!({"name":name,"status":"connected"})).collect::<Vec<_>>()}),
                 "session.mcp.listTools" if request["params"]["serverName"] == "slow" => {
                     // Leave only this RPC pending; unrelated runtime calls keep working.
                     continue;
@@ -1096,6 +1174,7 @@ fn mock_runtime_with_mcp(mcp: bool) -> MockRuntime {
         tool_state: RwLock::new(HashMap::new()),
         tool_catalog: tool_catalog::ToolCatalog::default(),
         metadata_path: metadata_dir.join("sessions.json"),
+        profile_configuration: AsyncMutex::new(HashMap::new()),
         metadata: RwLock::new(HashMap::from([(
             "a".into(),
             StoredSessionMeta {
@@ -1330,6 +1409,8 @@ async fn newly_created_sessions_have_editable_known_app_defaults() {
             reasoning_summary: None,
             context_tier: None,
             defer_initialization: false,
+            profile_id: None,
+            profile_revision: None,
         })
         .await
         .unwrap();
@@ -1419,6 +1500,8 @@ async fn concurrent_session_creation_is_rejected_before_reaching_the_runtime() {
             reasoning_summary: None,
             context_tier: None,
             defer_initialization: false,
+            profile_id: None,
+            profile_revision: None,
         })
         .await
         .unwrap_err();
@@ -1756,7 +1839,7 @@ async fn send_returns_acceptance_without_waiting_for_model_output() {
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(accepted, "accepted-without-reply");
+    assert_eq!(serde_json::to_value(accepted).unwrap(), json!("accepted-without-reply"));
     let calls = runtime.calls.lock().unwrap();
     let send = calls
         .iter()

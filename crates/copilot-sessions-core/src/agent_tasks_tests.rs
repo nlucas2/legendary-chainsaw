@@ -158,6 +158,7 @@ impl MockRuntime {
             metadata_path: PathBuf::from("target").join("agent-tests-unused.json"),
             metadata: RwLock::new(HashMap::new()),
             metadata_write_gate: AsyncMutex::new(()),
+            profile_configuration: AsyncMutex::new(HashMap::new()),
         });
         for id in ["a", "b"] {
             let session = service

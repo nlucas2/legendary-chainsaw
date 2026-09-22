@@ -52,6 +52,7 @@ impl Fixture {
                 ("other".into(), StoredSessionMeta::default()),
             ])),
             metadata_write_gate: AsyncMutex::new(()),
+            profile_configuration: AsyncMutex::new(HashMap::new()),
         });
         service.persist_metadata().await.unwrap();
         Self { service, directory }

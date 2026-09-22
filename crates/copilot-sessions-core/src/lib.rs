@@ -11,6 +11,10 @@ mod runtime_api;
 mod scheduled;
 mod session_actions;
 mod session_archive;
+mod session_skills;
+mod session_configuration;
+pub mod profiles;
+mod session_profiles;
 #[cfg(test)]
 mod session_archive_tests;
 pub mod git_workspace;
@@ -34,6 +38,8 @@ pub use runtime_api::{
 pub use scheduled::ScheduledDelivery;
 pub use session_actions::{AskSessionRequest, AskSessionResult, ForkSessionRequest, RenameSessionRequest};
 pub use session_archive::SetSessionArchived;
+pub use session_skills::{ReloadSessionSkills, SessionSkillPreview, SessionSkills};
+pub use session_profiles::{PreviewSessionProfile, SetSessionProfile};
 pub use tool_controls::{AdoptToolControls, SetMcpEnabled, SetToolEnabled, ToolControls};
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -86,6 +92,8 @@ const CONVERSATION_EVENT_TYPES: &[&str] = &[
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
+    #[error("{0}")]
+    Profile(#[from] profiles::ProfileError),
     #[error("{0}")]
     Copilot(#[from] github_copilot_sdk::Error),
     #[error("session {0} is not active")]
@@ -148,6 +156,8 @@ pub struct NewSession {
     pub context_tier: Option<String>,
     #[serde(default)]
     pub defer_initialization: bool,
+    pub profile_id: Option<String>,
+    pub profile_revision: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -452,6 +462,8 @@ struct StoredSessionMeta {
     tool_controls_created: bool,
     tool_available_tools: Option<Vec<String>>,
     prevent_pending_work: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<profiles::ProfileSelection>,
 }
 
 struct ApprovalBroker {
@@ -575,6 +587,7 @@ pub struct SessionService {
     metadata_path: PathBuf,
     metadata: RwLock<HashMap<String, StoredSessionMeta>>,
     metadata_write_gate: AsyncMutex<()>,
+    profile_configuration: AsyncMutex<HashMap<String, session_profiles::ProfileConfigurationState>>,
 }
 
 impl SessionService {
@@ -612,6 +625,7 @@ impl SessionService {
             metadata_path,
             metadata: RwLock::new(metadata),
             metadata_write_gate: AsyncMutex::new(()),
+            profile_configuration: AsyncMutex::new(HashMap::new()),
         }))
     }
 
@@ -709,7 +723,13 @@ impl SessionService {
                 summaries.push(summary);
             }
         }
-        summaries.sort_by_key(|session| (!session.pinned, Reverse(session.modified_time.clone())));
+        // New real sessions are indexed locally before native history supplies
+        // timestamps. Do not bury these rows below the sidebar's first page.
+        summaries.sort_by_key(|session| (
+            !session.pinned,
+            !(session.initialization.is_some() && session.modified_time.is_empty()),
+            Reverse(session.modified_time.clone()),
+        ));
         *cache = summaries.clone();
         Ok(summaries)
     }
@@ -768,6 +788,8 @@ impl SessionService {
             config = config.with_context_tier(tier);
         }
         let started = std::time::Instant::now();
+        let profile = self.resolve_new_profile(&request)?;
+        let config = session_configuration::SessionConfiguration.configure_new_profile(config, profile.as_ref());
         let session = Arc::new(self.client().await?.create_session(config).await?);
         let id = session.id().to_string();
         tracing::info!(session_id = %id, stage = "create", elapsed_ms = started.elapsed().as_millis(), "session startup");
@@ -789,6 +811,7 @@ impl SessionService {
                 tool_controls_created: true,
                 tool_available_tools: None,
                 prevent_pending_work: request.defer_initialization,
+                profile: profile.as_ref().map(profiles::ResolvedProfile::selection),
             },
         );
         self.persist_metadata().await?;
@@ -850,6 +873,7 @@ impl SessionService {
         if !self.active.read().await.contains_key(&session_id) {
             let session = self.resume_handle(&session_id, continue_pending_work).await?;
             self.attach(session).await?;
+            self.profile_configuration.lock().await.remove(&session_id);
             self.refresh_model(&session_id).await?;
         }
         self.initialize_environment(&session_id).await?;
@@ -944,6 +968,21 @@ impl SessionService {
         if let Some(tier) = meta.as_ref().and_then(|m| m.context_tier.as_deref()) {
             config = config.with_context_tier(tier);
         }
+        let mut profile = meta.as_ref().and_then(|meta| meta.profile.as_ref())
+            .map(|selection| profiles::resolve_snapshot(selection).map_err(ServiceError::from)).transpose()?;
+        let blocked_configuration = self.profile_configuration.lock().await.get(session_id).is_some_and(|state| state.blocked);
+        if profile.is_none() && blocked_configuration {
+            if meta.as_ref().is_some_and(|meta| meta.tool_controls_created) {
+                profile = Some(self.profile_library()?.resolve(None)?);
+            } else {
+                return Err(ServiceError::CapabilityUnavailable(
+                    "The saved imported session has an unverified profile transaction and no known source assignment. Restore its configuration in a supported runtime client before attaching.".into()));
+            }
+        }
+        if blocked_configuration {
+            config = config.with_continue_pending_work(false);
+        }
+        let config = session_configuration::SessionConfiguration.configure_resume_profile(config, profile.as_ref());
         Ok(Arc::new(self.client().await?.resume_session(config).await?))
     }
 
@@ -1213,6 +1252,9 @@ impl SessionService {
         session_id: &str,
         item_id: String,
     ) -> Result<serde_json::Value> {
+        let _lifecycle = self.lifecycle_gate.read().await;
+        let gate = self.turn_gate(session_id).await;
+        let _turn = gate.lock().await;
         self.session(session_id).await?;
         Ok(self
             .client()
@@ -1237,7 +1279,9 @@ impl SessionService {
         let gate = self.turn_gate(session_id).await;
         let _guard = gate.lock().await;
         self.require_accepting_work()?;
+        self.require_profile_ready(session_id).await?;
         self.session(session_id).await?;
+        self.last_submissions.write().await.insert(session_id.into(), tokio::time::Instant::now());
         let result = self
             .client()
             .await?
@@ -1448,6 +1492,11 @@ impl SessionService {
     }
 
     pub async fn decide_permission(&self, decision: PermissionDecision) -> Result<()> {
+        let session_id = self.approvals.pending.lock().expect("approval map poisoned")
+            .get(&decision.request_id).map(|pending| pending.session_id.clone());
+        if let Some(session_id) = session_id {
+            self.last_submissions.write().await.insert(session_id, tokio::time::Instant::now());
+        }
         self.approvals.resolve(decision)
     }
 
@@ -1477,6 +1526,7 @@ impl SessionService {
     pub async fn respond_interaction_async(&self, response: InteractionResponse) -> Result<()> {
         // Initialization may itself need an answer to a pending callback.
         self.attached_session(&response.session_id).await?;
+        self.last_submissions.write().await.insert(response.session_id.clone(), tokio::time::Instant::now());
         self.interactions
             .respond_native(response, &self.client().await?)
             .await
@@ -1504,6 +1554,7 @@ impl SessionService {
             return Err(error);
         }
         self.metadata.write().await.remove(session_id);
+        self.profile_configuration.lock().await.remove(session_id);
         self.last_submissions.write().await.remove(session_id);
         self.warmed.write().await.remove(session_id);
         self.ask_gates.write().await.remove(session_id);
@@ -1527,7 +1578,11 @@ impl SessionService {
     }
 
     pub async fn set_working_directory(&self, session_id: &str, cwd: String) -> Result<String> {
+        let _lifecycle = self.lifecycle_gate.read().await;
+        let gate = self.turn_gate(session_id).await;
+        let _turn = gate.lock().await;
         self.require_accepting_work()?;
+        self.require_profile_ready(session_id).await?;
         validate_cwd(&cwd)?;
         self.session(session_id).await?;
         let result = self
@@ -1622,7 +1677,11 @@ impl SessionService {
         reasoning_summary: Option<String>,
         context_tier: Option<String>,
     ) -> Result<serde_json::Value> {
+        let _lifecycle = self.lifecycle_gate.read().await;
+        let gate = self.turn_gate(session_id).await;
+        let _turn = gate.lock().await;
         self.require_accepting_work()?;
+        self.require_profile_ready(session_id).await?;
         self.session(session_id).await?;
         let result = self
             .client()
@@ -1798,11 +1857,19 @@ impl SessionService {
     }
 
     pub async fn reload_mcp(&self) -> Result<Vec<SessionOperationResult>> {
+        let _lifecycle = self.lifecycle_gate.read().await;
         self.require_accepting_work()?;
         let client = self.client().await?;
         let session_ids = self.active.read().await.keys().cloned().collect::<Vec<_>>();
         let mut results = Vec::with_capacity(session_ids.len());
         for session_id in session_ids {
+            let gate = self.turn_gate(&session_id).await;
+            let _turn = gate.lock().await;
+            if let Err(error) = self.require_profile_ready(&session_id).await {
+                results.push(SessionOperationResult { session_id, success: false, error: Some(error.to_string()) });
+                continue;
+            }
+            self.require_accepting_work()?;
             if let Err(error) = self.session(&session_id).await {
                 results.push(SessionOperationResult {
                     session_id,

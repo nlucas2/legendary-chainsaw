@@ -73,6 +73,9 @@ import { useChatHeader } from "./lib/useChatHeader";
 import { useMobileInput } from "./lib/useMobileInput";
 import { submitsComposer } from "./lib/composerInput";
 import { useSessionStartup } from "./lib/useSessionStartup";
+import { useSessionProfile } from "./lib/useSessionProfile";
+import { DEFAULT_PROFILE_CHOICE, type NewSessionProfileChoice } from "./lib/profiles";
+import { NewSessionProfilePicker, ProfileConfigurationNotice } from "./components/SessionProfilePanel";
 import { SessionStartupBanner } from "./components/SessionStartupBanner";
 import { useDeliveryDefault } from "./lib/useDeliveryDefault";
 import type { MessageDelivery } from "./lib/deliveryPreference";
@@ -117,6 +120,7 @@ import { chatDraftReducer, EMPTY_SESSION_DRAFTS } from "./lib/chatDrafts";
 import { mergeEvents, mergeHistoryEvents, reconcileOptimisticUserEvents } from "./lib/history";
 import { useSessionOperation } from "./lib/useSessionOperation";
 import { useSessionActivity } from "./lib/useSessionActivity";
+import { SessionStartupIndex, startupStageLabel } from "./lib/sessionStartup";
 import { sessionActivityIndicator, subagentActivity, type SessionActivity } from "./lib/sessionActivity";
 import { filterSessions, groupSessions, SessionArchiveChanges, type SessionView } from "./lib/sessionList";
 import type {
@@ -163,6 +167,7 @@ const TerminalPane = lazy(() =>
 const ReferenceDrawer = lazy(() =>
   import("./components/ReferenceDrawer").then((module) => ({ default: module.ReferenceDrawer })),
 );
+const ProfilesPanel = lazy(() => import("./components/ProfilesPanel").then((module) => ({ default: module.ProfilesPanel })));
 const InteractionPanel = lazy(() =>
   import("./components/InteractionPanel").then((module) => ({ default: module.InteractionPanel })),
 );
@@ -183,6 +188,7 @@ function App() {
   const typography = useTypography();
   const chatWidth = useChatWidth();
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [startupIndex] = useState(() => new SessionStartupIndex());
   const [sessionView, setSessionView] = useState<SessionView>("current");
   const [archiveChanges] = useState(() => new SessionArchiveChanges());
   const archiveOperation = useSessionOperation();
@@ -216,6 +222,7 @@ function App() {
   const initializationReady = useCallback((sessionId: string, summary?: SessionSummary) => {
     const update = (current: SessionSummary): SessionSummary => ({
       ...current, model: summary?.model ?? current.model,
+      isActive: summary?.isActive ?? current.isActive,
       initialization: { phase: "ready", stage: "ready" },
     });
     setSessions((current) => current.map((item) => item.sessionId === sessionId ? update(item) : item));
@@ -250,10 +257,12 @@ function App() {
   const [askPanel, setAskPanel] = useState<{ id: string; sessionId: string; question: string; submitOnOpen: boolean; reviewContext?: ReviewChatContext } | null>(null);
   const [gitOpen, setGitOpen] = useState(false);
   const [schedulesOpen, setSchedulesOpen] = useState(false);
+  const [profilesOpen, setProfilesOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [themePreference, setThemePreference] =
     useState<ThemePreference>(readThemePreference);
   const [creatingSession, setBusy] = useState(false);
+  const [creationError, setCreationError] = useState("");
   const [error, setError] = useState("");
   const [drafts, dispatchDraft] = useReducer(chatDraftReducer, {});
   const draftsRef = useRef(drafts);
@@ -302,6 +311,7 @@ function App() {
   const [collapsedGroups, setCollapsedGroups] =
     useState<Set<string>>(readCollapsedGroups);
   const [newSessionOpen, setNewSessionOpen] = useState(false);
+  const [newSessionProfile, setNewSessionProfile] = useState<NewSessionProfileChoice>(DEFAULT_PROFILE_CHOICE);
   const [newCwd, setNewCwd] = useState("");
   const [newModel, setNewModel] = useState(DEFAULT_MODEL);
   const [newReasoningEffort, setNewReasoningEffort] = useState("");
@@ -322,6 +332,8 @@ function App() {
   const terminalDrag = useRef<{ x: number; y: number; size: number } | null>(null);
   const [followCwd, setFollowCwd] = useState(true);
   const [trackedCwd, setTrackedCwd] = useState("");
+  const cwdUpdates = useRef(new Map<string, Promise<void>>());
+  const cwdGenerations = useRef(new Map<string, symbol>());
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const chatHeader = useChatHeader();
   const mobileInput = useMobileInput();
@@ -407,8 +419,8 @@ function App() {
   const loadSessions = useCallback(async () => {
     try {
       const checkpoint = archiveChanges.checkpoint();
-      const next = (await daemonInvoke<SessionSummary[]>("list_sessions")).map((session) => sessionStartup.track(archiveChanges.reconcile(session, checkpoint)));
-      setSessions(next);
+      const next = (await daemonInvoke<SessionSummary[]>("list_sessions")).map((session) => archiveChanges.reconcile(session, checkpoint));
+      setSessions((current) => startupIndex.reconcile(current, next).map(sessionStartup.reconcile));
       setNeedsLogin(false);
       if (!activeIdRef.current) {
         const requested = initialSessionIdRef.current;
@@ -463,6 +475,15 @@ function App() {
     queueRequestsRef.current.set(sessionId, request);
     return request;
   }, []);
+
+  const onProfileApplied = useCallback((sessionId: string) => {
+    if (activeIdRef.current !== sessionId) return;
+    setContextRevision((current) => current + 1);
+    sessionStartup.refresh();
+    void loadQueue(sessionId);
+  }, [loadQueue, sessionStartup.refresh]);
+  const sessionProfile = useSessionProfile(activeSession?.sessionId, activityConnected, onProfileApplied);
+  const profileUnavailable = sessionProfile.status?.applying === true || sessionProfile.status?.configurationBlocked === true;
 
   const loadInteractions = useCallback((sessionId: string): Promise<void> => {
     const running = interactionRequestsRef.current.get(sessionId);
@@ -548,13 +569,15 @@ function App() {
       // A freshly created session already has its runtime handle and event stream.
       // Startup status, not a second resume RPC, controls readiness while it warms.
       const archiveCheckpoint = archiveChanges.checkpoint();
-      const reuseAttachment = newlyCreated || (session.isActive && !!session.initialization);
+      const reuseAttachment = newlyCreated || session.initialization?.phase === "initializing"
+        || (session.isActive && !!session.initialization);
+      const awaitingAttachment = session.initialization?.phase === "initializing" && !session.isActive;
       const resumeRequest = reuseAttachment
         ? Promise.resolve(session)
         : daemonInvoke<SessionSummary>("resume_session", {
         sessionId: session.sessionId,
       });
-      const historyRequest = newlyCreated ? Promise.resolve<HistoryPage>({
+      const historyRequest = newlyCreated || awaitingAttachment ? Promise.resolve<HistoryPage>({
         events: [], hasMore: false, cursor: "", loadedPages: 0, humanMessages: 0, truncatedBeforeAnchor: false,
       }) : resumeRequest.then(() =>
         daemonInvoke<HistoryPage>("session_history_window", {
@@ -605,8 +628,8 @@ function App() {
         setActiveSession(resumed);
         setSessionReady(true);
         if (!reuseAttachment) sessionStartup.refresh();
-        void loadInteractions(session.sessionId);
-        if (!newlyCreated) void daemonInvoke<SessionEvent[]>("subagent_context", {
+        if (!awaitingAttachment) void loadInteractions(session.sessionId);
+        if (!newlyCreated && !awaitingAttachment) void daemonInvoke<SessionEvent[]>("subagent_context", {
           sessionId: session.sessionId,
         })
           .then((context) => {
@@ -652,6 +675,10 @@ function App() {
     const unsubscribe = subscribeToDaemon(
       (event) => {
         if (event.type === "session_archive_changed") applyArchiveChange(event.sessionId, event.archived);
+        if (event.type === "session_deleted") {
+          startupIndex.remove(event.sessionId);
+          setSessions((current) => current.filter((session) => session.sessionId !== event.sessionId));
+        }
         if (event.type === "event_gap") void loadSessions();
         agentTasks.notify(event);
         sessionStartup.notify(event);
@@ -742,7 +769,7 @@ function App() {
           }
           if ([
             "session.idle", "session.tools_updated", "session.mcp_servers_loaded",
-            "session.mcp_server_status_changed", "session.mode_changed",
+            "session.mcp_server_status_changed", "session.mode_changed", "session.skills_loaded",
           ].includes(event.event.type)) {
             setContextRevision((current) => current + 1);
           }
@@ -795,7 +822,7 @@ function App() {
   useEffect(() => {
     const toggleTerminal = (event: KeyboardEvent) => {
       if (event.defaultPrevented || !isTerminalToggle(event)) return;
-      if (shortcutsOpen || newSessionOpen || renamingSession || forkingSession || askPanel || gitOpen || schedulesOpen ||
+      if (shortcutsOpen || newSessionOpen || renamingSession || forkingSession || askPanel || gitOpen || schedulesOpen || profilesOpen ||
           modeConfirmation || modelPickerOpen || settingsOpen || organizingSession || runtimeOpen || referenceOpen) return;
       if (!activeSession || (!terminalOpen && !activeSession.cwd && !trackedCwd)) return;
       event.preventDefault();
@@ -813,7 +840,7 @@ function App() {
     window.addEventListener("keydown", toggleTerminal, true);
     return () => window.removeEventListener("keydown", toggleTerminal, true);
   }, [terminalOpen, activeSession, trackedCwd, shortcutsOpen, newSessionOpen, renamingSession,
-    forkingSession, askPanel, gitOpen, schedulesOpen, modeConfirmation, modelPickerOpen, settingsOpen,
+    forkingSession, askPanel, gitOpen, schedulesOpen, profilesOpen, modeConfirmation, modelPickerOpen, settingsOpen,
     organizingSession, runtimeOpen, referenceOpen]);
 
   useEffect(() => {
@@ -825,11 +852,11 @@ function App() {
       const inComposer = event.target === composerRef.current;
       const inTerminal = event.target instanceof Element && !!event.target.closest(".terminal-pane");
       const modal = event.target instanceof Element
-        ? event.target.closest(".modal-backdrop,.model-backdrop,.settings-backdrop,.runtime-backdrop,.ask-backdrop,.git-backdrop,.scheduled-tasks-backdrop")
+        ? event.target.closest(".modal-backdrop,.model-backdrop,.settings-backdrop,.runtime-backdrop,.ask-backdrop,.git-backdrop,.scheduled-tasks-backdrop,.profiles-backdrop")
         : null;
 
       if (event.key === "Escape") {
-        if (shortcutsOpen || newSessionOpen || renamingSession || forkingSession || askPanel || gitOpen || schedulesOpen || modeConfirmation || modelPickerOpen ||
+        if (shortcutsOpen || newSessionOpen || renamingSession || forkingSession || askPanel || gitOpen || schedulesOpen || profilesOpen || modeConfirmation || modelPickerOpen ||
             settingsOpen || organizingSession || runtimeOpen || referenceOpen) {
           event.preventDefault();
           setShortcutsOpen(false);
@@ -839,6 +866,7 @@ function App() {
           setAskPanel(null);
           setGitOpen(false);
           setSchedulesOpen(false);
+          setProfilesOpen(false);
           setModeConfirmation(null);
           setModelPickerOpen(false);
           setSettingsOpen(false);
@@ -985,7 +1013,7 @@ function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [queue.items, shortcutsOpen, newSessionOpen, modeConfirmation, modelPickerOpen,
       settingsOpen, organizingSession, runtimeOpen, referenceOpen, modeBusy,
-      composer, trackedCwd, activeSession, newSessionModels, newSessionModelsLoading, selectedAgent, renamingSession, forkingSession, askPanel, gitOpen, schedulesOpen]);
+      composer, trackedCwd, activeSession, newSessionModels, newSessionModelsLoading, selectedAgent, renamingSession, forkingSession, askPanel, gitOpen, schedulesOpen, profilesOpen]);
 
   useEffect(() => {
     if (!activeSession || !sessionReady || runtimeStatus?.connected === false) {
@@ -1132,9 +1160,10 @@ function App() {
 
   async function createSession(event: FormEvent) {
     event.preventDefault();
-    if (createSessionPendingRef.current || !newCwd.trim()) return;
+    if (createSessionPendingRef.current || !newCwd.trim() || newSessionProfile.pending || newSessionProfile.error) return;
     createSessionPendingRef.current = true;
     setBusy(true);
+    setCreationError("");
     try {
       const session = await daemonInvoke<SessionSummary>("create_session", {
         cwd: newCwd.trim(),
@@ -1143,11 +1172,23 @@ function App() {
         reasoningSummary: newReasoningSummary,
         contextTier: newContextTier || null,
         deferInitialization: true,
+        ...(newSessionProfile.profileId ? { profileId: newSessionProfile.profileId, profileRevision: newSessionProfile.revision } : {}),
       });
+      startupIndex.add(session.sessionId);
       setSessions((current) => [session, ...current.filter((item) => item.sessionId !== session.sessionId)]);
+      setSearch("");
+      setSessionView("current");
+      setCollapsedGroups((current) => {
+        const next = new Set(current);
+        next.delete("loose");
+        return next;
+      });
       setNewSessionOpen(false);
-      await openSession(session, true, true);
+      // Opening sets the workspace synchronously; enrichment must not extend the
+      // creation gate or disable composing in this or another conversation.
+      void openSession(session, true, true);
     } catch (cause) {
+      setCreationError(String(cause));
       handleError(cause, setError, setNeedsLogin);
     } finally {
       createSessionPendingRef.current = false;
@@ -1217,7 +1258,7 @@ function App() {
     const content = composer.trim();
     if (
       !activeSession ||
-      !sessionReady ||
+      !sessionReady || profileUnavailable ||
       (!content && attachmentDrafts.length === 0) ||
       sendOperation.operations.get(activeSession.sessionId) ||
       readingAttachments ||
@@ -1438,7 +1479,7 @@ function App() {
             (session) => session.sessionId === sessionId,
           );
           setRuntimeStatus(status);
-          setSessions(refreshedSessions);
+          setSessions((sessions) => startupIndex.reconcile(sessions, refreshedSessions).map(sessionStartup.reconcile));
           if (current) setActiveSession(current);
           setSessionReady(Boolean(status.connected && current?.isActive));
         } catch {
@@ -1608,6 +1649,7 @@ function App() {
     if (!window.confirm(`Delete "${session.title}"? This cannot be undone.`)) return;
     try {
       await daemonInvoke("delete_session", { sessionId: session.sessionId });
+      startupIndex.remove(session.sessionId);
       dispatchDraft({ type: "delete", sessionId: session.sessionId });
       setSelectedAgent((current) => current?.sessionId === session.sessionId ? null : current);
       setExpandedSessions((current) => {
@@ -1681,6 +1723,9 @@ function App() {
   }, [archiveChanges, archiveOperation.start, archiveOperation.finish, applyArchiveChange]);
 
   function openNewSession() {
+    if (createSessionPendingRef.current) return;
+    setNewSessionProfile(DEFAULT_PROFILE_CHOICE);
+    setCreationError("");
     setNewCwd(trackedCwd || activeSession?.cwd || "");
     setNewModel(DEFAULT_MODEL);
     setNewReasoningEffort("");
@@ -1911,18 +1956,26 @@ function App() {
   const trackTerminalCwd = useCallback((cwd: string) => {
     const sessionId = activeIdRef.current;
     if (!sessionId) return;
-    setTrackedCwd(cwd);
-    setActiveSession((current) =>
-      current?.sessionId === sessionId ? { ...current, cwd } : current,
-    );
-    setSessions((current) =>
-      current.map((session) =>
-        session.sessionId === sessionId ? { ...session, cwd } : session,
-      ),
-    );
-    void daemonInvoke<string>("set_session_cwd", { sessionId, cwd }).catch((cause) =>
-      handleError(cause, setError, setNeedsLogin),
-    );
+    const generation = Symbol(sessionId);
+    cwdGenerations.current.set(sessionId, generation);
+    // Serialize tracked directory changes and publish only the daemon's accepted
+    // CWD. A pending profile barrier can reject the terminal's directory change.
+    const update = (cwdUpdates.current.get(sessionId) ?? Promise.resolve()).then(async () => {
+      if (cwdGenerations.current.get(sessionId) !== generation) return;
+      const confirmed = await daemonInvoke<string>("set_session_cwd", { sessionId, cwd });
+      if (typeof confirmed !== "string" || !confirmed) throw new Error("The daemon did not confirm the session working directory.");
+      if (activeIdRef.current === sessionId) {
+        setTrackedCwd(confirmed);
+        setActiveSession((current) => current?.sessionId === sessionId ? { ...current, cwd: confirmed } : current);
+      }
+      setSessions((current) => current.map((session) => session.sessionId === sessionId ? { ...session, cwd: confirmed } : session));
+    }).catch((cause) => {
+      if (activeIdRef.current === sessionId && cwdGenerations.current.get(sessionId) === generation) handleError(cause, setError, setNeedsLogin);
+    }).finally(() => {
+      if (cwdUpdates.current.get(sessionId) === update) cwdUpdates.current.delete(sessionId);
+      if (cwdGenerations.current.get(sessionId) === generation) cwdGenerations.current.delete(sessionId);
+    });
+    cwdUpdates.current.set(sessionId, update);
   }, []);
 
   const selectAgent = useCallback((session: SessionSummary, task: AgentTask) => {
@@ -2243,7 +2296,7 @@ function App() {
             <button
               className={referenceOpen ? "icon-button active" : "icon-button"}
               title="Browse commands, tools, skills, MCP, and instructions"
-              disabled={!sessionReady || !!selectedAgent}
+              disabled={!activeSession || !!selectedAgent}
               onClick={() => setReferenceOpen((current) => !current)}
             >
               <BookOpen size={17} />
@@ -2274,6 +2327,7 @@ function App() {
           </div>
         </header>
         {chatHeader.error && <p className="error-banner" role="alert">{chatHeader.error}</p>}
+        <ProfileConfigurationNotice status={sessionProfile.status} error={sessionProfile.error} onRefresh={sessionProfile.refresh} />
         {sessionStartup.status && !sessionStartup.ready && <SessionStartupBanner
           initialization={sessionStartup.status.initialization} error={sessionStartup.status.error}
           connected={activityConnected} retrying={sessionStartup.retrying}
@@ -2679,6 +2733,7 @@ function App() {
             </select>
             <span>
               {readingAttachments ? "Reading files..." :
+                profileUnavailable ? "Profile configuration unavailable - draft preserved" :
                 mobileInput ? "Enter for newline · tap Send" :
                 `${sessionProcessing && deliveryMode === "enqueue" ? "Enter to queue" : "Enter to send"} · Shift+Enter newline`}
             </span>
@@ -2688,7 +2743,7 @@ function App() {
               aria-label="Send message"
               disabled={
                 !activeSession ||
-                !sessionReady ||
+                !sessionReady || profileUnavailable ||
                 (!composer.trim() && attachmentDrafts.length === 0) ||
                 busy ||
                 modeBusy ||
@@ -2750,6 +2805,12 @@ function App() {
           <Suspense fallback={<aside className="reference-drawer" role="status">Loading context controls...</aside>}>
           <ReferenceDrawer
             sessionId={activeSession?.sessionId}
+            cwd={activeSession?.cwd}
+            profileStatus={sessionProfile.status}
+            profileError={sessionProfile.error}
+            onProfileStatus={sessionProfile.replace}
+            onRefreshProfile={sessionProfile.refresh}
+            onManageProfiles={() => { setReferenceOpen(false); setProfilesOpen(true); }}
             revision={contextRevision}
             references={references}
             loading={false}
@@ -2796,6 +2857,7 @@ function App() {
           deliveryDefaultError={deliveryDefault.error}
           onDeliveryDefaultChange={(value) => { deliveryDefault.setValue(value); setDeliveryOverride(null); }}
           onOpenShortcuts={() => { setSettingsOpen(false); setShortcutsOpen(true); }}
+          onOpenProfiles={() => { setSettingsOpen(false); setProfilesOpen(true); }}
           themePreference={themePreference}
           onThemePreferenceChange={setThemePreference}
           onClose={() => setSettingsOpen(false)}
@@ -2805,6 +2867,9 @@ function App() {
           }}
         />
       )}
+      {profilesOpen && <Suspense fallback={<p role="status">Opening profiles...</p>}>
+        <ProfilesPanel onClose={() => setProfilesOpen(false)} />
+      </Suspense>}
       {schedulesOpen && <Suspense fallback={<p role="status">Opening scheduled tasks...</p>}>
         <ScheduledTasksPanel sessions={sessions} defaultCwd={activeSession?.cwd ?? trackedCwd}
           onClose={() => setSchedulesOpen(false)}
@@ -2814,7 +2879,7 @@ function App() {
               .map((session) => sessionStartup.track(archiveChanges.reconcile(session, checkpoint)));
             const target = latest.find((session) => session.sessionId === sessionId);
             if (!target) throw new Error("This scheduled task's conversation is no longer available.");
-            setSessions(latest);
+            setSessions((current) => startupIndex.reconcile(current, latest).map(sessionStartup.reconcile));
             setSessionView(target.archived ? "archived" : "current");
             setSchedulesOpen(false);
             setSelectedAgent(null);
@@ -2994,6 +3059,13 @@ function App() {
                 </select>
               </label>
             </div>
+            <NewSessionProfilePicker cwd={newCwd} disabled={creatingSession} onChange={setNewSessionProfile} />
+            {newSessionProfile.pending && <p role="status">Resolving selected profile...</p>}
+            {creatingSession && <p role="status" aria-label="Session creation">
+              Creating the native session… Waiting for Copilot to confirm its session ID.
+              It will appear in Unfiled automatically; no message will be sent.
+            </p>}
+            {creationError && <p role="alert">{creationError}</p>}
             <footer>
               <button
                 type="button"
@@ -3006,7 +3078,7 @@ function App() {
               <button
                 className="button primary"
                 type="submit"
-                disabled={creatingSession || !newCwd.trim()}
+                disabled={creatingSession || !newCwd.trim() || newSessionProfile.pending || !!newSessionProfile.error}
               >
                 <Plus size={16} />
                 {creatingSession ? "Creating..." : "Create session"}
@@ -3101,7 +3173,9 @@ function SessionRow({
   onRename: () => void;
   onDelete: () => void;
 }) {
-  const indicator = sessionActivityIndicator(session.isActive, activityConnected, activity);
+  const indicator = activityConnected && session.initialization?.phase === "initializing"
+    ? { kind: "unknown", label: "Preparing session", description: startupStageLabel(session.initialization) }
+    : sessionActivityIndicator(session.isActive, activityConnected, activity);
   const statusId = `session-activity-${session.sessionId}`;
   return (
     <div className={active ? "session-item active" : "session-item"} data-session-id={session.sessionId}>
