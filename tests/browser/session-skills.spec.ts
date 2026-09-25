@@ -83,8 +83,15 @@ test("Skills lists runtime-effective sources and only explicit preview/apply rel
   await composer.fill("Keep my draft");
   const drawer = await open();
   await expect(drawer).toContainText("2 session skills");
+  await expect(drawer).toContainText("1 enabled · 1 disabled (hidden)");
+  await expect(drawer.getByRole("checkbox", { name: "Show disabled skills", exact: true })).not.toBeChecked();
+  await expect(drawer.locator(".skill-disabled")).toHaveCount(0);
   expect(state.requests.some((request) => request.command === "discover_skills" || request.command === "reload_session_skills")).toBe(false);
-  const disabled = drawer.locator("details").filter({ hasText: "disabled" });
+  await drawer.getByRole("checkbox", { name: "Show disabled skills", exact: true }).check();
+  const disabled = drawer.locator(".skill-disabled");
+  await expect(disabled.locator(".skill-disabled-badge")).toHaveText("Disabled");
+  await expect(disabled.locator("summary strong")).toHaveCSS("text-decoration-line", "line-through");
+  await expect(disabled).toHaveCSS("border-top-style", "dashed");
   await disabled.locator("summary").click();
   await expect(disabled.getByRole("button", { name: "Reference skill in chat" })).toBeDisabled();
   await drawer.getByRole("button", { name: "Load skills from current directory" }).click();
@@ -99,6 +106,109 @@ test("Skills lists runtime-effective sources and only explicit preview/apply rel
   await drawer.getByRole("button", { name: "Close context" }).click();
   await expect(composer).toHaveValue("Keep my draft");
   expect(state.requests.some((request) => ["send_message", "set_tool_enabled", "set_mcp_enabled"].includes(request.command))).toBe(false);
+});
+
+test("disabled visibility filters before pagination and search explains hidden matches without modifying runtime", async ({ page }) => {
+  const { state, open } = await setup(page);
+  state.skills = [
+    ...Array.from({ length: 35 }, (_, index) => skill(`blocked-${index}`, false)),
+    ...Array.from({ length: 35 }, (_, index) => skill(`enabled-${index}`)),
+  ];
+  const drawer = await open();
+  const entries = drawer.locator(".session-skills-panel .reference-item");
+  await expect(entries).toHaveCount(30);
+  await expect(entries.first()).toContainText("enabled-0");
+  await drawer.getByRole("button", { name: "Load more (5 remaining)", exact: true }).click();
+  await expect(entries).toHaveCount(35);
+  const toggle = drawer.getByRole("checkbox", { name: "Show disabled skills", exact: true });
+  await toggle.check();
+  await expect(entries).toHaveCount(30);
+  await expect(entries.first()).toHaveClass(/skill-disabled/);
+  await expect(drawer).toContainText("70 session skills · 35 enabled · 35 disabled");
+  await drawer.getByRole("textbox", { name: "Search skills", exact: true }).fill("blocked-34");
+  await expect(entries).toHaveCount(1);
+  await toggle.uncheck();
+  await expect(entries).toHaveCount(0);
+  await expect(drawer).toContainText('1 disabled skill matches this search. Select "Show disabled skills"');
+  await expect(drawer).toContainText("No matching enabled skills.");
+  await toggle.focus();
+  await toggle.press("Space");
+  await expect(entries).toHaveCount(1);
+  await drawer.getByRole("button", { name: "Refresh skill list", exact: true }).click();
+  await expect(toggle).toBeChecked();
+  await expect(entries).toHaveCount(1);
+  expect(state.requests.some((request) => ["reload_session_skills", "set_session_profile", "set_tool_enabled", "send_message"].includes(request.command))).toBe(false);
+});
+
+test("desktop skill rows keep names and sources inline with compact spacing and a visible disabled badge", async ({ page }, testInfo) => {
+  const { open } = await setup(page);
+  const drawer = await open();
+  await drawer.getByRole("checkbox", { name: "Show disabled skills", exact: true }).check();
+  const rows = drawer.locator(".session-skills-panel .reference-item");
+  for (const width of [1440, 1920, 900]) {
+    await page.setViewportSize({ width, height: 1000 });
+    const layout = await rows.evaluateAll((elements) => elements.map((element) => {
+      const name = element.querySelector("summary strong")!.getBoundingClientRect();
+      const source = element.querySelector("summary small")!.getBoundingClientRect();
+      const bounds = element.getBoundingClientRect();
+      const badge = element.querySelector(".skill-disabled-badge")?.getBoundingClientRect();
+      return { height: bounds.height, nameY: name.y, sourceY: source.y,
+        sourceAfterName: source.x >= name.right,
+        badgeFits: !badge || (source.right <= badge.left && badge.right <= bounds.right) };
+    }));
+    expect(layout.every((row) => row.height <= 36 && Math.abs(row.nameY - row.sourceY) < 3 && row.sourceAfterName && row.badgeFits)).toBe(true);
+    await expect(rows.first()).toHaveCSS("margin-top", "4px");
+  }
+  await rows.last().scrollIntoViewIfNeeded();
+  await page.screenshot({ path: testInfo.outputPath("compact-skill-rows-desktop.png") });
+  const first = rows.first();
+  await first.locator("summary").focus();
+  await first.locator("summary").press("Enter");
+  await expect(first).toHaveAttribute("open");
+  await expect(first).toContainText("Instructions for existing");
+  await expect(first.locator(".reference-detail .skills-cwd")).toHaveText("Q:\\repo-a\\.github\\skills\\existing\\SKILL.md");
+  await expect(first.getByRole("button", { name: "Reference skill in chat" })).toBeEnabled();
+});
+
+test("long skill names and sources wrap instead of clipping or pushing disabled badges out of the drawer", async ({ page }) => {
+  const { state, open } = await setup(page);
+  const longName = "descriptive-skill-name-".repeat(8);
+  state.skills = [{ ...skill(longName, false), source: "a-very-long-repository-source-".repeat(6) }];
+  const drawer = await open();
+  await drawer.getByRole("checkbox", { name: "Show disabled skills", exact: true }).check();
+  for (const width of [1440, 900, 390, 320]) {
+    await page.setViewportSize({ width, height: 1000 });
+    const row = drawer.locator(".skill-disabled");
+    const fits = await row.evaluate((element) => {
+      const summary = element.querySelector(".skill-summary-text")!;
+      const bounds = summary.getBoundingClientRect();
+      const text = document.createRange();
+      text.selectNodeContents(summary);
+      const badge = element.querySelector(".skill-disabled-badge")!.getBoundingClientRect();
+      return summary.scrollWidth <= summary.clientWidth + 1
+        && text.getBoundingClientRect().bottom <= bounds.bottom + 1
+        && bounds.right <= badge.left && badge.right <= element.getBoundingClientRect().right;
+    });
+    expect(fits).toBe(true);
+    await expect(row.locator("summary strong")).toHaveText(longName);
+    expect(await drawer.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+  }
+});
+
+test("all-disabled and empty inventories have distinct explanations and disabled styling survives light theme", async ({ page }) => {
+  const { state, open } = await setup(page);
+  state.skills = [skill("only-disabled", false)];
+  const drawer = await open();
+  await expect(drawer).toContainText("No enabled skills in this session.");
+  await expect(drawer).not.toContainText("The runtime reports no skills");
+  await drawer.getByRole("checkbox", { name: "Show disabled skills", exact: true }).check();
+  await page.evaluate(() => { document.documentElement.dataset.theme = "light"; });
+  await expect(drawer.locator(".skill-disabled")).toHaveCSS("border-top-style", "dashed");
+  await expect(drawer.locator(".skill-disabled summary strong")).toHaveCSS("text-decoration-line", "line-through");
+  state.skills = [];
+  await drawer.getByRole("button", { name: "Refresh skill list", exact: true }).click();
+  await expect(drawer).toContainText("The runtime reports no skills in this session.");
+  await expect(drawer).toContainText("0 session skills · 0 enabled · 0 disabled");
 });
 
 test("changing terminal CWD invalidates a preview and reload targets the confirmed new directory", async ({ page }) => {
@@ -162,5 +272,15 @@ test.describe("mobile skills", () => {
     await page.screenshot({ path: testInfo.outputPath("skill-preview-mobile.png") });
     await apply.tap();
     await expect(drawer).toContainText("3 session skills");
+    await drawer.getByRole("checkbox", { name: "Show disabled skills", exact: true }).check();
+    await expect(drawer.locator(".skill-disabled .skill-disabled-badge")).toBeVisible();
+    const row = drawer.locator(".session-skills-panel .reference-item").first();
+    const name = (await row.locator("summary strong").boundingBox())!;
+    const source = (await row.locator("summary small").boundingBox())!;
+    expect(source.y).toBeGreaterThanOrEqual(name.y + name.height);
+    expect((await row.locator("summary").boundingBox())!.height).toBeGreaterThanOrEqual(44);
+    expect((await drawer.locator(".skills-show-disabled").boundingBox())!.height).toBeGreaterThanOrEqual(44);
+    await page.setViewportSize({ width: 320, height: 844 });
+    expect(await drawer.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
   });
 });

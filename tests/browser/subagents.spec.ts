@@ -122,6 +122,19 @@ test("child navigation preserves the parent draft and routes direct messages by 
   expect(state.sent[1].sessionId).toBe("b");
 });
 
+test("Escape in a subagent view does not stop the parent or implicitly cancel all agents", async ({ page }) => {
+  const state = await setup(page);
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent("test-daemon", { detail: {
+    type: "session_event", sessionId: "a",
+    event: { id: "parent-working", type: "assistant.turn_start", timestamp: "", data: {} },
+  } })));
+  const a = await expand(page, "a");
+  await a.getByRole("button", { name: /Builder/ }).click();
+  await page.getByRole("textbox", { name: "Message Builder", exact: true }).press("Escape");
+  expect(state.requests.some((request) => ["abort_session", "cancel_agent_task"].includes(request.command))).toBe(false);
+  await expect(page.getByRole("heading", { name: "Builder", exact: true })).toBeVisible();
+});
+
 test.describe("mobile multiline chat", () => {
   test.use({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
   test("Enter adds lines in parent and subagent composers, and only Send submits", async ({ page }) => {
@@ -437,10 +450,10 @@ test("Settings exposes a keyboard shortcut popup with the terminal and copy shor
   await expect(popup).not.toContainText("Alt T");
   await expect(popup.getByRole("button", { name: "Close", exact: true })).toBeFocused();
   await page.setViewportSize({ width: 390, height: 844 });
-  expect(await popup.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
-  await popup.getByRole("button", { name: "Close", exact: true }).click();
   await expect(popup).toHaveCount(0);
-  await expect(page.locator(".parent-session-view .composer textarea")).toBeFocused();
+  await page.getByRole("button", { name: "Open sessions", exact: true }).click();
+  await page.locator(".daemon-state").click();
+  await expect(page.getByRole("button", { name: /^Keyboard shortcuts/ })).toHaveCount(0);
 });
 
 test("Ctrl+C copies selected terminal text, preserves bare interrupts and reports clipboard failures", async ({ page }) => {

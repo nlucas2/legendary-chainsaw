@@ -59,7 +59,10 @@ Mobile/web browser ──┘                                  │
 - **Live events** use the SDK's forward event-log cursor and a sequenced replay bus. Model-call
   boundaries do not mark the whole session idle: session lifecycle events drive the composer status,
   with a periodic authoritative snapshot for recovery. Accepted, model-started, and first-output
-  timings distinguish runtime/model latency from UI latency. Heavy diagnostic payloads are opt-in.
+  timings distinguish runtime/model latency from UI latency. **Additional options → Advanced →
+  Raw diagnostics** is off by default. Its checkbox shows the current On/Off state and enables
+  a JSON viewer for the latest 100 live events with additional filtered telemetry, not full model
+  payloads. Normal streaming, event logging, and the Context usage view do not depend on this setting.
 - **Models** are resolved from the live session rather than labeled "default." The header opens the
   session-specific model catalog and switches via the Copilot runtime.
 - **Profiles and groups** are configured in Settings, not hardcoded launch aliases. Groups link
@@ -73,6 +76,41 @@ Mobile/web browser ──┘                                  │
   or replacements for tool approvals. MCP name conflicts replace the whole earlier definition
   with the later one and are shown in the preview. Skill directories keep their declared order;
   native discovery determines which same-named skill wins.
+  **Edit profile → Plugin exclusions** lists the daemon runtime's installed plugins, including
+  their version, marketplace, and enabled state. Separate **Exclude skills** and **Exclude MCP**
+  checkboxes select capabilities without disabling the plugin globally. **Refresh installed plugins**
+  rereads the inventory; **Add a plugin name manually** supports exact-name write-ins. Saved names
+  absent from the inventory remain visible and editable; duplicate plugin names share a selection.
+  Inventory failures are shown without clearing selections. The skills column affects **skills only**; MCP exclusions are a
+  separate setting. Neither setting disables a plugin's custom agents, hooks, or existing
+  conversation instructions.
+  It applies on session initialization/resume, profile changes, and app-driven skill/CWD reloads.
+  Switching to a profile without the exclusion restores skills disabled by the previous profile;
+  skills already disabled beforehand stay disabled. Global plugin settings are never changed.
+  An external client that directly reloads or enables skills can change runtime state; reapply the
+  profile or use the app's skill reload to restore its exclusions. This is not a security boundary.
+  **Exclude MCP** matches exact plugin names, independently
+  of the skills column. The preview resolves native MCP source ownership before using the runtime's
+  name-based `disabledMcpServers` setting:
+  - Included profile/group definitions win, including explicitly linked repository files.
+  - A same-named base/user definition is copied into the session's explicit configuration so the
+    excluded plugin cannot override it. Source files and other sessions are not modified.
+  - A winning included-plugin definition is kept. A plugin-only name is disabled only when its
+    ownership is unambiguous. Pre-existing disabled choices remain disabled.
+  - Unknown provenance blocks creation/application. The pinned runtime reports only winning
+    definitions, not shadowed plugin contributions. When another plugin remains enabled and the
+    excluded plugin is the reported winner, the app cannot determine the fallback precedence
+    (even if a base definition exists). An explicit profile/group definition resolves this;
+    otherwise the preview blocks rather than guessing.
+  Repository `.mcp.json` and `.github/mcp.json` were not discovered automatically by the pinned
+  runtime in the isolated probe. The app detects potential overlapping declarations in those files
+  but does not silently load them; explicitly link the intended CLI-shaped file in a group.
+  Exclusions survive native MCP/plugin reloads and are supplied on create/resume. Removing a profile
+  restores only its owned disabled names and removes its base overrides. The app retains observed
+  independent disabled choices across reattachment. Source decisions and base overrides are
+  fingerprinted; relevant discovery changes require a fresh preview, including after a CWD change.
+  No MCP credentials are written to session metadata or returned in the preview. Out-of-band
+  configuration changes are not a security boundary; reapply the profile after external edits.
   **Apply profile now** succeeds only when the session is idle, including subagents, existing
   native queued work, and pending input. Busy changes are rejected rather than queued: let the
   work finish or use the existing Stop action, then explicitly try again.
@@ -96,6 +134,12 @@ Mobile/web browser ──┘                                  │
   terminal; the runtime can update its discovered repository skills on that directory change.
   **Context → Skills** shows the runtime's actual session skill list, enabled/disabled state,
   source, and path, rather than treating a global discovery catalog as active session state.
+  Desktop skill rows place the name and source on one compact line, wrapping only when needed.
+  Mobile keeps stacked metadata and touch-sized rows; expanding a row reveals the full definition.
+  Disabled skills are hidden by default; **Show disabled skills** reveals them with a crossed-out
+  name, dashed card, and a prohibition-icon badge. Counts distinguish enabled and disabled skills,
+  and searches indicate when disabled matches are hidden. This display toggle never changes runtime
+  enablement; disabled definitions remain inspectable but cannot be referenced with the insert button.
   **Load skills from current directory** previews discoverable skill metadata; **Apply discovery
   and reload** refreshes the selected idle session. This uses the same configuration policy as
   create/resume and does not rewrite skill directories, disabled-skill selections, global config,
@@ -328,14 +372,45 @@ confirmation value or starting a follow-up implementation turn automatically.
 
 ## Keyboard workflow
 
-Open **Settings → Keyboard shortcuts** for the shortcut popup (also available with `?` outside
-text fields). Ctrl+T remains the reasoning toggle; no Alt+T terminal shortcut is assigned.
+Open **Settings → Keyboard shortcuts** to record or change app bindings, add/remove alternatives,
+or **Clear** an action to leave it **Unbound**. Empty bindings are saved explicitly; they never
+silently fall back to defaults. **Reset** restores one action; **Reset all shortcuts** restores
+the defaults. Conflicts are rejected and browser/OS-reserved combinations carry warnings.
+Preferences are stored locally per browser/desktop installation and sync between its open windows.
+Storage failures stay visible. The editor and its entry point are absent in narrow layouts
+(820px and below), not hidden merely because a device supports touch: tablets using the desktop
+layout retain it. Normal clipboard/caret editing, dialog dismissal/focus navigation, plain Enter
+submission, and Enter-to-open previews stay native/contextual rather than remappable.
+
+The following are the defaults. The editor also opens with `?` outside text fields unless that
+action is remapped or cleared. Ctrl+T toggles reasoning; no Alt+T terminal shortcut is assigned.
+On phones the toolbar keeps labelled **Git**, **Context**, **Terminal**, and **More** actions.
+**More → Additional options** contains Ask, Fork, Catch up, Rename, and App settings with
+visible descriptions and explanations when unavailable. Fork copies a conversation, not a Git branch.
+Stop remains beside the composer while a turn is running.
+Desktop sidebar sessions use compact padding and thin separators, with visible expand arrows.
+Titles and working-directory paths still wrap in full; mobile retains its larger touch targets.
 
 The prompt keeps focus while a session runs. Enter submits using the selected delivery mode;
 Shift+Enter inserts a newline. Ctrl+Q explicitly queues; Ctrl+Enter steers the running turn.
-Tab or Shift+Tab cycles agent modes in the composer. Ctrl+S stashes/restores the draft, Ctrl+R
-cycles recent submitted prompts, and F6 / Shift+F6 moves between workspace regions.
-Terminal-focused keystrokes stay with the terminal except its explicit toggle shortcut.
+Tab or Shift+Tab cycles agent modes in the composer. Ctrl+S stashes/restores the draft.
+Up on the composer's first visual line recalls an earlier prompt; Down on the last visual line
+moves forward and restores the unsent draft. Selection, modified arrow keys, and movement within
+multiline/wrapped text retain their normal behavior. History is session-scoped, includes loaded
+human messages and locally submitted prompts, and keeps the latest 100 distinct texts.
+F6 / Shift+F6 moves between workspace regions. Ctrl+R is not bound by default.
+In the Tauri desktop app, Ctrl+Tab / Ctrl+Shift+Tab cycles the currently listed sessions in sidebar order, wrapping at either
+end and respecting search and Current/Archived filters. Collapsed groups remain in the cycle.
+Keyboard cycling only previews inactive or not-yet-ready sessions: Enter opens/initializes the
+highlighted session, while Escape returns without attaching it. You can keep cycling past a preview
+without warming that session up. Already-active, ready sessions switch immediately. Clicking any
+session still opens it directly without this confirmation.
+The web app explicitly ignores Ctrl+Tab / Ctrl+Shift+Tab, even if the browser forwards those keys,
+so changing browser tabs cannot also change sessions. Ctrl+Alt+Down / Ctrl+Alt+Up switches sessions
+in both versions. These shortcuts also work with terminal focus, but not through an open dialog.
+Escape stops the current parent turn, including while drafting; Ctrl+. remains an alternative.
+Open dialogs consume Escape first. Idle sessions and subagent views do not stop the parent.
+Terminal-focused keystrokes stay with the terminal except the terminal toggle and session-cycle shortcuts.
 Press `?` outside text inputs for the shortcut list. Touch controls remain available.
 
 ## Regression tests

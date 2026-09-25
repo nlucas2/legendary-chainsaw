@@ -90,7 +90,7 @@ export function SettingsPanel({
               <h2>Settings</h2>
             </div>
           </div>
-          <button className="icon-button" onClick={onClose} aria-label="Close settings">
+          <button className="icon-button" autoFocus onClick={onClose} aria-label="Close settings">
             <X size={18} />
           </button>
         </header>
@@ -143,7 +143,7 @@ export function SettingsPanel({
         {onOpenShortcuts && <div className="settings-section">
           <button type="button" className="settings-navigation" onClick={onOpenShortcuts}>
             <span className="settings-navigation-icon"><Keyboard size={17} /></span>
-            <span><strong>Keyboard shortcuts</strong><small>Terminal, copy, chat, queue, and navigation</small></span>
+            <span><strong>Keyboard shortcuts</strong><small>Customize, unbind, or reset app shortcuts</small></span>
             <i>Open</i>
           </button>
         </div>}
@@ -159,7 +159,7 @@ export function SettingsPanel({
             </select>
             <small>Applies to the composer now and after reload. Queue waits for the current turn; Steer sends guidance to the running turn. This does not change messages already queued.</small>
           </label>
-          <p>The composer dropdown is a temporary override for this window. Ctrl+Q explicitly queues; Ctrl+Enter explicitly steers.</p>
+          <p>The composer dropdown is a temporary override for this window. Configured Queue and Steer shortcuts choose delivery explicitly.</p>
         </details>}
         {deliveryDefaultError && <p role="alert" className="typography-error">{deliveryDefaultError}</p>}
 

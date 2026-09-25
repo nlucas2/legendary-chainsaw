@@ -1,15 +1,21 @@
 import { useEffect, useState } from "react";
 
-const QUERY = "(max-width: 820px), (pointer: coarse)";
-
-export function useMobileInput() {
-  const [mobile, setMobile] = useState(() => window.matchMedia(QUERY).matches);
+function useMediaMatch(condition: string) {
+  const [mobile, setMobile] = useState(() => window.matchMedia(condition).matches);
   useEffect(() => {
-    const query = window.matchMedia(QUERY);
+    const query = window.matchMedia(condition);
     const sync = () => setMobile(query.matches);
     sync();
     query.addEventListener("change", sync);
     return () => query.removeEventListener("change", sync);
-  }, []);
+  }, [condition]);
   return mobile;
+}
+
+export function useMobileInput() {
+  return useMediaMatch("(max-width: 820px), (pointer: coarse)");
+}
+
+export function useNarrowLayout() {
+  return useMediaMatch("(max-width: 820px)");
 }

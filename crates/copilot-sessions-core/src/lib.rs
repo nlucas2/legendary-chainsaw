@@ -13,6 +13,7 @@ mod session_actions;
 mod session_archive;
 mod session_skills;
 mod session_configuration;
+mod mcp_resolution;
 pub mod profiles;
 mod session_profiles;
 #[cfg(test)]
@@ -465,6 +466,10 @@ struct StoredSessionMeta {
     prevent_pending_work: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     profile: Option<profiles::ProfileSelection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    profile_disabled_skills: Vec<session_skills::ProfileDisabledSkill>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile_mcps: Option<mcp_resolution::ProfileMcpState>,
 }
 
 struct ApprovalBroker {
@@ -791,8 +796,8 @@ impl SessionService {
             config = config.with_context_tier(tier);
         }
         let started = std::time::Instant::now();
-        let profile = self.resolve_new_profile(&request)?;
-        let config = session_configuration::SessionConfiguration.configure_new_profile(config, profile.as_ref());
+        let (profile, mcp) = self.resolve_new_profile(&request).await?;
+        let config = session_configuration::SessionConfiguration.configure_new_profile(config, profile.as_ref(), &mcp);
         let session = Arc::new(self.client().await?.create_session(config).await?);
         let id = session.id().to_string();
         tracing::info!(session_id = %id, stage = "create", elapsed_ms = started.elapsed().as_millis(), "session startup");
@@ -815,6 +820,8 @@ impl SessionService {
                 tool_available_tools: None,
                 prevent_pending_work: request.defer_initialization,
                 profile: profile.as_ref().map(profiles::ResolvedProfile::selection),
+                profile_disabled_skills: Vec::new(),
+                profile_mcps: (!mcp.revision.is_empty()).then(|| mcp.state(&[], &[])),
             },
         );
         self.persist_metadata().await?;
@@ -823,6 +830,8 @@ impl SessionService {
         }
         self.attach(session).await?;
         self.sync_initial_session_name(&id).await?;
+        self.sync_profile_skill_exclusions(&id).await?;
+        self.verify_profile_mcps(&id).await?;
         self.initialize_environment(&id).await?;
         self.refresh_model(&id).await?;
         let metadata = self.metadata.read().await;
@@ -876,11 +885,20 @@ impl SessionService {
         self.require_initialized(&session_id).await?;
         if !self.active.read().await.contains_key(&session_id) {
             let session = self.resume_handle(&session_id, continue_pending_work).await?;
-            self.attach(session).await?;
+            self.attach(session.clone()).await?;
+            let restore_mcps = self.profile_configuration.lock().await.get(&session_id).is_some_and(|state| state.blocked)
+                && self.metadata.read().await.get(&session_id).is_some_and(|meta| meta.profile_mcps.is_some());
+            if restore_mcps {
+                self.require_configuration_idle(&session).await?;
+                self.client().await?.call("session.mcp.reload", Some(serde_json::json!({"sessionId":session_id}))).await?;
+                self.verify_profile_mcps(&session_id).await?;
+            }
             self.profile_configuration.lock().await.remove(&session_id);
             self.refresh_model(&session_id).await?;
         }
         self.initialize_environment(&session_id).await?;
+        self.sync_profile_skill_exclusions(&session_id).await?;
+        self.verify_profile_mcps(&session_id).await?;
         let metadata = self.metadata.read().await;
         let meta = metadata.get(&session_id);
         let mut cache = self.session_cache.write().await;
@@ -986,7 +1004,21 @@ impl SessionService {
         if blocked_configuration {
             config = config.with_continue_pending_work(false);
         }
-        let config = session_configuration::SessionConfiguration.configure_resume_profile(config, profile.as_ref());
+        let mcp = if let Some(profile) = &profile {
+            if profile.excluded_mcp_plugins.is_empty() {
+                Default::default()
+            } else {
+                let cwd = meta.as_ref().and_then(|m|m.cwd.as_deref()).ok_or_else(||
+                    ServiceError::InvalidArgument("Missing working directory for the approved MCP profile.".into()))?;
+                self.resolve_profile_mcps(profile, cwd).await?
+            }
+        } else { Default::default() };
+        mcp.require_resolved()?;
+        let mcp_state = meta.as_ref().and_then(|meta| meta.profile_mcps.as_ref());
+        if mcp_state.map(|state| state.revision.as_str()).unwrap_or("") != mcp.revision {
+            return Err(ServiceError::InvalidArgument("MCP sources changed. Preview and reapply the profile before resuming.".into()));
+        }
+        let config = session_configuration::SessionConfiguration.configure_resume_profile(config, profile.as_ref(), &mcp, mcp_state);
         Ok(Arc::new(self.client().await?.resume_session(config).await?))
     }
 
@@ -1608,6 +1640,8 @@ impl SessionService {
             .or_default()
             .cwd = Some(cwd.clone());
         self.persist_metadata().await?;
+        self.sync_profile_skill_exclusions(session_id).await?;
+        self.verify_profile_mcps(session_id).await?;
         Ok(cwd)
     }
 
@@ -1882,13 +1916,17 @@ impl SessionService {
                 });
                 continue;
             }
-            match client
+            let result = async {
+                self.verify_profile_mcps(&session_id).await?;
+                client
                 .call(
                     "session.mcp.reload",
                     Some(serde_json::json!({ "sessionId": &session_id })),
                 )
-                .await
-            {
+                .await?;
+                self.verify_profile_mcps(&session_id).await
+            }.await;
+            match result {
                 Ok(_) => results.push(SessionOperationResult {
                     session_id,
                     success: true,

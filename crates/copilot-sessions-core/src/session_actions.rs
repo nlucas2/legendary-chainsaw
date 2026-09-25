@@ -203,6 +203,8 @@ impl SessionService {
                 reasoning_summary: source_meta.reasoning_summary,
                 context_tier: source_meta.context_tier,
                 profile: source_meta.profile,
+                profile_disabled_skills: source_meta.profile_disabled_skills,
+                profile_mcps: source_meta.profile_mcps,
                 title: Some(title.clone()),
                 prevent_pending_work: true,
                 ..StoredSessionMeta::default()

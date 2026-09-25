@@ -77,6 +77,10 @@ pub struct SessionProfile {
     pub id: String,
     pub name: String,
     pub group_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_skill_plugins: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_mcp_plugins: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +111,10 @@ pub struct SaveSessionProfile {
     pub name: String,
     #[serde(default)]
     pub group_ids: Vec<String>,
+    #[serde(default)]
+    pub excluded_skill_plugins: Vec<String>,
+    #[serde(default)]
+    pub excluded_mcp_plugins: Vec<String>,
     pub expected_revision: String,
 }
 
@@ -191,6 +199,8 @@ pub struct ResolvedProfilePreview {
     pub group_names: Vec<String>,
     pub mcp_servers: Vec<ProfileMcpSource>,
     pub skill_directories: Vec<String>,
+    pub excluded_skill_plugins: Vec<String>,
+    pub excluded_mcp_plugins: Vec<String>,
     pub warnings: Vec<String>,
 }
 
@@ -204,6 +214,8 @@ pub struct ResolvedProfile {
     pub group_names: Vec<String>,
     pub mcp_servers: IndexMap<String, McpServerConfig>,
     pub skill_directories: Vec<PathBuf>,
+    pub excluded_skill_plugins: Vec<String>,
+    pub excluded_mcp_plugins: Vec<String>,
     pub warnings: Vec<String>,
     pub mcp_sources: Vec<ProfileMcpSource>,
     resolution_snapshot: Option<ProfileResolutionSnapshot>,
@@ -232,6 +244,8 @@ impl ResolvedProfile {
                 .iter()
                 .map(|path| display_path(path))
                 .collect(),
+            excluded_skill_plugins: self.excluded_skill_plugins.clone(),
+            excluded_mcp_plugins: self.excluded_mcp_plugins.clone(),
             warnings: self.warnings.clone(),
         }
     }
@@ -355,6 +369,8 @@ impl ProfileLibrary {
                 )?,
                 name: request.name.trim().to_owned(),
                 group_ids: request.group_ids,
+                excluded_skill_plugins: request.excluded_skill_plugins.into_iter().map(|name| name.trim().to_owned()).collect(),
+                excluded_mcp_plugins: request.excluded_mcp_plugins.into_iter().map(|name| name.trim().to_owned()).collect(),
             };
             if let Some(existing) = store.profiles.iter_mut().find(|p| p.id == profile.id) {
                 *existing = profile;
@@ -617,6 +633,8 @@ fn compile(directory: &Path, store: &Store, profile_id: Option<&str>) -> Result<
         group_names: vec![],
         mcp_servers: IndexMap::new(),
         skill_directories: vec![],
+        excluded_skill_plugins: vec![],
+        excluded_mcp_plugins: vec![],
         warnings: vec![],
         mcp_sources: vec![],
         resolution_snapshot: None,
@@ -634,6 +652,8 @@ fn compile(directory: &Path, store: &Store, profile_id: Option<&str>) -> Result<
         .find(|profile| profile.id == profile_id)
         .ok_or_else(|| ProfileError::NotFound("Session profile not found.".into()))?;
     resolved.name = profile.name.clone();
+    resolved.excluded_skill_plugins = profile.excluded_skill_plugins.clone();
+    resolved.excluded_mcp_plugins = profile.excluded_mcp_plugins.clone();
     hash_part(&mut fingerprint, path_key(directory).as_bytes());
     hash_part(&mut fingerprint, &json_bytes(profile)?);
     let mut definitions: IndexMap<String, (Value, String)> = IndexMap::new();
@@ -770,7 +790,7 @@ fn compile(directory: &Path, store: &Store, profile_id: Option<&str>) -> Result<
     Ok(resolved)
 }
 
-fn parse_mcp(bytes: &[u8], path: &Path) -> Result<(IndexMap<String, Value>, bool)> {
+pub(crate) fn parse_mcp(bytes: &[u8], path: &Path) -> Result<(IndexMap<String, Value>, bool)> {
     if bytes.len() as u64 > MAX_SOURCE_BYTES {
         return Err(ProfileError::Invalid("MCP source exceeds 2 MiB.".into()));
     }
@@ -1042,6 +1062,23 @@ fn validate_store(store: &Store) -> Result<()> {
             return Err(ProfileError::Invalid(
                 "A profile may reference at most 128 groups.".into(),
             ));
+        }
+        if profile.excluded_skill_plugins.len() > MAX_REFERENCES || profile.excluded_mcp_plugins.len() > MAX_REFERENCES {
+            return Err(ProfileError::Invalid("Each plugin exclusion list may contain at most 128 names.".into()));
+        }
+        let mut excluded = HashSet::new();
+        for name in &profile.excluded_skill_plugins {
+            validate_name(name)?;
+            if !excluded.insert(name) {
+                return Err(ProfileError::Invalid("Excluded skill plugin names must be unique.".into()));
+            }
+        }
+        excluded.clear();
+        for name in &profile.excluded_mcp_plugins {
+            validate_name(name)?;
+            if !excluded.insert(name) {
+                return Err(ProfileError::Invalid("Excluded MCP plugin names must be unique.".into()));
+            }
         }
         let mut selected = HashSet::new();
         for group_id in &profile.group_ids {

@@ -359,6 +359,7 @@ async fn dispatch(state: &DaemonState, command: &str, body: Value) -> Result<Val
             json_result(service.submit_message(request).await?)
         }
         "get_profile_library" => json_result(service.profile_library()?.snapshot()?),
+        "get_installed_plugins" => service.installed_plugins().await,
         "save_profile_group" => json_result(service.profile_library()?.save_group(decode(body)?)?),
         "delete_profile_group" => json_result(service.profile_library()?.delete_group(decode(body)?)?),
         "save_profile" => json_result(service.profile_library()?.save_profile(decode(body)?)?),

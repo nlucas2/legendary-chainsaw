@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { Ban } from "lucide-react";
 import { daemonInvoke } from "../lib/daemon";
 import { createSingleflightReader, errorMessage, paginate } from "../lib/context";
 import { normalizeSessionSkills, normalizeSkillPreview, type SessionSkills, type SessionSkillPreview } from "../lib/sessionSkills";
@@ -21,6 +22,7 @@ export function SessionSkillsPanel({ sessionId, cwd, query, revision = 0, refres
   const [preview, setPreview] = useState<SessionSkillPreview | null>(null);
   const [previewing, setPreviewing] = useState(false);
   const [limit, setLimit] = useState(30);
+  const [showDisabled, setShowDisabled] = useState(false);
   const reader = useRef<ReturnType<typeof createSingleflightReader<SessionSkills>> | null>(null);
   const mutation = useRef(false);
   const generation = useRef(0);
@@ -44,7 +46,7 @@ export function SessionSkillsPanel({ sessionId, cwd, query, revision = 0, refres
     const timer = setTimeout(() => { if (!mutation.current) void reader.current?.refresh(); }, 250);
     return () => clearTimeout(timer);
   }, [revision, refreshToken]);
-  useEffect(() => setLimit(30), [query, sessionId]);
+  useEffect(() => setLimit(30), [query, sessionId, showDisabled]);
 
   async function inspect() {
     if (mutation.current || !snapshot?.cwd || snapshot.cwd !== cwd) return;
@@ -91,12 +93,16 @@ export function SessionSkillsPanel({ sessionId, cwd, query, revision = 0, refres
   }
 
   const needle = query.trim().toLocaleLowerCase();
-  const matching = snapshot?.skills.filter((skill) => [skill.name, skill.description, skill.path ?? "", skill.source]
+  const matching = snapshot?.skills.filter((skill) => [skill.name, skill.description, skill.path ?? "", skill.source, skill.pluginName ?? ""]
     .some((text) => text.toLocaleLowerCase().includes(needle))) ?? [];
-  const page = paginate(matching, limit);
+  const visible = matching.filter((skill) => showDisabled || skill.enabled);
+  const page = paginate(visible, limit);
+  const enabledCount = snapshot?.skills.filter((skill) => skill.enabled).length ?? 0;
+  const disabledCount = (snapshot?.skills.length ?? 0) - enabledCount;
+  const hiddenMatches = showDisabled ? 0 : matching.length - visible.length;
   const cwdPending = snapshot && snapshot.cwd !== cwd;
   return <div className="context-tools-panel session-skills-panel">
-    <p className="ct-scope"><strong>Skills available to this session</strong> · Reported by the runtime, including disabled skills.</p>
+    <p className="ct-scope"><strong>Session skills</strong> · Enabled skills are shown by default. Showing disabled skills does not enable them.</p>
     <section className="ct-status">
       <strong>Current working directory</strong>
       <code className="skills-cwd">{cwd || snapshot?.cwd || "No working directory"}</code>
@@ -125,17 +131,27 @@ export function SessionSkillsPanel({ sessionId, cwd, query, revision = 0, refres
     {snapshot?.warnings.map((message, index) => <p className="ct-help" key={`warning-${index}`}>{message}</p>)}
     <button type="button" className="ct-load-more" disabled={loading || reloading || previewing}
       onClick={() => void reader.current?.refresh()}>Refresh skill list</button>
-    {snapshot && <p className="ct-help">{snapshot.skills.length} session skills · {snapshot.skills.filter((skill) => skill.enabled).length} enabled</p>}
-    {page.items.map((skill) => <details className="reference-item" key={skill.name}>
-      <summary><span><strong>{skill.name}</strong><small>{skill.enabled ? "Enabled" : "Disabled"} · {skill.source}{skill.pluginName ? ` · ${skill.pluginName}` : ""}</small></span></summary>
+    {snapshot && <div className="skills-visibility">
+      <p className="ct-help" role="status">{snapshot.skills.length} session skills · {enabledCount} enabled · {disabledCount} disabled{showDisabled ? "" : " (hidden)"}</p>
+      <label className="skills-show-disabled"><input type="checkbox" checked={showDisabled}
+        onChange={(event) => setShowDisabled(event.target.checked)} />Show disabled skills</label>
+    </div>}
+    {needle && hiddenMatches > 0 && <p className="ct-help">{hiddenMatches} disabled {hiddenMatches === 1 ? "skill matches" : "skills match"} this search. Select "Show disabled skills" to view {hiddenMatches === 1 ? "it" : "them"}.</p>}
+    {page.items.map((skill) => <details className={`reference-item${skill.enabled ? "" : " skill-disabled"}`} key={skill.name}>
+      <summary><span className="skill-summary-text"><strong>{skill.name}</strong><small>{skill.enabled ? "Enabled" : "Not available"} · {skill.source}{skill.pluginName ? ` · ${skill.pluginName}` : ""}</small></span>
+        {!skill.enabled && <span className="skill-disabled-badge"><Ban size={14} aria-hidden="true" />Disabled</span>}
+      </summary>
       <div className="reference-detail">
+        {!skill.enabled && <p className="ct-help">Disabled for this session. This skill is not available for use; its definition is shown for reference only.</p>}
         <p>{skill.description}</p>
         {skill.path && <code className="skills-cwd">{skill.path}</code>}
         <button type="button" className="ct-load-more" disabled={!skill.enabled}
           onClick={() => onInsert(`Use the ${skill.name} skill to `)}>Reference skill in chat</button>
       </div>
     </details>)}
-    {!loading && snapshot && matching.length === 0 && <p className="ct-help">{needle ? "No matching session skills." : "The runtime reports no skills in this session."}</p>}
+    {!loading && snapshot && visible.length === 0 && <p className="ct-help">{needle
+      ? showDisabled ? "No matching session skills." : "No matching enabled skills."
+      : snapshot.skills.length === 0 ? "The runtime reports no skills in this session." : "No enabled skills in this session. Select \"Show disabled skills\" to inspect the disabled definitions."}</p>}
     {page.remaining > 0 && <button type="button" className="ct-load-more" onClick={() => setLimit(page.nextLimit)}>Load more ({page.remaining} remaining)</button>}
   </div>;
 }

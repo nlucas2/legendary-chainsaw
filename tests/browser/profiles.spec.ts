@@ -1,5 +1,5 @@
 import { test, expect, type Page, type Route, type WebSocketRoute } from "@playwright/test";
-import type { ProfileLibrary, SessionProfileStatus } from "../../src/lib/profiles";
+import type { InstalledPlugin, ProfileLibrary, SessionProfileStatus } from "../../src/lib/profiles";
 
 const initialLibrary = (): ProfileLibrary => ({
   directory: "Q:\\profiles", revision: "r1",
@@ -19,8 +19,13 @@ async function setup(page: Page) {
     library: initialLibrary(), status: { sessionId: "a", profile: null, applying: false,
       configurationBlocked: false, requiresReconnect: false, error: null } as SessionProfileStatus,
     requests: [] as { command: string; args: Record<string, unknown> }[],
-    failSave: false, failPreview: false, busySession: false, holdApply: false,
+    failSave: false, failPreview: false, busySession: false, holdApply: false, resolutionIssues: [] as string[],
     pendingApply: undefined as Route | undefined, terminalConnections: 0,
+    plugins: [
+      { name: "fixture-alpha", marketplace: "example-market", version: "1.2.3", enabled: true },
+      { name: "fixture-beta", marketplace: "", version: null, enabled: false },
+    ] as InstalledPlugin[],
+    failPlugins: false, holdPlugins: false, pendingPlugins: undefined as Route | undefined,
     socket: undefined as WebSocketRoute | undefined,
   };
   await page.addInitScript(() => {
@@ -56,6 +61,10 @@ async function setup(page: Page) {
       case "context_attribution": result = { contextAttribution: null }; break;
       case "available_models": result = { models: [] }; break;
       case "get_profile_library": result = state.library; break;
+      case "get_installed_plugins":
+        if (state.holdPlugins) { state.pendingPlugins = route; return; }
+        if (state.failPlugins) return route.fulfill({ status: 503, body: "Plugin inventory unavailable" });
+        result = { plugins: state.plugins }; break;
       case "save_profile_group":
         if (state.failSave) return route.fulfill({ status: 409, body: "Library changed; refresh and retry" });
         state.library = { ...state.library, revision: "r2",
@@ -65,7 +74,8 @@ async function setup(page: Page) {
       case "save_profile":
         state.library = { ...state.library, revision: "r3",
           profiles: [...state.library.profiles.filter((profile) => profile.id !== args.id),
-            { id: args.id ?? "new-profile", name: args.name, groupIds: args.groupIds }] };
+            { id: args.id ?? "new-profile", name: args.name, groupIds: args.groupIds, excludedSkillPlugins: args.excludedSkillPlugins ?? [],
+              excludedMcpPlugins: args.excludedMcpPlugins ?? [] }] };
         result = state.library; break;
       case "set_profile_library_directory":
         state.library = { directory: args.directory, revision: "other", profiles: [], groups: [] };
@@ -78,6 +88,12 @@ async function setup(page: Page) {
           groupNames: args.profileId ? ["Everyday", "M365"] : [], mcpServers: [{ name: "fixture", sourceFile: "Q:\\base.json" }],
           skillDirectories: ["Q:\\skills"], warnings: ["Fixture override shown for review"], addedServers: ["fixture"],
           removedServers: [], requiresReconnect: !!args.sessionId };
+        if (args.profileId) Object.assign(result, {
+          excludedSkillPlugins: state.library.profiles.find((profile) => profile.id === args.profileId)?.excludedSkillPlugins ?? [],
+          excludedMcpPlugins: state.library.profiles.find((profile) => profile.id === args.profileId)?.excludedMcpPlugins ?? [],
+          resolutionIssues: state.resolutionIssues,
+          mcpExclusions: [{ name: "fixture", action: "keep", reason: "Independent base definition overrides the excluded plugin." }],
+        });
         break;
       case "set_session_profile":
         if (state.busySession) return route.fulfill({ status: 409, body: "Session is processing. Wait for the turn and subagents to finish." });
@@ -135,6 +151,170 @@ test("groups link arbitrary sources and profiles stack groups in an editable ord
   await panel.getByRole("button", { name: "Save profile", exact: true }).click();
   expect(state.library.profiles.find((profile) => profile.name === "Independent stack")!.groupIds).toEqual(["base", "new-group", "admin"]);
   expect(state.requests.some((request) => ["set_session_profile", "create_session", "send_message"].includes(request.command))).toBe(false);
+});
+
+test("profile and group cards use one compact row for short names, summaries, and actions", async ({ page }, testInfo) => {
+  const { manager } = await setup(page);
+  const panel = await manager();
+  for (const label of ["Profile Focused work", "Group Everyday", "Group M365"]) {
+    const card = panel.getByRole("article", { name: label, exact: true });
+    const summary = card.locator(".profile-card-summary");
+    const name = (await summary.locator("h4").boundingBox())!;
+    const description = (await summary.locator("p").boundingBox())!;
+    const box = (await card.boundingBox())!;
+    const actions = (await card.locator(".profile-actions").boundingBox())!;
+    expect(box.height).toBeLessThanOrEqual(48);
+    expect(Math.abs(name.y - description.y)).toBeLessThan(3);
+    expect(description.x).toBeGreaterThan(name.x + name.width);
+    expect(actions.x).toBeGreaterThan(description.x + description.width);
+    expect(actions.y + actions.height).toBeLessThanOrEqual(box.y + box.height);
+    expect(await card.locator("button").allTextContents()).toEqual(["Edit", "Delete"]);
+  }
+  await panel.screenshot({ path: testInfo.outputPath("compact-profile-list.png") });
+  await panel.getByRole("article", { name: "Group Everyday" }).getByRole("button", { name: "Edit group", exact: true }).click();
+  await expect(panel.getByLabel("Group name", { exact: true })).toHaveValue("Everyday");
+  await panel.getByRole("button", { name: "Cancel edit", exact: true }).click();
+  await panel.getByRole("article", { name: "Profile Focused work" }).getByRole("button", { name: "Edit profile", exact: true }).click();
+  await expect(panel.getByLabel("Profile name", { exact: true })).toHaveValue("Focused work");
+});
+
+test("profiles save plugin-skill exclusions with explicit skills-only scope and show them in previews", async ({ page }) => {
+  const { state, manager, context } = await setup(page);
+  const panel = await manager();
+  await panel.getByRole("article", { name: "Profile Focused work" }).getByRole("button", { name: "Edit profile" }).click();
+  await panel.getByRole("checkbox", { name: "Exclude skills from fixture-alpha", exact: true }).check();
+  await panel.getByRole("checkbox", { name: "Exclude skills from fixture-beta", exact: true }).check();
+  await expect(panel).toContainText("example-market · v1.2.3 · Enabled");
+  await expect(panel).toContainText("Disabled globally");
+  await expect(panel.getByRole("checkbox", { name: "Exclude MCP servers from fixture-alpha", exact: true })).not.toBeChecked();
+  await panel.getByRole("button", { name: "Save profile", exact: true }).click();
+  expect(state.library.profiles[0].excludedSkillPlugins).toEqual(["fixture-alpha", "fixture-beta"]);
+  await panel.getByRole("article", { name: "Profile Focused work" }).getByRole("button", { name: "Edit profile" }).click();
+  await expect(panel.getByRole("checkbox", { name: "Exclude skills from fixture-alpha", exact: true })).toBeChecked();
+  await expect(panel.getByRole("checkbox", { name: "Exclude skills from fixture-beta", exact: true })).toBeChecked();
+  await panel.getByRole("button", { name: "Cancel edit" }).click();
+  await panel.getByRole("button", { name: "Close profiles" }).click();
+  const drawer = await context();
+  await drawer.getByLabel("Choose profile", { exact: true }).selectOption("profile-one");
+  await drawer.getByRole("button", { name: "Preview profile change" }).click();
+  await expect(drawer.getByRole("region", { name: "Resolved profile preview" })).toContainText("Exclude skills from: fixture-alpha, fixture-beta");
+  await expect(drawer.getByRole("region", { name: "Resolved profile preview" })).toContainText("MCP servers, agents, hooks");
+  expect(state.requests.some((request) => ["set_session_profile", "set_mcp_enabled"].includes(request.command))).toBe(false);
+});
+
+test("long profile and group text wraps within the summary without clipping or displacing actions", async ({ page }) => {
+  const { state, manager } = await setup(page);
+  state.library.groups[0].name = "Detailed repository tools and everyday development helpers";
+  state.library.profiles[0].name = "A deliberately descriptive profile for reviewing a large project";
+  const panel = await manager();
+  for (const width of [1100, 390, 320]) {
+    await page.setViewportSize({ width, height: 900 });
+    const cards = await panel.locator(".profile-card").evaluateAll((elements) => elements.map((element) => {
+      const summary = element.querySelector(".profile-card-summary")!;
+      const text = document.createRange();
+      text.selectNodeContents(summary);
+      const bounds = summary.getBoundingClientRect();
+      const actions = element.querySelector(".profile-actions")!.getBoundingClientRect();
+      return {
+        fits: summary.scrollWidth <= summary.clientWidth + 1 && text.getBoundingClientRect().bottom <= bounds.bottom + 1,
+        actionsSeparate: bounds.right <= actions.left && actions.right <= element.getBoundingClientRect().right,
+        height: bounds.height,
+      };
+    }));
+    expect(cards.every((card) => card.fits && card.actionsSeparate)).toBe(true);
+    if (width <= 390) expect(cards[0].height).toBeGreaterThan(40);
+    expect(await panel.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+  }
+});
+
+test("MCP plugin exclusions are saved separately and unresolved sources prevent application and creation", async ({ page }) => {
+  const { state, manager, context } = await setup(page);
+  const panel = await manager();
+  await panel.getByRole("article", { name: "Profile Focused work" }).getByRole("button", { name: "Edit profile" }).click();
+  const excluded = panel.getByRole("checkbox", { name: "Exclude MCP servers from fixture-alpha", exact: true });
+  await excluded.check();
+  await panel.getByRole("button", { name: "Save profile", exact: true }).click();
+  expect(state.library.profiles[0].excludedMcpPlugins).toEqual(["fixture-alpha"]);
+  expect(state.library.profiles[0].excludedSkillPlugins).toEqual([]);
+  await panel.getByRole("article", { name: "Profile Focused work" }).getByRole("button", { name: "Edit profile" }).click();
+  await expect(excluded).toBeChecked();
+  await panel.getByRole("button", { name: "Cancel edit" }).click();
+  await panel.getByRole("button", { name: "Close profiles" }).click();
+  state.resolutionIssues = ["Shadowed repository source: link the intended file in a group."];
+  const drawer = await context();
+  await drawer.getByLabel("Choose profile", { exact: true }).selectOption("profile-one");
+  await drawer.getByRole("button", { name: "Preview profile change" }).click();
+  await expect(drawer).toContainText("fixture: keep");
+  await expect(drawer).toContainText("Independent base definition overrides the excluded plugin.");
+  await expect(drawer.getByRole("alert")).toContainText("Shadowed repository source");
+  await expect(drawer.getByRole("button", { name: "Apply profile now" })).toBeDisabled();
+  await drawer.getByRole("button", { name: "Close context" }).click();
+  await page.getByRole("button", { name: /New session/ }).first().click();
+  const dialog = page.getByRole("dialog", { name: "New session", exact: true });
+  await dialog.getByLabel("Session profile", { exact: true }).selectOption("profile-one");
+  await expect(dialog).toContainText("Shadowed repository source");
+  await expect(dialog.getByRole("button", { name: "Create session", exact: true })).toBeDisabled();
+  expect(state.requests.some((request) => ["set_session_profile", "create_session"].includes(request.command))).toBe(false);
+});
+
+test("plugin picker preserves missing names, supports write-ins and refresh without changing draft selections", async ({ page }) => {
+  const { state, manager } = await setup(page);
+  state.library.profiles[0].excludedMcpPlugins = ["previous-install"];
+  const panel = await manager();
+  await panel.getByRole("article", { name: "Profile Focused work" }).getByRole("button", { name: "Edit profile" }).click();
+  await expect(panel.getByRole("checkbox", { name: "Exclude MCP servers from previous-install", exact: true })).toBeChecked();
+  await expect(panel).toContainText("Not in installed inventory / custom name");
+  await panel.getByRole("checkbox", { name: "Exclude skills from fixture-alpha", exact: true }).check();
+  await panel.getByText("Add a plugin name manually", { exact: true }).click();
+  await panel.getByLabel("Plugin name", { exact: true }).fill("  custom-plugin  ");
+  await panel.getByLabel("Plugin name", { exact: true }).press("Enter");
+  await panel.getByRole("checkbox", { name: "Exclude MCP servers from custom-plugin", exact: true }).check();
+  expect(state.requests.some((request) => request.command === "save_profile")).toBe(false);
+  state.plugins = [{ name: "new-plugin", marketplace: "new-market", version: "3", enabled: true }];
+  await panel.getByRole("button", { name: "Refresh installed plugins", exact: true }).click();
+  await expect(panel.getByRole("checkbox", { name: "Exclude skills from new-plugin", exact: true })).toBeVisible();
+  await expect(panel.getByRole("checkbox", { name: "Exclude skills from fixture-alpha", exact: true })).toBeChecked();
+  await expect(panel.getByRole("checkbox", { name: "Exclude MCP servers from custom-plugin", exact: true })).toBeChecked();
+  await panel.getByRole("button", { name: "Save profile", exact: true }).click();
+  expect(state.library.profiles[0].excludedSkillPlugins).toEqual(["fixture-alpha"]);
+  expect(state.library.profiles[0].excludedMcpPlugins).toEqual(["previous-install", "custom-plugin"]);
+  expect(state.requests.some((request) => ["set_session_profile", "set_mcp_enabled", "create_session"].includes(request.command))).toBe(false);
+});
+
+test("inventory errors and loading never clear selections, and retry distinguishes a genuinely empty inventory", async ({ page }) => {
+  const { state, manager } = await setup(page);
+  state.library.profiles[0].excludedSkillPlugins = ["saved-plugin"];
+  state.holdPlugins = true;
+  const panel = await manager();
+  await panel.getByRole("article", { name: "Profile Focused work" }).getByRole("button", { name: "Edit profile" }).click();
+  await expect(panel).toContainText("Reading installed plugins...");
+  await expect(panel.getByRole("checkbox", { name: "Exclude skills from saved-plugin", exact: true })).toBeChecked();
+  await expect.poll(() => !!state.pendingPlugins).toBe(true);
+  state.holdPlugins = false;
+  await state.pendingPlugins!.fulfill({ status: 503, body: "Synthetic inventory failure" });
+  await expect(panel.getByRole("alert")).toContainText("Synthetic inventory failure");
+  await expect(panel).not.toContainText("No installed plugins reported");
+  await panel.getByText("Add a plugin name manually", { exact: true }).click();
+  await panel.getByLabel("Plugin name", { exact: true }).fill("manual-during-error");
+  await panel.getByRole("button", { name: "Add plugin name", exact: true }).click();
+  await panel.getByRole("checkbox", { name: "Exclude skills from manual-during-error", exact: true }).check();
+  state.plugins = [];
+  await panel.getByRole("button", { name: "Retry installed plugins", exact: true }).click();
+  await expect(panel).toContainText("No installed plugins reported by the runtime.");
+  await expect(panel.getByRole("alert")).toHaveCount(0);
+  await expect(panel.getByRole("checkbox", { name: "Exclude skills from saved-plugin", exact: true })).toBeChecked();
+  await panel.getByRole("button", { name: "Save profile", exact: true }).click();
+  expect(state.library.profiles[0].excludedSkillPlugins).toEqual(["saved-plugin", "manual-during-error"]);
+});
+
+test("same-named plugin installs share checkboxes while all installation metadata stays visible", async ({ page }) => {
+  const { state, manager } = await setup(page);
+  state.plugins.push({ name: "fixture-alpha", marketplace: "second-market", version: "2", enabled: false });
+  const panel = await manager();
+  await panel.getByRole("button", { name: "New profile", exact: true }).click();
+  await expect(panel.getByRole("checkbox", { name: "Exclude skills from fixture-alpha", exact: true })).toHaveCount(1);
+  await expect(panel).toContainText("example-market · v1.2.3 · Enabled");
+  await expect(panel).toContainText("second-market · v2 · Disabled globally");
 });
 
 test("source creation and storage changes are explicit and failed saves keep edits", async ({ page }) => {
@@ -253,6 +433,17 @@ test("rejected terminal CWD updates do not change the session's profile-preview 
 
 test.describe("mobile profiles", () => {
   test.use({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  test("compact list actions retain comfortable touch targets", async ({ page }, testInfo) => {
+    const { manager } = await setup(page);
+    const panel = await manager();
+    const buttons = await panel.locator(".profile-card button").evaluateAll((elements) =>
+      elements.map((element) => ({ width: element.getBoundingClientRect().width, height: element.getBoundingClientRect().height })));
+    expect(buttons.every((button) => button.height >= 44 && button.width >= 44)).toBe(true);
+    expect(await panel.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+    await panel.screenshot({ path: testInfo.outputPath("compact-profile-list-mobile.png") });
+    await panel.getByRole("article", { name: "Group Everyday" }).getByRole("button", { name: "Edit group", exact: true }).tap();
+    await expect(panel.getByLabel("Group name", { exact: true })).toHaveValue("Everyday");
+  });
   test("the editor fits the phone without invoking background chat shortcuts", async ({ page }) => {
     const { state, manager } = await setup(page);
     const panel = await manager();
@@ -260,6 +451,12 @@ test.describe("mobile profiles", () => {
     await panel.getByLabel("Profile name", { exact: true }).fill("Mobile profile");
     await panel.getByLabel("Profile name", { exact: true }).press("Control+Shift+t");
     await expect(page.locator(".terminal-pane")).toHaveCount(0);
+    await panel.getByRole("checkbox", { name: "Exclude skills from fixture-alpha", exact: true }).check();
+    const targets = await panel.locator(".plugin-exclusion-toggle").evaluateAll((elements) =>
+      elements.map((element) => element.getBoundingClientRect().height));
+    expect(targets.every((height) => height >= 44)).toBe(true);
+    await page.setViewportSize({ width: 320, height: 844 });
+    expect(await panel.locator(".plugin-exclusion-list").evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
     expect(await panel.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
     await panel.getByRole("button", { name: "Cancel edit", exact: true }).tap();
     await panel.getByRole("button", { name: "Close profiles" }).tap();

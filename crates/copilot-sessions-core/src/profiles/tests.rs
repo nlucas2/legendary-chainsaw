@@ -1,5 +1,60 @@
 use super::*;
+
+#[test]
+fn plugin_skill_exclusions_roundtrip_and_are_part_of_the_approved_profile() {
+    let fixture = Fixture::new();
+    let profile = fixture.profile("Skills limited", &[]);
+    let before = fixture.resolve(&profile);
+    let library = fixture.library.snapshot().unwrap();
+    let saved = fixture.library.save_profile(SaveSessionProfile {
+        id: Some(profile.id.clone()), name: profile.name.clone(), group_ids: vec![],
+        excluded_skill_plugins: vec![" fixture-alpha ".into()], excluded_mcp_plugins: vec![], expected_revision: library.revision,
+    }).unwrap();
+    assert_eq!(saved.profiles[0].excluded_skill_plugins, ["fixture-alpha"]);
+    let resolved = fixture.resolve(&saved.profiles[0]);
+    assert_ne!(resolved.revision, before.revision);
+    assert_eq!(resolved.preview().excluded_skill_plugins, ["fixture-alpha"]);
+    assert_eq!(resolve_snapshot(&resolved.selection()).unwrap().excluded_skill_plugins, ["fixture-alpha"]);
+    let legacy: SessionProfile = serde_json::from_value(serde_json::json!({
+        "id":profile.id,"name":"Legacy","groupIds":[]
+    })).unwrap();
+    assert!(legacy.excluded_skill_plugins.is_empty());
+    assert!(serde_json::to_value(&legacy).unwrap().get("excludedSkillPlugins").is_none(),
+        "empty exclusions must not change existing profile fingerprints");
+    for excluded_skill_plugins in [vec!["".into()], vec!["fixture-alpha".into(), "fixture-alpha".into()]] {
+        assert!(fixture.library.save_profile(SaveSessionProfile {
+            id: Some(profile.id.clone()), name: profile.name.clone(), group_ids: vec![],
+            excluded_skill_plugins, excluded_mcp_plugins: vec![], expected_revision: fixture.library.snapshot().unwrap().revision,
+        }).is_err());
+    }
+}
 use std::sync::{Arc, Barrier};
+
+#[test]
+fn mcp_plugin_exclusions_are_independent_backward_compatible_and_fingerprinted() {
+    let fixture = Fixture::new();
+    let profile = fixture.profile("Limited MCP", &[]);
+    let before = fixture.resolve(&profile);
+    let snapshot = fixture.library.snapshot().unwrap();
+    let saved = fixture.library.save_profile(SaveSessionProfile {
+        id: Some(profile.id.clone()), name: profile.name.clone(), group_ids: vec![],
+        excluded_skill_plugins: vec![], excluded_mcp_plugins: vec![" fixture-alpha ".into()],
+        expected_revision: snapshot.revision,
+    }).unwrap();
+    assert_eq!(saved.profiles[0].excluded_mcp_plugins, ["fixture-alpha"]);
+    assert!(saved.profiles[0].excluded_skill_plugins.is_empty());
+    let resolved = fixture.resolve(&saved.profiles[0]);
+    assert_ne!(resolved.revision,before.revision);
+    assert_eq!(resolve_snapshot(&resolved.selection()).unwrap().excluded_mcp_plugins, ["fixture-alpha"]);
+    assert!(serde_json::to_value(&profile).unwrap().get("excludedMcpPlugins").is_none());
+    for names in [vec!["".into()],vec!["duplicate".into(),"duplicate".into()],vec!["many".into();129]] {
+        assert!(fixture.library.save_profile(SaveSessionProfile {
+            id: Some(profile.id.clone()), name: profile.name.clone(), group_ids: vec![],
+            excluded_skill_plugins: vec![], excluded_mcp_plugins: names,
+            expected_revision: fixture.library.snapshot().unwrap().revision,
+        }).is_err());
+    }
+}
 
 struct Fixture {
     root: PathBuf,
@@ -54,6 +109,8 @@ impl Fixture {
                 id: None,
                 name: name.into(),
                 group_ids: groups.iter().map(|group| group.id.clone()).collect(),
+                excluded_skill_plugins: vec![],
+                excluded_mcp_plugins: vec![],
                 expected_revision: snapshot.revision,
             })
             .unwrap()
@@ -131,6 +188,8 @@ fn crud_stable_ids_case_insensitive_names_and_referenced_group_protection() {
             id: Some(profile.id.clone()),
             name: "Personal".into(),
             group_ids: vec![group.id.clone()],
+            excluded_skill_plugins: vec![],
+            excluded_mcp_plugins: vec![],
             expected_revision: renamed.revision,
         })
         .unwrap();
@@ -746,6 +805,8 @@ fn unknown_groups_duplicate_references_and_unknown_edit_ids_are_rejected() {
                 id: None,
                 name: "Bad".into(),
                 group_ids: ids,
+                excluded_skill_plugins: vec![],
+                excluded_mcp_plugins: vec![],
                 expected_revision: fixture.library.snapshot().unwrap().revision,
             }),
             Err(ProfileError::Invalid(_))

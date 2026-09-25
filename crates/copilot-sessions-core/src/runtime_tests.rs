@@ -26,6 +26,8 @@ struct MockRuntime {
     processing: Arc<AtomicBool>,
     future_tool: Arc<AtomicBool>,
     missing_metadata: Arc<AtomicBool>,
+    plugin_skills: Arc<AtomicBool>,
+    plugin_mcps: Arc<AtomicBool>,
     held_methods: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -1029,13 +1031,19 @@ fn mock_runtime_with_mcp(mcp: bool) -> MockRuntime {
     let runtime_future_tool = future_tool.clone();
     let missing_metadata = Arc::new(AtomicBool::new(false));
     let runtime_missing_metadata = missing_metadata.clone();
+    let plugin_skills = Arc::new(AtomicBool::new(false));
+    let runtime_plugin_skills = plugin_skills.clone();
+    let plugin_mcps = Arc::new(AtomicBool::new(false));
+    let runtime_plugin_mcps = plugin_mcps.clone();
     let held_methods = Arc::new(Mutex::new(HashSet::<String>::new()));
     let runtime_held_methods = held_methods.clone();
     let task = tokio::spawn(async move {
         let mut read = BufReader::new(read);
         let mut names = HashMap::<String, Value>::new();
+        let mut disabled_skills = HashMap::<String, HashSet<String>>::new();
         let mut modes = HashMap::<String, Value>::new();
         let mut profile_mcp = HashMap::<String, Value>::new();
+        let mut disabled_mcps = HashMap::<String, Vec<String>>::new();
         let mut excluded = HashMap::<String, Vec<Value>>::new();
         let mut available = HashMap::<String, Vec<Value>>::new();
         loop {
@@ -1072,6 +1080,9 @@ fn mock_runtime_with_mcp(mcp: bool) -> MockRuntime {
                 "session.name.get" => json!({"name":names.get(sid)}),
                 "session.list" => json!({"sessions":[]}),
                 "session.create" => {
+                    if let Some(disabled) = request["params"].get("disabledMcpServers") {
+                        disabled_mcps.insert(sid.into(), serde_json::from_value(disabled.clone()).unwrap());
+                    }
                     if let Some(servers) = request["params"].get("mcpServers") {
                         profile_mcp.insert(sid.into(), servers.clone());
                     }
@@ -1085,6 +1096,9 @@ fn mock_runtime_with_mcp(mcp: bool) -> MockRuntime {
                     json!({"sessionId":sid})
                 }
                 "session.resume" => {
+                    if let Some(disabled) = request["params"].get("disabledMcpServers") {
+                        disabled_mcps.insert(sid.into(), serde_json::from_value(disabled.clone()).unwrap());
+                    }
                     if let Some(servers) = request["params"].get("mcpServers") {
                         profile_mcp.insert(sid.into(), servers.clone());
                     }
@@ -1098,6 +1112,39 @@ fn mock_runtime_with_mcp(mcp: bool) -> MockRuntime {
                 }
                 "session.skills.reload" => json!({"warnings":[], "errors":[]}),
                 "session.mcp.reload" | "session.cancelAllBackgroundAgents" => json!({}),
+                "mcp.discover" => json!({"servers":[
+                    {"name":"only-plugin","source":"plugin","sourcePlugin":"fixture-alpha","enabled":true},
+                    {"name":"base-overlap","source":"plugin","sourcePlugin":"fixture-alpha","enabled":true}
+                ]}),
+                "mcp.config.list" => json!({"servers":{"base-overlap":{"command":"base-command","env":{"TOKEN":"fixture-secret"}}}}),
+                "plugins.list" => json!({"plugins":[{"name":"fixture-alpha","marketplace":"","enabled":true}]}),
+                "session.mcp.disable" => {
+                    let disabled = disabled_mcps.entry(sid.into()).or_default();
+                    let name = request["params"]["serverName"].as_str().unwrap().to_owned();
+                    if !disabled.contains(&name) { disabled.push(name); }
+                    json!({})
+                }
+                "session.mcp.enable" => {
+                    disabled_mcps.entry(sid.into()).or_default().retain(|name| request["params"]["serverName"] != *name);
+                    json!({})
+                }
+                "session.skills.disable" => {
+                    disabled_skills.entry(sid.into()).or_default().insert(request["params"]["name"].as_str().unwrap().into());
+                    json!({})
+                }
+                "session.skills.enable" => {
+                    disabled_skills.entry(sid.into()).or_default().remove(request["params"]["name"].as_str().unwrap());
+                    json!({})
+                }
+                "session.skills.list" if runtime_plugin_skills.load(Ordering::Relaxed) => {
+                    let disabled = disabled_skills.entry(sid.into()).or_insert_with(|| HashSet::from(["alpha-off".into()]));
+                    json!({"skills":[
+                        {"name":"alpha-on","description":"Plugin A skill","pluginName":"fixture-alpha","enabled":!disabled.contains("alpha-on"),"source":"plugin","userInvocable":true},
+                        {"name":"alpha-off","description":"Already disabled","pluginName":"fixture-alpha","enabled":!disabled.contains("alpha-off"),"source":"plugin","userInvocable":true},
+                        {"name":"beta-on","description":"Plugin B skill","pluginName":"fixture-beta","enabled":!disabled.contains("beta-on"),"source":"plugin","userInvocable":true},
+                        {"name":"personal","description":"Personal skill","enabled":true,"source":"personal-copilot","userInvocable":true}
+                    ]})
+                }
                 "session.skills.list" => json!({"skills":[
                     {"name":"repo-review","description":"Review fixture code","enabled":true,"source":"project","path":"Q:\\fixture\\.github\\skills\\repo-review\\SKILL.md","userInvocable":true},
                     {"name":"disabled-fixture","description":"Not enabled","enabled":false,"source":"project","userInvocable":false}
@@ -1157,9 +1204,16 @@ fn mock_runtime_with_mcp(mcp: bool) -> MockRuntime {
                 "session.mcp.list" if mcp => json!({"servers":[
                     {"name":"fast","status":"connected"}, {"name":"slow","status":"connected"},
                 ]}),
-                "session.mcp.list" => json!({"servers":profile_mcp.get(sid)
-                    .and_then(Value::as_object).into_iter().flat_map(|servers| servers.keys())
-                    .map(|name| json!({"name":name,"status":"connected"})).collect::<Vec<_>>()}),
+                "session.mcp.list" => {
+                    let mut names: HashSet<String> = profile_mcp.get(sid).and_then(Value::as_object)
+                        .into_iter().flat_map(|servers| servers.keys().cloned()).collect();
+                    if runtime_plugin_mcps.load(Ordering::Relaxed) {
+                        names.extend(["only-plugin".into(),"base-overlap".into()]);
+                    }
+                    let disabled = disabled_mcps.entry(sid.into()).or_default();
+                    json!({"host":{"disabledServers":disabled},"servers":names.into_iter()
+                        .map(|name|json!({"status":if disabled.contains(&name) {"disabled"} else {"connected"},"name":name})).collect::<Vec<_>>()})
+                }
                 "session.mcp.listTools" if request["params"]["serverName"] == "slow" => {
                     // Leave only this RPC pending; unrelated runtime calls keep working.
                     continue;
@@ -1268,6 +1322,8 @@ fn mock_runtime_with_mcp(mcp: bool) -> MockRuntime {
         processing,
         future_tool,
         missing_metadata,
+        plugin_skills,
+        plugin_mcps,
         held_methods,
     }
 }

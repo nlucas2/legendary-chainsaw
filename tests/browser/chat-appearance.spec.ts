@@ -95,7 +95,10 @@ test.describe("compact chat header on phones", () => {
       await expect(page.locator("#workspace-tools")).toBeVisible();
       await expect(page.locator("#session-metadata")).toBeVisible();
       await expect(page.locator("#workspace-history")).toBeVisible();
-      await expect(header.getByRole("button", { name: "Ask about conversation", exact: true })).toBeVisible();
+      await expect(header.getByRole("button", { name: "Ask about conversation", exact: true })).toBeHidden();
+      await header.getByRole("button", { name: "Additional options", exact: true }).tap();
+      await expect(page.getByRole("dialog", { name: "Additional options" })
+        .getByRole("button", { name: "Ask about conversation", exact: true })).toBeVisible();
     });
   }
 });

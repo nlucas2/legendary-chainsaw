@@ -1,9 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { isTerminalToggle, isTerminalCopy } from "../src/lib/shortcuts.ts";
+import { isTerminalCopy } from "../src/lib/shortcuts.ts";
+import { matchesAction } from "../src/lib/keybindings.ts";
 import { readDeliveryDefault } from "../src/lib/deliveryPreference.ts";
 
 test("terminal shortcuts retain reasoning and browser keys and avoid AltGr/composition", () => {
+  const isTerminalToggle = (event) => matchesAction({}, "toggleTerminal", event, true);
   const key = { key: "t", altKey: false, ctrlKey: false, metaKey: false, shiftKey: false, isComposing: false };
   assert.equal(isTerminalToggle({ ...key, altKey: true }), false);
   assert.equal(isTerminalToggle({ ...key, ctrlKey: true, shiftKey: true }), true);

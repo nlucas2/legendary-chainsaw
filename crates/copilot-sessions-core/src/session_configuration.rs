@@ -4,6 +4,7 @@ use github_copilot_sdk::{Client, ResumeSessionConfig, SessionConfig};
 use serde_json::json;
 
 use crate::profiles::ResolvedProfile;
+use crate::mcp_resolution::McpResolution;
 use crate::{AppEvent, Result, ServiceError, SessionService};
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -14,12 +15,16 @@ impl SessionConfiguration {
         self,
         config: SessionConfig,
         profile: Option<&ResolvedProfile>,
+        mcp: &McpResolution,
     ) -> SessionConfig {
         let mut config = self.configure_new(config);
         if let Some(profile) = profile {
             config = config
-                .with_mcp_servers(profile.mcp_servers.clone())
+                .with_mcp_servers(mcp.definitions(profile))
                 .with_skill_directories(profile.skill_directories.clone());
+            if !profile.excluded_mcp_plugins.is_empty() {
+                config = config.with_disabled_mcp_servers(mcp.disabled_with(&[], &[]));
+            }
         }
         config
     }
@@ -28,12 +33,17 @@ impl SessionConfiguration {
         self,
         config: ResumeSessionConfig,
         profile: Option<&ResolvedProfile>,
+        mcp: &McpResolution,
+        state: Option<&crate::mcp_resolution::ProfileMcpState>,
     ) -> ResumeSessionConfig {
         let mut config = self.configure_resume(config);
         if let Some(profile) = profile {
             config = config
-                .with_mcp_servers(profile.mcp_servers.clone())
+                .with_mcp_servers(mcp.definitions(profile))
                 .with_skill_directories(profile.skill_directories.clone());
+        }
+        if let Some(state) = state {
+            config = config.with_disabled_mcp_servers(state.disabled.clone());
         }
         config
     }
@@ -45,16 +55,21 @@ impl SessionConfiguration {
         cwd: &str,
         profile: &ResolvedProfile,
         recovery_metadata: Option<&crate::StoredSessionMeta>,
+        mcp: &McpResolution,
+        disabled: Option<&[String]>,
     ) -> Result<()> {
         // A resident resume updates the source configuration without registering
         // another SDK handle. MCP clients only change after the scoped reload.
         let mut parameters = json!({
             "sessionId": session_id, "workingDirectory": cwd,
             "enableConfigDiscovery": true, "continuePendingWork": false,
-            "mcpServers": profile.mcp_servers, "skillDirectories": profile.skill_directories,
+            "mcpServers": mcp.definitions(profile), "skillDirectories": profile.skill_directories,
             "requestPermission": true, "requestUserInput": true, "requestElicitation": true,
             "requestExitPlanMode": true, "requestAutoModeSwitch": true
         });
+        if let Some(disabled) = disabled {
+            parameters["disabledMcpServers"] = json!(disabled);
+        }
         // Restore app-owned choices only for an observation-only cold reattach,
         // at the verified-idle source application boundary, not during draining.
         if let Some(metadata) = recovery_metadata
@@ -89,10 +104,10 @@ impl SessionConfiguration {
                 "The runtime reported skill source errors; profile was not verified".into(),
             ));
         }
-        let mcp = client
+        let inventory = client
             .call("session.mcp.list", Some(json!({"sessionId": session_id})))
             .await?;
-        let servers = mcp
+        let servers = inventory
             .get("servers")
             .and_then(serde_json::Value::as_array)
             .ok_or_else(|| {
@@ -100,7 +115,7 @@ impl SessionConfiguration {
                     "The runtime did not return a verifiable MCP inventory".into(),
                 )
             })?;
-        if profile.mcp_servers.keys().any(|name| {
+        if mcp.definitions(profile).keys().any(|name| {
             !servers.iter().any(|server| {
                 server.get("name").and_then(serde_json::Value::as_str) == Some(name.as_str())
             })
@@ -108,6 +123,13 @@ impl SessionConfiguration {
             return Err(ServiceError::CommandFailed(
                 "The runtime did not load all selected profile MCP servers".into(),
             ));
+        }
+        if let Some(disabled) = disabled {
+            crate::mcp_resolution::verify_disabled(client, session_id, disabled).await?;
+            let actual = crate::mcp_resolution::disabled_servers(client, session_id).await?;
+            if actual.len() != disabled.len() || actual.iter().any(|name| !disabled.contains(name)) {
+                return Err(ServiceError::CommandFailed("The runtime did not restore the requested MCP enablement state.".into()));
+            }
         }
         Ok(())
     }
@@ -120,13 +142,16 @@ impl SessionConfiguration {
     }
 
     pub async fn apply_discovery(self, client: &Client, session_id: &str, cwd: &str) -> Result<()> {
+        self.update_discovery(client, session_id, cwd, None).await
+    }
+
+    pub(crate) async fn update_discovery(
+        self, client: &Client, session_id: &str, cwd: &str, disabled_mcps: Option<&[String]>,
+    ) -> Result<()> {
         // Discovery is a resume-time option, not a mutable options.update field.
         // A resident resume preserves this session's filters and handlers; do not
         // replace SDK subscriptions or restart the shared runtime.
-        let result = client
-            .call(
-                "session.resume",
-                Some(json!({
+        let mut options = json!({
                     "sessionId": session_id,
                     "workingDirectory": cwd,
                     "enableConfigDiscovery": true,
@@ -136,8 +161,11 @@ impl SessionConfiguration {
                     "requestElicitation": true,
                     "requestExitPlanMode": true,
                     "requestAutoModeSwitch": true
-                })),
-            )
+                });
+        if let Some(disabled) = disabled_mcps {
+            options["disabledMcpServers"] = json!(disabled);
+        }
+        let result = client.call("session.resume", Some(options))
             .await?;
         if result.get("sessionId").and_then(serde_json::Value::as_str) != Some(session_id) {
             return Err(ServiceError::CommandFailed(

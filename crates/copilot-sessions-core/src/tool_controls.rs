@@ -387,7 +387,22 @@ impl SessionService {
         let gate = self.turn_gate(&request.session_id).await;
         let _guard = gate.lock().await;
         self.require_accepting_work()?;
-        self.session(&request.session_id).await?;
+        self.require_profile_ready(&request.session_id).await?;
+        let session = self.session(&request.session_id).await?;
+        let meta = self.metadata.read().await.get(&request.session_id).cloned().unwrap_or_default();
+        if meta.profile_mcps.is_some() {
+            self.require_configuration_idle(&session).await?;
+            self.verify_profile_mcps(&request.session_id).await?;
+            if request.enabled && let Some(selection) = &meta.profile {
+                let profile = crate::profiles::resolve_snapshot(selection)?;
+                let resolution = self.resolve_profile_mcps(&profile, meta.cwd.as_deref().ok_or_else(||
+                    ServiceError::InvalidArgument("Set a working directory before changing MCP configuration".into()))?).await?;
+                if resolution.disabled.contains(&request.server_name) {
+                    return Err(ServiceError::InvalidArgument(
+                        "This MCP server is excluded by the session profile. Edit or switch profiles before enabling it.".into()));
+                }
+            }
+        }
         let client = self.client().await?;
         let servers = client
             .call(
@@ -421,6 +436,24 @@ impl SessionService {
             )
             .await
             .map_err(|error| capability(method, error))?;
+        if let Some(mut state) = meta.profile_mcps {
+            let changed = async {
+                state.disabled = crate::mcp_resolution::disabled_servers(&client, &request.session_id).await?;
+                let cwd = meta.cwd.as_deref().ok_or_else(|| ServiceError::InvalidArgument("Missing session working directory".into()))?;
+                crate::session_configuration::SessionConfiguration.update_discovery(
+                    &client, &request.session_id, cwd, Some(&state.disabled),
+                ).await?;
+                self.metadata.write().await.get_mut(&request.session_id)
+                    .ok_or_else(|| ServiceError::SessionNotActive(request.session_id.clone()))?.profile_mcps = Some(state);
+                self.persist_metadata().await
+            }.await;
+            if let Err(error) = changed {
+                self.profile_configuration.lock().await.insert(request.session_id.clone(), crate::session_profiles::ProfileConfigurationState {
+                    blocked: true, error: Some(format!("MCP selection could not be saved. Reapply the profile. {error}")), ..Default::default()
+                });
+                return Err(error);
+            }
+        }
         // Session-scoped RPCs publish native MCP/tool changes through the
         // existing event log. No global mcp.config.* or config-file writes.
         self.session(&request.session_id)

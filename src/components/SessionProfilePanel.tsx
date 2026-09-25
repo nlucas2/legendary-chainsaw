@@ -25,6 +25,15 @@ export function ProfilePreviewCard({ preview }: { preview: ProfilePreview }) {
   return <section className="profile-preview" aria-label="Resolved profile preview">
     <strong>{preview.profileName}</strong>
     <p>{preview.groupNames.join(" + ") || "No additional groups"} + automatic repository discovery</p>
+    {!!preview.excludedSkillPlugins?.length && <p>Exclude skills from: <strong>{preview.excludedSkillPlugins.join(", ")}</strong>.
+      {" "}Skill exclusions alone do not exclude MCP servers, agents, hooks, or existing conversation instructions.</p>}
+    {!!preview.excludedMcpPlugins?.length && <p>Exclude MCP contributions from: <strong>{preview.excludedMcpPlugins.join(", ")}</strong>.</p>}
+    {!!preview.mcpExclusions?.length && <details open><summary>MCP source decisions</summary>
+      {preview.mcpExclusions.map((decision, index) => <p key={`${decision.name}-${index}`}>
+        <strong>{decision.name}: {decision.action}</strong> - {decision.reason}
+      </p>)}
+    </details>}
+    {preview.resolutionIssues?.map((issue, index) => <p role="alert" className="profile-error" key={index}>{issue}</p>)}
     {preview.mcpServers.length > 0 && <details><summary>{preview.mcpServers.length} additional MCP definitions</summary>
       {preview.mcpServers.map((server) => <p key={server.name}><strong>{server.name}</strong><code>{server.sourceFile}</code></p>)}
     </details>}
@@ -55,7 +64,8 @@ export function NewSessionProfilePicker({ cwd, disabled, onChange }: {
         if (controller.signal.aborted) return;
         const next = normalizeProfilePreview(value);
         if (next.profileId !== selected) throw new Error("The preview returned a different profile.");
-        setPreview(next); onChange({ profileId: selected, revision: next.revision, pending: false });
+        setPreview(next); onChange({ profileId: selected, revision: next.revision, pending: false,
+          ...(next.resolutionIssues?.length ? { error: "Resolve the MCP source issues before creating this session." } : {}) });
       }).catch((cause) => {
         if (controller.signal.aborted) return;
         const message = errorMessage(cause); setPreviewError(message);
@@ -106,7 +116,7 @@ export function SessionProfilePanel({ sessionId, cwd, status, statusError, onSta
     finally { setBusy(false); }
   }
   async function apply() {
-    if (!preview || busy) return;
+    if (!preview || busy || preview.resolutionIssues?.length) return;
     setBusy(true); setActionError("");
     const current = generation.current;
     try {
@@ -138,7 +148,7 @@ export function SessionProfilePanel({ sessionId, cwd, status, statusError, onSta
       <ProfilePreviewCard preview={preview} />
       <p className="profile-help">Apply now requires the session, subagents, and existing queued work to be idle. If busy, let the work finish or use the existing Stop action, then try again. This change is never queued automatically.</p>
       <div className="profile-actions">
-        <button type="button" disabled={busy || blocked || status?.requiresReconnect}
+        <button type="button" disabled={busy || blocked || status?.requiresReconnect || !!preview.resolutionIssues?.length}
           onClick={() => void apply()}>{busy ? "Applying profile..." : "Apply profile now"}</button>
         <button type="button" disabled={busy} onClick={() => setPreview(null)}>Cancel preview</button>
       </div>

@@ -25,8 +25,7 @@ import {
   ChevronRight,
   ChevronsDown,
   ChevronsUp,
-  Eye,
-  EyeOff,
+  Ellipsis,
   FolderCog,
   Menu,
   MessageSquarePlus,
@@ -44,7 +43,7 @@ import {
   Pencil,
   PanelBottom,
   PanelTop,
-  GitBranch,
+  CopyPlus,
   MessageCircleQuestion,
   TerminalSquare,
   Trash2,
@@ -70,7 +69,7 @@ import { SidebarResizer } from "./components/SidebarResizer";
 import { useTypography } from "./lib/useTypography";
 import { useChatWidth } from "./lib/useChatWidth";
 import { useChatHeader } from "./lib/useChatHeader";
-import { useMobileInput } from "./lib/useMobileInput";
+import { useMobileInput, useNarrowLayout } from "./lib/useMobileInput";
 import { submitsComposer } from "./lib/composerInput";
 import { useSessionStartup } from "./lib/useSessionStartup";
 import { useSessionProfile } from "./lib/useSessionProfile";
@@ -79,7 +78,10 @@ import { NewSessionProfilePicker, ProfileConfigurationNotice } from "./component
 import { SessionStartupBanner } from "./components/SessionStartupBanner";
 import { useDeliveryDefault } from "./lib/useDeliveryDefault";
 import type { MessageDelivery } from "./lib/deliveryPreference";
-import { isTerminalToggle } from "./lib/shortcuts";
+import { adjacentSession } from "./lib/shortcuts";
+import { atComposerEdge, PromptHistoryNavigation, recentPrompts } from "./lib/promptHistory";
+import { actionBindings, ariaBindings, formatBinding, matchesAction, type ShortcutAction } from "./lib/keybindings";
+import { useKeybindings } from "./lib/useKeybindings";
 import { resizedTerminal, terminalSizeLimits } from "./lib/workspaceLayout";
 import { slashCommandSuggestions } from "./lib/slashCommands";
 import "./components/workspace-actions.css";
@@ -88,6 +90,7 @@ import { SessionSubagents } from "./components/SessionSubagents";
 import { agentKey, type AgentTask } from "./lib/agentTasks";
 import { useAgentTasks } from "./lib/useAgentTasks";
 import { SessionOrganizer } from "./components/SessionOrganizer";
+import { WorkspaceOptions } from "./components/WorkspaceOptions";
 import { ReviewContextChip } from "./components/ReviewContextChip";
 import { reviewAttachment, withReviewAttachment, type ReviewChatContext } from "./lib/reviewChat";
 import {
@@ -98,6 +101,7 @@ import {
   DaemonError,
   daemonInvoke,
   daemonLogin,
+  isTauri,
   subscribeToDaemon,
 } from "./lib/daemon";
 import {
@@ -168,6 +172,7 @@ const ReferenceDrawer = lazy(() =>
   import("./components/ReferenceDrawer").then((module) => ({ default: module.ReferenceDrawer })),
 );
 const ProfilesPanel = lazy(() => import("./components/ProfilesPanel").then((module) => ({ default: module.ProfilesPanel })));
+const ShortcutSettings = lazy(() => import("./components/ShortcutSettings").then((module) => ({ default: module.ShortcutSettings })));
 const InteractionPanel = lazy(() =>
   import("./components/InteractionPanel").then((module) => ({ default: module.InteractionPanel })),
 );
@@ -198,6 +203,8 @@ function App() {
   const sessionViewControl = useRef<HTMLSelectElement>(null);
   const sessionListRef = useRef<HTMLElement>(null);
   const [activeSession, setActiveSession] = useState<SessionSummary | null>(null);
+  const [keyboardPreviewId, setKeyboardPreviewId] = useState<string | null>(null);
+  const keyboardPreviewRef = useRef<string | null>(null);
   const [events, setEvents] = useState<SessionEvent[]>([]);
   const [subagentContext, setSubagentContext] = useState<SessionEvent[]>([]);
   const [permissions, setPermissions] = useState<PermissionRequest[]>([]);
@@ -258,6 +265,7 @@ function App() {
   const [gitOpen, setGitOpen] = useState(false);
   const [schedulesOpen, setSchedulesOpen] = useState(false);
   const [profilesOpen, setProfilesOpen] = useState(false);
+  const [optionsOpen, setOptionsOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [themePreference, setThemePreference] =
     useState<ThemePreference>(readThemePreference);
@@ -281,6 +289,7 @@ function App() {
   });
   const attachmentOperation = useSessionOperation();
   const sendOperation = useSessionOperation();
+  const stopOperation = useSessionOperation();
   const modeOperation = useSessionOperation();
   const queueOperation = useSessionOperation();
   const readingAttachments = !!attachmentOperation.operations.get(draftSessionId);
@@ -338,6 +347,9 @@ function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const chatHeader = useChatHeader();
   const mobileInput = useMobileInput();
+  const narrowLayout = useNarrowLayout();
+  const keybindings = useKeybindings();
+  useEffect(() => { if (narrowLayout) setShortcutsOpen(false); }, [narrowLayout]);
   const activeIdRef = useRef<string | null>(null);
   const createSessionPendingRef = useRef(false);
   const historyCursorRef = useRef<string | null>(null);
@@ -348,8 +360,8 @@ function App() {
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
   const submitDeliveryRef = useRef<"enqueue" | "immediate" | null>(null);
-  const promptHistoryRef = useRef<string[]>([]);
-  const promptHistoryIndexRef = useRef(-1);
+  const promptHistoryRef = useRef(new Map<string, string[]>());
+  const promptNavigationRef = useRef(new Map<string, PromptHistoryNavigation>());
   const activityRef = useRef<ChatActivity>(emptyActivity());
   const activityGenerationRef = useRef(0);
   const showRawEventsRef = useRef(false);
@@ -516,6 +528,8 @@ function App() {
 
   const openSession = useCallback(
     async (incoming: SessionSummary, closeSidebar = true, newlyCreated = false) => {
+      keyboardPreviewRef.current = null;
+      setKeyboardPreviewId(null);
       const session = sessionStartup.track(incoming);
       if (activeIdRef.current === session.sessionId) {
         if (closeSidebar) setSidebarOpen(false);
@@ -822,8 +836,8 @@ function App() {
 
   useEffect(() => {
     const toggleTerminal = (event: KeyboardEvent) => {
-      if (event.defaultPrevented || !isTerminalToggle(event)) return;
-      if (shortcutsOpen || newSessionOpen || renamingSession || forkingSession || askPanel || gitOpen || schedulesOpen || profilesOpen ||
+      if (event.defaultPrevented || !matchesAction(keybindings.overrides, "toggleTerminal", event, isTauri())) return;
+      if (optionsOpen || shortcutsOpen || newSessionOpen || renamingSession || forkingSession || askPanel || gitOpen || schedulesOpen || profilesOpen ||
           modeConfirmation || modelPickerOpen || settingsOpen || organizingSession || runtimeOpen || referenceOpen) return;
       if (!activeSession || (!terminalOpen && !activeSession.cwd && !trackedCwd)) return;
       event.preventDefault();
@@ -842,23 +856,24 @@ function App() {
     return () => window.removeEventListener("keydown", toggleTerminal, true);
   }, [terminalOpen, activeSession, trackedCwd, shortcutsOpen, newSessionOpen, renamingSession,
     forkingSession, askPanel, gitOpen, schedulesOpen, profilesOpen, modeConfirmation, modelPickerOpen, settingsOpen,
-    organizingSession, runtimeOpen, referenceOpen]);
+    organizingSession, runtimeOpen, referenceOpen, optionsOpen, keybindings.overrides]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.defaultPrevented || event.isComposing) return;
       const key = event.key.toLowerCase();
-      const modifier = event.ctrlKey || event.metaKey;
       const editing = isEditableTarget(event.target);
       const inComposer = event.target === composerRef.current;
       const inTerminal = event.target instanceof Element && !!event.target.closest(".terminal-pane");
       const modal = event.target instanceof Element
-        ? event.target.closest(".modal-backdrop,.model-backdrop,.settings-backdrop,.runtime-backdrop,.ask-backdrop,.git-backdrop,.scheduled-tasks-backdrop,.profiles-backdrop")
+        ? event.target.closest(".modal-backdrop,.model-backdrop,.settings-backdrop,.runtime-backdrop,.ask-backdrop,.git-backdrop,.scheduled-tasks-backdrop,.profiles-backdrop,.workspace-options-backdrop,.shortcut-settings-backdrop")
         : null;
+      const modalOpen = optionsOpen || shortcutsOpen || newSessionOpen || renamingSession || forkingSession || askPanel || gitOpen ||
+        schedulesOpen || profilesOpen || modeConfirmation || modelPickerOpen || settingsOpen || organizingSession || runtimeOpen || referenceOpen;
+      const match = (action: ShortcutAction) => matchesAction(keybindings.overrides, action, event, isTauri());
 
-      if (event.key === "Escape") {
-        if (shortcutsOpen || newSessionOpen || renamingSession || forkingSession || askPanel || gitOpen || schedulesOpen || profilesOpen || modeConfirmation || modelPickerOpen ||
-            settingsOpen || organizingSession || runtimeOpen || referenceOpen) {
+      if (event.key === "Escape" && !event.repeat && !event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey) {
+        if (modalOpen) {
           event.preventDefault();
           setShortcutsOpen(false);
           setNewSessionOpen(false);
@@ -874,12 +889,25 @@ function App() {
           setOrganizingSession(null);
           setRuntimeOpen(false);
           setReferenceOpen(false);
+          setOptionsOpen(false);
           composerRef.current?.focus();
+          return;
+        }
+      }
+
+      if (modal || modalOpen) {
+        if (modal && event.key === "Tab" && !event.ctrlKey && !event.metaKey && !event.altKey) {
+          const controls = Array.from(modal.querySelectorAll<HTMLElement>(
+            'button:not(:disabled),input:not(:disabled),textarea:not(:disabled),select:not(:disabled),a[href],summary',
+          )).filter((element) => element.offsetParent !== null);
+          const first = controls[0], last = controls[controls.length - 1];
+          if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+          else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
         }
         return;
       }
-
-      if (event.key === "F6" && !modal) {
+      if (keyboardPreviewRef.current) return;
+      if (match("nextRegion") || match("previousRegion")) {
         event.preventDefault();
         const regions = [
           document.querySelector<HTMLTextAreaElement>(".agent-composer textarea") ?? composerRef.current,
@@ -888,63 +916,43 @@ function App() {
           document.querySelector<HTMLElement>(".terminal-host .xterm-helper-textarea"),
         ].filter((region): region is HTMLElement => region !== null);
         const index = regions.findIndex((region) => region === document.activeElement);
-        regions[(index + (event.shiftKey ? -1 : 1) + regions.length) % regions.length]?.focus();
+        regions[(index + (match("previousRegion") ? -1 : 1) + regions.length) % regions.length]?.focus();
         return;
       }
       if (inTerminal) return;
-
-      if (modal) {
-        if (event.key === "Tab") {
-          const controls = Array.from(modal.querySelectorAll<HTMLElement>(
-            'button:not(:disabled),input:not(:disabled),textarea:not(:disabled),select:not(:disabled),a[href],summary',
-          )).filter((element) => element.offsetParent !== null);
-          const first = controls[0];
-          const last = controls[controls.length - 1];
-          if (event.shiftKey && document.activeElement === first) {
-            event.preventDefault(); last?.focus();
-          } else if (!event.shiftKey && document.activeElement === last) {
-            event.preventDefault(); first?.focus();
-          }
-        }
-        return;
-      }
-      if (selectedAgent && !(modifier && key === "n") &&
-          !(modifier && event.shiftKey && (key === "t" || key === "b"))) {
-        if (modifier && key === "k") {
-          event.preventDefault();
-          document.querySelector<HTMLTextAreaElement>(".agent-composer textarea")?.focus();
-        }
-        return;
-      }
-      if (event.altKey && !event.ctrlKey && !event.metaKey) {
-        const mode =
-          key === "1" ? "interactive" : key === "2" ? "plan" : key === "3" ? "autopilot" : null;
-        if (mode) {
-          event.preventDefault();
-          void changeMode(mode);
-          composerRef.current?.focus();
-        }
-        return;
-      }
-
-      if (modifier && event.shiftKey && key === "b") {
+      if (match("toggleSidebar")) {
         event.preventDefault();
         setSidebarOpen((current) => !current);
         return;
       }
-      if (modifier && key === "n") {
+      if (match("newSession")) {
         event.preventDefault();
         openNewSession();
         return;
       }
-      if (modifier && key === ".") {
-        if (processingRef.current) {
+      if (match("focusPrompt") && (!editing || inComposer || !!selectedAgent)) {
+        event.preventDefault();
+        (document.querySelector<HTMLTextAreaElement>(".agent-composer textarea") ?? composerRef.current)?.focus();
+        return;
+      }
+      if (selectedAgent) return;
+      if (match("stopTurn")) {
+        const copy = key === "c" && event.ctrlKey;
+        const nativeControl = event.target instanceof Element && event.target.closest('select,[role="dialog"],[role="combobox"],[role="menu"]');
+        if (processingRef.current && !event.repeat && !nativeControl && !(copy && (editing || window.getSelection()?.toString()))) {
           event.preventDefault();
           void stopTurn();
         }
         return;
       }
-      if (modifier && event.shiftKey && key === "backspace") {
+      const mode = match("interactiveMode") ? "interactive" : match("planMode") ? "plan" : match("autopilotMode") ? "autopilot" : null;
+      if (mode) {
+        event.preventDefault();
+        void changeMode(mode);
+        composerRef.current?.focus();
+        return;
+      }
+      if (match("removeQueued")) {
         const item = [...queue.items]
           .reverse()
           .find((queued) => !queued.id.startsWith("local-queue-"));
@@ -954,67 +962,39 @@ function App() {
         }
         return;
       }
-      if (modifier && key === "t") {
+      if (match("toggleReasoning")) {
         event.preventDefault();
         setReasoningExpanded((current) => !current);
         return;
       }
-      if (modifier && key === "o" && !editing) {
+      if (match("toggleTools") && !editing) {
         event.preventDefault();
         setToolDetailsExpanded((current) => !current);
         return;
       }
-      if (modifier && key === "e" && !editing) {
+      if (match("expandDetails") && !editing) {
         event.preventDefault();
         setReasoningExpanded(true);
         setToolDetailsExpanded(true);
         return;
       }
-      if (event.ctrlKey && key === "c" && !editing && processingRef.current) {
-        if (!window.getSelection()?.toString()) {
-          event.preventDefault();
-          void stopTurn();
-        }
-        return;
-      }
-
-      if (inComposer) {
-        if (modifier && key === "q") {
-          event.preventDefault();
-          submitDeliveryRef.current = "enqueue";
-          composerRef.current?.form?.requestSubmit();
-        } else if (modifier && key === "s") {
-          event.preventDefault();
-          dispatchDraft({ type: "stash", sessionId: draftSessionId });
-        } else if (modifier && key === "r") {
-          event.preventDefault();
-          const history = promptHistoryRef.current;
-          if (history.length) {
-            promptHistoryIndexRef.current = (promptHistoryIndexRef.current + 1) % history.length;
-            setComposer(history[history.length - 1 - promptHistoryIndexRef.current]);
-          }
-        }
-        return;
-      }
+      if (inComposer) return;
       if (editing) return;
 
-      if (key === "?" || (modifier && key === "/")) {
+      if (match("showShortcuts") && !narrowLayout) {
         event.preventDefault();
         setShortcutsOpen(true);
-      } else if (key === "/") {
+      } else if (match("openCommands")) {
         event.preventDefault();
         setComposer((current) => current || "/");
         requestAnimationFrame(() => composerRef.current?.focus());
-      } else if (modifier && key === "k") {
-        event.preventDefault();
-        composerRef.current?.focus();
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [queue.items, shortcutsOpen, newSessionOpen, modeConfirmation, modelPickerOpen,
       settingsOpen, organizingSession, runtimeOpen, referenceOpen, modeBusy,
-      composer, trackedCwd, activeSession, newSessionModels, newSessionModelsLoading, selectedAgent, renamingSession, forkingSession, askPanel, gitOpen, schedulesOpen, profilesOpen]);
+      composer, trackedCwd, activeSession, newSessionModels, newSessionModelsLoading, selectedAgent, renamingSession, forkingSession, askPanel, gitOpen, schedulesOpen, profilesOpen, optionsOpen, events, keybindings.overrides, narrowLayout]);
 
   useEffect(() => {
     if (!activeSession || !sessionReady || runtimeStatus?.connected === false) {
@@ -1136,6 +1116,74 @@ function App() {
     () => groupSessions(filteredSessions.slice(0, sessionRenderLimit)),
     [filteredSessions, sessionRenderLimit],
   );
+  const keyboardPreview = sessions.find((session) => session.sessionId === keyboardPreviewId);
+  useEffect(() => {
+    if (keyboardPreviewId && !filteredSessions.some((session) => session.sessionId === keyboardPreviewId)) {
+      keyboardPreviewRef.current = null;
+      setKeyboardPreviewId(null);
+    }
+  }, [keyboardPreviewId, filteredSessions]);
+
+  function cancelKeyboardPreview() {
+    keyboardPreviewRef.current = null;
+    setKeyboardPreviewId(null);
+    requestAnimationFrame(() => composerRef.current?.focus());
+  }
+
+  useEffect(() => {
+    const cycle = (event: KeyboardEvent) => {
+      const direction = matchesAction(keybindings.overrides, "nextSession", event, isTauri()) ? 1
+        : matchesAction(keybindings.overrides, "previousSession", event, isTauri()) ? -1 : null;
+      if (direction === null || event.defaultPrevented) return;
+      if (optionsOpen || shortcutsOpen || newSessionOpen || renamingSession || forkingSession || askPanel ||
+          gitOpen || schedulesOpen || profilesOpen || modeConfirmation || modelPickerOpen ||
+          settingsOpen || organizingSession || runtimeOpen || referenceOpen) return;
+      const ordered = sessionGroups.flatMap((group) => group.sessions);
+      const next = adjacentSession(ordered, keyboardPreviewRef.current ?? activeIdRef.current, direction);
+      if (!next) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.repeat) return;
+      if (next.sessionId === activeIdRef.current) {
+        keyboardPreviewRef.current = null;
+        setKeyboardPreviewId(null);
+        requestAnimationFrame(() => composerRef.current?.focus());
+        return;
+      }
+      if (!next.isActive || (next.initialization && next.initialization.phase !== "ready")) {
+        keyboardPreviewRef.current = next.sessionId;
+        setKeyboardPreviewId(next.sessionId);
+        return;
+      }
+      void openSession(next).then(() => requestAnimationFrame(() => {
+        if (activeIdRef.current === next.sessionId && !composerRef.current?.disabled) composerRef.current?.focus();
+      }));
+    };
+    window.addEventListener("keydown", cycle, true);
+    return () => window.removeEventListener("keydown", cycle, true);
+  }, [sessionGroups, openSession, optionsOpen, shortcutsOpen, newSessionOpen, renamingSession, forkingSession,
+    askPanel, gitOpen, schedulesOpen, profilesOpen, modeConfirmation, modelPickerOpen, settingsOpen,
+    organizingSession, runtimeOpen, referenceOpen, keybindings.overrides]);
+
+  function recallPrompt(direction: -1 | 1) {
+    const sessionId = activeIdRef.current;
+    const input = composerRef.current;
+    if (!sessionId || sessionId !== draftSessionId || !input || input.disabled) return;
+    let navigation = promptNavigationRef.current.get(sessionId);
+    if (!navigation) {
+      navigation = new PromptHistoryNavigation();
+      promptNavigationRef.current.set(sessionId, navigation);
+    }
+    const value = navigation.move(recentPrompts(events, promptHistoryRef.current.get(sessionId) ?? []), direction, input.value);
+    if (value === null) return;
+    setComposer(value);
+    requestAnimationFrame(() => {
+      if (activeIdRef.current !== sessionId || composerRef.current !== input) return;
+      const caret = direction === -1 ? 0 : value.length;
+      input.setSelectionRange(caret, caret);
+      input.scrollTop = direction === -1 ? 0 : input.scrollHeight;
+    });
+  }
 
   useEffect(() => {
     setSessionRenderLimit(100);
@@ -1276,12 +1324,14 @@ function App() {
       return;
     }
     if (slash?.name === "ask") {
+      promptNavigationRef.current.get(activeSession.sessionId)?.reset();
       dispatchDraft({ type: "submitted", sessionId: activeSession.sessionId });
       submitDeliveryRef.current = null;
       setAskPanel({ id: crypto.randomUUID(), sessionId: activeSession.sessionId, question: slash.args, submitOnOpen: !!slash.args.trim() });
       return;
     }
     if (slash?.name === "fork") {
+      promptNavigationRef.current.get(activeSession.sessionId)?.reset();
       dispatchDraft({ type: "submitted", sessionId: activeSession.sessionId });
       submitDeliveryRef.current = null;
       setForkingName(slash.args.trim() || undefined);
@@ -1302,8 +1352,9 @@ function App() {
     const queued = processingRef.current && delivery === "enqueue";
     const optimisticQueueId = queued ? `local-queue-${crypto.randomUUID()}` : "";
     if (content) {
-      promptHistoryRef.current = [...promptHistoryRef.current.slice(-99), content];
-      promptHistoryIndexRef.current = -1;
+      const history = promptHistoryRef.current.get(sessionId) ?? [];
+      promptHistoryRef.current.set(sessionId, [...history.slice(-99), content]);
+      promptNavigationRef.current.get(sessionId)?.reset();
     }
     const token = sendOperation.start(sessionId);
     if (!token) return;
@@ -1598,6 +1649,8 @@ function App() {
   async function stopTurn() {
     const sessionId = activeIdRef.current;
     if (!sessionId) return;
+    const token = stopOperation.start(sessionId);
+    if (!token) return;
     const before = activityRef.current;
     activityRef.current = { ...before, phase: "stopping" };
     setActivity(activityRef.current);
@@ -1609,6 +1662,8 @@ function App() {
         setActivity(before);
         handleError(cause, setError, setNeedsLogin);
       }
+    } finally {
+      stopOperation.finish(sessionId, token);
     }
   }
 
@@ -2019,6 +2074,23 @@ function App() {
 
   const selectedAgentKey = selectedAgent ? agentKey(selectedAgent.sessionId, selectedAgent.task.id) : "";
   const selectedAgentDraft = agentDrafts[selectedAgentKey] ?? EMPTY_SESSION_DRAFTS;
+  useEffect(() => setOptionsOpen(false), [activeSession?.sessionId, selectedAgentKey]);
+
+  const askUnavailable = !sessionReady || !activeSession ? "Wait for a session to finish attaching."
+    : selectedAgent ? "Return to the parent conversation first."
+    : runtimeStatus?.acceptingWork === false ? "The runtime is not accepting new work." : undefined;
+  const forkUnavailable = !sessionReady || !activeSession ? "Wait for a session to finish attaching."
+    : selectedAgent ? "Return to the parent conversation first."
+    : sessionProcessing === true ? "Wait for the current turn to finish." : undefined;
+  const catchUpUnavailable = !activeSession ? "Select a session first."
+    : selectedAgent ? "Return to the parent conversation first."
+    : runtimeStatus?.connected === false ? "Reconnect the runtime first."
+    : busy || sessionProcessing === true ? "Wait for the current operation or turn to finish."
+    : catchingUp ? "History refresh is already running." : undefined;
+  const openAsk = () => {
+    if (activeSession) setAskPanel({ id: crypto.randomUUID(), sessionId: activeSession.sessionId, question: "", submitOnOpen: false });
+  };
+  const openFork = () => { setForkingName(undefined); if (activeSession) setForkingSession(activeSession); };
 
   const sessionRows = useMemo(() => sessionGroups.map((group) => {
     const collapsed = collapsedGroups.has(group.key);
@@ -2044,7 +2116,8 @@ function App() {
               })}>
               {expandedSessions.has(session.sessionId) ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
             </button>
-          <SessionRow session={session} active={activeSession?.sessionId === session.sessionId} showFolder={!!group.pinned}
+          <SessionRow session={session} active={!keyboardPreview && activeSession?.sessionId === session.sessionId}
+            preview={keyboardPreviewId === session.sessionId} showFolder={!!group.pinned}
             activity={sidebarActivity.states[session.sessionId]} activityConnected={activityConnected}
             onOpen={() => { setSelectedAgent(null); void openSession(session); }}
             onTogglePin={() => void organizeSession(session, {
@@ -2069,7 +2142,7 @@ function App() {
         </div>
       </section>
     );
-  }), [sessionGroups, collapsedGroups, activeSession?.sessionId, expandedSessions, agentTasks.states, selectedAgent, selectAgent, runtimeStatus?.connected, setSessionArchived, archiveOperation.revision, sidebarActivity.states, activityConnected]);
+  }), [sessionGroups, collapsedGroups, activeSession?.sessionId, expandedSessions, agentTasks.states, selectedAgent, selectAgent, runtimeStatus?.connected, setSessionArchived, archiveOperation.revision, sidebarActivity.states, activityConnected, keyboardPreview, keyboardPreviewId]);
 
   if (needsLogin) {
     return <LoginScreen tunnel={needsLogin === "tunnel"} onTunnelAuth={() => setNeedsLogin("tunnel")} onLoggedIn={loadSessions} />;
@@ -2079,6 +2152,7 @@ function App() {
     <main
       className={`app-shell ${terminalOpen ? "terminal-visible" : ""} terminal-${terminalLayout.layout.dock}`}
       data-chat-width={chatWidth.width}
+      data-keyboard-preview={!!keyboardPreview}
       style={{ "--terminal-width": `${terminalWidth}px`, "--terminal-height": `${terminalLayout.height}px`,
         "--workspace-sidebar-width": `${sidebarWidth.width}px` } as CSSProperties}
     >
@@ -2106,7 +2180,8 @@ function App() {
           <button className="new-session-button" onClick={openNewSession}>
             <MessageSquarePlus size={17} />
             New session
-            <span>⌘ N</span>
+            {actionBindings(keybindings.overrides, "newSession")[0] &&
+              <span>{formatBinding(actionBindings(keybindings.overrides, "newSession")[0])}</span>}
           </button>
           <button type="button" className="scheduled-nav-button" onClick={() => setSchedulesOpen(true)}>
             <CalendarClock size={16} />Scheduled tasks
@@ -2195,7 +2270,27 @@ function App() {
         />
       )}
 
-      <section className="workspace">
+      <section className="workspace" data-keyboard-preview={!!keyboardPreview}>
+        {keyboardPreview && <section className="keyboard-session-preview" key={keyboardPreview.sessionId}
+          role="region" aria-label="Keyboard session preview" onKeyDown={(event) => {
+            if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); cancelKeyboardPreview(); }
+          }}>
+          <small>Keyboard preview - not opened</small>
+          <h1>{keyboardPreview.title}</h1>
+          <code>{keyboardPreview.cwd || "No working directory"}</code>
+          <p id="keyboard-session-preview-hint">Press <kbd>Enter</kbd> to open and initialize this session.
+            Keep cycling to browse without opening it, or press <kbd>Escape</kbd> to return.</p>
+          <p>Your current conversation, draft, and terminal stay unchanged until you open a session.</p>
+          <div>
+            <button type="button" className="button primary" autoFocus onClick={() => {
+              if (keyboardPreviewRef.current !== keyboardPreview.sessionId) return;
+              void openSession(keyboardPreview).then(() => requestAnimationFrame(() => {
+                if (activeIdRef.current === keyboardPreview.sessionId) composerRef.current?.focus();
+              }));
+            }}>Open session</button>
+            <button type="button" className="button secondary" onClick={cancelKeyboardPreview}>Return to current session</button>
+          </div>
+        </section>}
         {archiveError && archiveErrorLocation === "workspace" && <p className="session-archive-error" role="alert">{archiveError}</p>}
         {activeArchived && activeSession && <div className="session-archived-banner" role="status">
           <Archive size={15} /><span>This session is archived. Its conversation and running work are unchanged.</span>
@@ -2214,7 +2309,7 @@ function App() {
           <div className="session-heading">
             <div className="session-title-line">
               <h1 title={activeSession?.title ?? "Copilot Sessions"}>{activeSession?.title ?? "Copilot Sessions"}</h1>
-              {activeSession && <button type="button" className="icon-button" aria-label="Rename session"
+              {activeSession && <button type="button" className="icon-button workspace-secondary-action" aria-label="Rename session"
                 hidden={chatHeader.collapsed} title="Rename session" onClick={() => setRenamingSession(activeSession)}><Pencil size={15} /></button>}
             </div>
             <div id="session-metadata" className="session-context" hidden={chatHeader.collapsed}>
@@ -2252,69 +2347,58 @@ function App() {
           </div>
           <div id="workspace-tools" className="header-actions" hidden={chatHeader.collapsed}>
             {activeSession?.cwd && <GitWorkspaceButton sessionId={activeSession.sessionId} cwd={activeSession.cwd} onOpen={() => setGitOpen(true)} />}
-            <button type="button" className="icon-button" title="Ask about this conversation without tools or history changes"
-              aria-label="Ask about conversation" disabled={!sessionReady || !!selectedAgent || runtimeStatus?.acceptingWork === false}
-              onClick={() => activeSession && setAskPanel({ id: crypto.randomUUID(), sessionId: activeSession.sessionId, question: "", submitOnOpen: false })}>
+            <button type="button" className="icon-button workspace-secondary-action" title="Ask about this conversation without tools or history changes"
+              aria-label="Ask about conversation" disabled={!!askUnavailable}
+              onClick={openAsk}>
               <MessageCircleQuestion size={16} /><span className="desktop-label">Ask</span>
             </button>
-            <button type="button" className="icon-button" title="Fork conversation" aria-label="Fork conversation"
-              disabled={!activeSession || !sessionReady || !!selectedAgent || sessionProcessing === true}
-              onClick={() => { setForkingName(undefined); if (activeSession) setForkingSession(activeSession); }}>
-              <GitBranch size={16} /><span className="desktop-label">Fork</span>
+            <button type="button" className="icon-button workspace-secondary-action" title="Fork conversation" aria-label="Fork conversation"
+              disabled={!!forkUnavailable} onClick={openFork}>
+              <CopyPlus size={16} /><span className="desktop-label">Fork</span>
             </button>
             {!selectedAgent && activeSession && (busy || sessionProcessing) && (
               <button
-                className="icon-button"
-                title="Stop current turn"
+                className="icon-button workspace-secondary-action"
+                title={`Stop current turn${actionBindings(keybindings.overrides, "stopTurn").length ? ` (${actionBindings(keybindings.overrides, "stopTurn").map(formatBinding).join(" / ")})` : ""}`}
+                aria-keyshortcuts={ariaBindings(keybindings.overrides, "stopTurn")}
                 onClick={() => void stopTurn()}
               >
                 <Square size={15} />
               </button>
             )}
             <button
-              className="icon-button"
+              className="icon-button workspace-secondary-action"
               title="Merge recent history without restarting Copilot or other sessions"
-              disabled={
-                !activeSession ||
-                !!selectedAgent ||
-                runtimeStatus?.connected === false ||
-                busy ||
-                sessionProcessing === true ||
-                catchingUp
-              }
+              disabled={!!catchUpUnavailable}
               onClick={() => void catchUpSession()}
             >
               <RefreshCw className={catchingUp ? "spin" : undefined} size={17} />
               <span className="desktop-label">Catch up</span>
             </button>
             <button
-              className={showRawEvents ? "icon-button active" : "icon-button"}
-              title="Toggle raw session event stream"
-              disabled={!activeSession}
-              onClick={() => setShowRawEvents((current) => !current)}
-            >
-              {showRawEvents ? <EyeOff size={17} /> : <Eye size={17} />}
-              <span className="desktop-label">Trace</span>
-            </button>
-            <button
-              className={referenceOpen ? "icon-button active" : "icon-button"}
+              className={`icon-button workspace-primary-action${referenceOpen ? " active" : ""}`}
               title="Browse commands, tools, skills, MCP, and instructions"
               disabled={!activeSession || !!selectedAgent}
               onClick={() => setReferenceOpen((current) => !current)}
             >
               <BookOpen size={17} />
-              <span className="desktop-label">Context</span>
+              <span className="desktop-label workspace-primary-label">Context</span>
             </button>
             <button
-              className={terminalOpen ? "icon-button active" : "icon-button"}
+              className={`icon-button workspace-primary-action${terminalOpen ? " active" : ""}`}
               title={terminalOpen ? "Hide terminal" : "Open terminal"}
-              aria-keyshortcuts="Control+Shift+t Meta+Shift+t"
+              aria-keyshortcuts={ariaBindings(keybindings.overrides, "toggleTerminal")}
               disabled={!activeSession?.cwd && !trackedCwd}
               onClick={() => setTerminalOpen((current) => !current)}
             >
               <TerminalSquare size={18} />
-              <span className="desktop-label">Terminal</span>
-              {terminalOpen ? <PanelRightClose size={15} /> : <PanelRightOpen size={15} />}
+              <span className="desktop-label workspace-primary-label">Terminal</span>
+              {terminalOpen ? <PanelRightClose className="terminal-toggle-direction" size={15} /> : <PanelRightOpen className="terminal-toggle-direction" size={15} />}
+            </button>
+            <button type="button" className={`icon-button workspace-primary-action${optionsOpen ? " active" : ""}`}
+              title="Conversation actions, settings, and advanced diagnostics" aria-label="Additional options"
+              aria-haspopup="dialog" aria-expanded={optionsOpen} onClick={() => setOptionsOpen(true)}>
+              <Ellipsis size={18} /><span className="desktop-label workspace-primary-label">More</span>
             </button>
             {terminalOpen && <div className="terminal-layout-toggle" role="group" aria-label="Terminal layout">
               <button type="button" className="icon-button" title="Terminal above chat" aria-label="Terminal above chat"
@@ -2330,6 +2414,7 @@ function App() {
           </div>
         </header>
         {chatHeader.error && <p className="error-banner" role="alert">{chatHeader.error}</p>}
+        {keybindings.error && <p className="error-banner" role="alert">{keybindings.error}</p>}
         <ProfileConfigurationNotice status={sessionProfile.status} error={sessionProfile.error} onRefresh={sessionProfile.refresh} />
         {sessionStartup.status && !sessionStartup.ready && <SessionStartupBanner
           initialization={sessionStartup.status.initialization} error={sessionStartup.status.error}
@@ -2595,6 +2680,8 @@ function App() {
             {(busy || sessionProcessing) && (
               <button
                 type="button"
+                title="Stop current turn"
+                aria-keyshortcuts={ariaBindings(keybindings.overrides, "stopTurn")}
                 onClick={() => void stopTurn()}
               >
                 <Square size={11} />
@@ -2688,12 +2775,26 @@ function App() {
             }}
             onKeyDown={(event) => {
               if (event.nativeEvent.isComposing) return;
-              if (event.key === "Tab" && !event.altKey && !event.ctrlKey && !event.metaKey) {
+              const match = (action: ShortcutAction) => matchesAction(keybindings.overrides, action, event.nativeEvent, isTauri());
+              if (match("olderPrompt") || match("newerPrompt")) {
+                const direction = match("olderPrompt") ? -1 : 1;
+                if (atComposerEdge(event.currentTarget, direction)) {
+                  event.preventDefault();
+                  recallPrompt(direction);
+                }
+              } else if (match("cycleMode")) {
                 event.preventDefault();
                 void changeMode(cycleAgentMode(agentMode, 1));
-              } else if (submitsComposer(event, mobileInput)) {
+              } else if (match("queuePrompt") || match("steerPrompt")) {
                 event.preventDefault();
-                if (event.ctrlKey || event.metaKey) submitDeliveryRef.current = "immediate";
+                submitDeliveryRef.current = match("steerPrompt") ? "immediate" : "enqueue";
+                event.currentTarget.form?.requestSubmit();
+              } else if (match("stashPrompt")) {
+                event.preventDefault();
+                promptNavigationRef.current.get(draftSessionId)?.reset();
+                dispatchDraft({ type: "stash", sessionId: draftSessionId });
+              } else if (!event.ctrlKey && !event.metaKey && !event.altKey && submitsComposer(event, mobileInput)) {
+                event.preventDefault();
                 event.currentTarget.form?.requestSubmit();
               }
             }}
@@ -2850,6 +2951,22 @@ function App() {
         />
       )}
 
+      {optionsOpen && <WorkspaceOptions diagnostics={showRawEvents} diagnosticsDisabled={!activeSession}
+        onDiagnosticsChange={setShowRawEvents} onClose={() => setOptionsOpen(false)} actions={[
+          { label: "Ask about conversation", description: "Ask a side question without using tools or changing this conversation's history.",
+            icon: MessageCircleQuestion, disabledReason: askUnavailable, onSelect: openAsk },
+          { label: "Fork conversation", description: "Start a separate conversation from this history. This does not create a Git branch or copy the terminal.",
+            icon: CopyPlus, disabledReason: forkUnavailable, onSelect: openFork },
+          { label: "Catch up", description: "Reload recent history from the daemon without restarting Copilot, the terminal, or other sessions.",
+            icon: RefreshCw, disabledReason: catchUpUnavailable, onSelect: () => void catchUpSession() },
+          { label: "Rename session", description: "Change the conversation's name in your session list.",
+            icon: Pencil, disabledReason: !activeSession ? "Select a session first." : undefined,
+            onSelect: () => { if (activeSession) setRenamingSession(activeSession); } },
+          { label: "App settings", description: narrowLayout
+              ? "Appearance, font sizes, chat defaults, profiles, and runtime maintenance."
+              : "Appearance, font sizes, chat defaults, profiles, keyboard shortcuts, and runtime maintenance.",
+            icon: Settings2, onSelect: () => setSettingsOpen(true) },
+        ]} />}
       {settingsOpen && (
         <SettingsPanel
           typography={typography}
@@ -2859,7 +2976,7 @@ function App() {
           deliveryDefault={deliveryDefault.value}
           deliveryDefaultError={deliveryDefault.error}
           onDeliveryDefaultChange={(value) => { deliveryDefault.setValue(value); setDeliveryOverride(null); }}
-          onOpenShortcuts={() => { setSettingsOpen(false); setShortcutsOpen(true); }}
+          onOpenShortcuts={narrowLayout ? undefined : () => { setSettingsOpen(false); setShortcutsOpen(true); }}
           onOpenProfiles={() => { setSettingsOpen(false); setProfilesOpen(true); }}
           themePreference={themePreference}
           onThemePreferenceChange={setThemePreference}
@@ -3097,48 +3214,12 @@ function App() {
         </div>
       )}
 
-      {shortcutsOpen && (
-        <div className="modal-backdrop" role="presentation" onClick={() => setShortcutsOpen(false)}>
-          <section
-            className="shortcut-modal"
-            role="dialog"
-            aria-modal="true"
-            aria-label="Keyboard shortcuts"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <header>
-              <div>
-                <span>Keyboard workflow</span>
-                <h2>Shortcuts</h2>
-              </div>
-              <button type="button" autoFocus onClick={() => { setShortcutsOpen(false); composerRef.current?.focus(); }} aria-label="Close">
-                <X size={17} />
-              </button>
-            </header>
-            <div className="shortcut-grid">
-              <kbd>F6 / Shift F6</kbd><span>Move between prompt, conversation, sessions, and terminal</span>
-              <kbd>Ctrl K</kbd><span>Focus prompt</span>
-              <kbd>/</kbd><span>Open command palette</span>
-              <kbd>Ctrl Q</kbd><span>Send or enqueue prompt</span>
-              <kbd>Ctrl Enter</kbd><span>Steer the running turn</span>
-              <kbd>Ctrl S</kbd><span>Stash or restore prompt</span>
-              <kbd>Ctrl R</kbd><span>Cycle recent prompts</span>
-              <kbd>Tab / Shift Tab</kbd><span>Cycle Interactive / Plan / Autopilot</span>
-              <kbd>Alt 1 / 2 / 3</kbd><span>Jump to Interactive / Plan / Autopilot</span>
-              <kbd>Ctrl T</kbd><span>Toggle reasoning</span>
-              <kbd>Ctrl O</kbd><span>Toggle tool details</span>
-              <kbd>Ctrl E</kbd><span>Expand reasoning and tool details</span>
-              <kbd>Ctrl .</kbd><span>Stop current turn</span>
-              <kbd>Ctrl Shift Backspace</kbd><span>Remove newest queued prompt</span>
-              <kbd>Ctrl Shift B</kbd><span>Toggle sessions sidebar</span>
-              <kbd>Ctrl Shift T</kbd><span>Toggle terminal (Cmd Shift T on macOS also works)</span>
-              <kbd>Ctrl C / Cmd C</kbd><span>In terminal: copy selected text. Ctrl C without selection interrupts the shell.</span>
-              <kbd>Ctrl N</kbd><span>New session</span>
-              <kbd>?</kbd><span>Show this help</span>
-            </div>
-          </section>
-        </div>
-      )}
+      {shortcutsOpen && !narrowLayout && <Suspense fallback={<p role="status">Opening keyboard shortcuts...</p>}>
+        <ShortcutSettings controller={keybindings} onClose={() => {
+          setShortcutsOpen(false);
+          composerRef.current?.focus();
+        }} />
+      </Suspense>}
       {modeConfirmation && (
         <div className="modal-backdrop" role="presentation">
           <section className="shortcut-modal" role="dialog" aria-modal="true" aria-label="Mode change requires confirmation">
@@ -3158,6 +3239,7 @@ function App() {
 function SessionRow({
   session,
   active,
+  preview,
   showFolder,
   activity,
   activityConnected,
@@ -3171,6 +3253,7 @@ function SessionRow({
 }: {
   session: SessionSummary;
   active: boolean;
+  preview: boolean;
   showFolder: boolean;
   activity?: SessionActivity;
   activityConnected: boolean;
@@ -3187,8 +3270,9 @@ function SessionRow({
     : sessionActivityIndicator(session.isActive, activityConnected, activity);
   const statusId = `session-activity-${session.sessionId}`;
   return (
-    <div className={active ? "session-item active" : "session-item"} data-session-id={session.sessionId}>
-      <button className="session-open" onClick={onOpen} aria-describedby={statusId}>
+    <div className={`session-item${active ? " active" : ""}${preview ? " keyboard-preview" : ""}`} data-session-id={session.sessionId}>
+      <button className="session-open" onClick={onOpen} aria-current={preview || active ? "true" : undefined}
+        aria-describedby={`${statusId}${preview ? " keyboard-session-preview-hint" : ""}`}>
         {session.pinned && <Pin className="session-pin" size={12} />}
         <span className="session-main">
           <strong title={session.title}>{session.title}</strong>

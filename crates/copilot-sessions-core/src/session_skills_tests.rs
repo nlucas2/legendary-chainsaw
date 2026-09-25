@@ -148,3 +148,70 @@ fn skill_diff_distinguishes_source_changes_without_overwriting_enablement() {
     assert_eq!(not_discovered, ["removed"]);
     assert!(!current[0].enabled);
 }
+
+#[tokio::test]
+async fn plugin_skill_exclusions_are_session_only_and_preserve_preexisting_disabled_choices() {
+    let runtime = prepared().await;
+    runtime.service.resume_session("b".into()).await.unwrap();
+    runtime.plugin_skills.store(true, Ordering::Relaxed);
+    runtime.service.apply_profile_skill_exclusions("a", &["fixture-alpha".into()]).await.unwrap();
+    let a = runtime.service.session_skills("a").await.unwrap();
+    let b = runtime.service.session_skills("b").await.unwrap();
+    assert!(!a.skills.iter().find(|s|s.name=="alpha-on").unwrap().enabled);
+    assert!(!a.skills.iter().find(|s|s.name=="alpha-off").unwrap().enabled);
+    assert!(a.skills.iter().find(|s|s.name=="beta-on").unwrap().enabled);
+    assert!(a.skills.iter().find(|s|s.name=="personal").unwrap().enabled);
+    assert!(b.skills.iter().find(|s|s.name=="alpha-on").unwrap().enabled);
+    assert_eq!(runtime.requests("session.skills.disable").len(), 1);
+    runtime.service.apply_profile_skill_exclusions("a", &["fixture-alpha".into()]).await.unwrap();
+    assert_eq!(runtime.requests("session.skills.disable").len(), 1);
+    runtime.service.apply_profile_skill_exclusions("a", &[]).await.unwrap();
+    let restored = runtime.service.session_skills("a").await.unwrap();
+    assert!(restored.skills.iter().find(|s|s.name=="alpha-on").unwrap().enabled);
+    assert!(!restored.skills.iter().find(|s|s.name=="alpha-off").unwrap().enabled);
+    assert_eq!(runtime.requests("session.skills.enable").len(), 1);
+    assert!(runtime.requests("plugins.disable").is_empty());
+    assert!(runtime.requests("session.options.update").is_empty());
+    assert!(runtime.requests("session.mcp.disable").is_empty());
+}
+
+#[tokio::test]
+async fn plugin_skill_exclusions_reapply_after_skill_reload_and_cwd_change() {
+    let runtime = prepared().await;
+    runtime.plugin_skills.store(true, Ordering::Relaxed);
+    let library = runtime.service.profile_library().unwrap();
+    let snapshot = library.snapshot().unwrap();
+    let saved = library.save_profile(crate::profiles::SaveSessionProfile {
+        id: None, name: "Skills limited".into(), group_ids: vec![],
+        excluded_skill_plugins: vec!["fixture-alpha".into()], expected_revision: snapshot.revision,
+        excluded_mcp_plugins: vec![],
+    }).unwrap();
+    let selected = library.resolve(Some(&saved.profiles[0].id)).unwrap().selection();
+    runtime.service.metadata.write().await.get_mut("a").unwrap().profile = Some(selected);
+    let result = runtime.service.reload_session_skills(request(".")).await.unwrap();
+    assert!(!result.skills.iter().find(|s|s.name=="alpha-on").unwrap().enabled);
+    runtime.service.set_working_directory("a", "..".into()).await.unwrap();
+    let result = runtime.service.session_skills("a").await.unwrap();
+    assert!(!result.skills.iter().find(|s|s.name=="alpha-on").unwrap().enabled);
+    assert_eq!(load_metadata(&runtime.service.metadata_path)["a"].profile_disabled_skills.len(), 1);
+}
+
+#[tokio::test]
+async fn plugin_skill_exclusion_failure_is_visible_and_blocks_message_admission() {
+    let runtime = prepared().await;
+    runtime.plugin_skills.store(true, Ordering::Relaxed);
+    let library = runtime.service.profile_library().unwrap();
+    let saved = library.save_profile(crate::profiles::SaveSessionProfile {
+        id: None, name: "Restricted skills".into(), group_ids: vec![],
+        excluded_skill_plugins: vec!["fixture-alpha".into()], expected_revision: library.snapshot().unwrap().revision,
+        excluded_mcp_plugins: vec![],
+    }).unwrap();
+    runtime.service.metadata.write().await.get_mut("a").unwrap().profile = Some(library.resolve(Some(&saved.profiles[0].id)).unwrap().selection());
+    runtime.hold("session.skills.disable");
+    let service = runtime.service.clone();
+    let reload = tokio::spawn(async move { service.sync_profile_skill_exclusions("a").await });
+    let call = runtime.request("session.skills.disable", 1).await;
+    runtime.inject(json!({"jsonrpc":"2.0","id":call["id"],"error":{"code":-32000,"message":"Fixture skill toggle failure"}})).await;
+    assert!(reload.await.unwrap().is_err());
+    assert!(runtime.service.require_profile_ready("a").await.is_err());
+}

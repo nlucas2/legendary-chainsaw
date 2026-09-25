@@ -5,11 +5,17 @@
 .profiles-content { padding: 16px 18px; overflow: auto; min-width: 0; min-height: 0; font-size: 13px; }
 .profiles-panel button, .session-profile-panel button, .profile-state button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 7px 10px; min-height: 34px; border: 1px solid var(--line); border-radius: 6px; color: var(--text); background: var(--surface-1); font: inherit; font-size: 12px; cursor: pointer; }
 .profiles-panel button:disabled, .session-profile-panel button:disabled, .profile-state button:disabled { cursor: default; opacity: .5; }
+.profiles-panel button { min-height: 30px; padding: 5px 8px; }
 .profile-help { color: var(--muted); font-size: 12px; line-height: 1.55; }
 .profile-error { color: var(--danger); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
 .profile-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
-.profile-card, .profile-editor, .profile-preview { padding: 12px; margin: 12px 0; border: 1px solid var(--line); border-radius: 8px; min-width: 0; overflow-wrap: anywhere; }
-.profile-card h4 { margin: 0; }
+.profile-editor, .profile-preview { padding: 12px; margin: 12px 0; border: 1px solid var(--line); border-radius: 8px; min-width: 0; overflow-wrap: anywhere; }
+.profile-card { display: flex; align-items: center; gap: 10px; padding: 8px 10px; margin: 6px 0; border: 1px solid var(--line); border-radius: 6px; min-width: 0; }
+.profile-card-summary { flex: 1; min-width: 0; line-height: 1.5; overflow-wrap: anywhere; }
+.profile-card-summary h4, .profile-card-summary p { display: inline; margin: 0; font-size: inherit; }
+.profile-card-summary p { margin-inline-start: 6px; color: var(--muted); font-size: 12px; }
+.profile-card .profile-actions { flex: 0 0 auto; flex-wrap: nowrap; gap: 4px; margin: 0; }
+.profile-card button { min-height: 28px; padding: 4px 7px; }
 .profile-editor { border-color: var(--accent); }
 .profile-editor fieldset { display: grid; gap: 10px; padding: 0; margin: 0; border: 0; min-width: 0; }
 .profiles-panel label, .session-profile-panel label, .new-profile-picker label { display: grid; gap: 6px; }
@@ -20,6 +26,20 @@
 .profile-stack { padding: 0; list-style-position: inside; }
 .profile-stack li { display: flex; gap: 5px; align-items: center; padding-block: 4px; }
 .profile-stack li span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.plugin-exclusions { min-width: 0; }
+.plugin-exclusions-header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+.plugin-exclusions-header h4 { margin: 0; }
+.plugin-exclusion-list { border: 1px solid var(--line); border-radius: 6px; max-height: 270px; overflow: auto; }
+.plugin-exclusion-columns, .plugin-exclusion-row { display: grid; grid-template-columns: minmax(0, 1fr) 60px 60px; gap: 4px; align-items: center; padding: 4px 8px; }
+.plugin-exclusion-columns { position: sticky; top: 0; background: var(--panel); color: var(--muted); font-size: 11px; text-align: center; }
+.plugin-exclusion-columns > :first-child { text-align: left; }
+.plugin-exclusion-row { border-top: 1px solid var(--line); }
+.plugin-exclusion-name { min-width: 0; overflow-wrap: anywhere; }
+.plugin-exclusion-name small { display: block; color: var(--muted); font-size: 11px; }
+.profiles-panel .plugin-exclusion-toggle { display: flex; justify-content: center; align-items: center; min-height: 32px; cursor: pointer; }
+.profiles-panel .plugin-exclusion-toggle input { width: 16px; height: 16px; min-height: 0; padding: 0; accent-color: var(--accent); }
+.plugin-write-in { display: flex; align-items: end; flex-wrap: wrap; gap: 8px; }
+.plugin-write-in label { flex: 1; min-width: 140px; }
 .profile-preview p, .profile-preview code { overflow-wrap: anywhere; }
 .profile-preview code { display: block; white-space: pre-wrap; font-size: 11px; }
 .session-profile-panel { padding: 4px; font-size: 13px; }
@@ -31,5 +51,7 @@
   .profiles-panel { max-height: calc(100dvh - 10px); }
   .profiles-content { padding: 10px; }
   .profiles-panel button, .session-profile-panel button, .profile-state button { min-height: 44px; }
+  .profile-card button { min-width: 44px; }
+  .profiles-panel .plugin-exclusion-toggle { min-height: 44px; }
   .profiles-panel input, .profiles-panel select, .profiles-panel textarea, .session-profile-panel select, .new-profile-picker select { font-size: 16px; }
 }

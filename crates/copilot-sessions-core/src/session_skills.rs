@@ -1,7 +1,14 @@
-use github_copilot_sdk::rpc::{ServerSkill, Skill, SkillsDiscoverRequest};
+use github_copilot_sdk::rpc::{ServerSkill, Skill, SkillsDiscoverRequest, SkillsDisableRequest, SkillsEnableRequest};
 use serde::{Deserialize, Serialize};
 
 use crate::{Result, ServiceError, SessionService};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProfileDisabledSkill {
+    name: String,
+    plugin: String,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -51,6 +58,76 @@ pub(crate) fn skill_discovery_diff(current: &[Skill], discovered: &[ServerSkill]
 }
 
 impl SessionService {
+    pub(crate) async fn sync_profile_skill_exclusions(&self, session_id: &str) -> Result<()> {
+        let plugins = self.metadata.read().await.get(session_id)
+            .and_then(|meta| meta.profile.as_ref())
+            .and_then(|profile| profile.snapshot.as_ref())
+            .map(|snapshot| snapshot.profile.excluded_skill_plugins.clone()).unwrap_or_default();
+        if let Err(error) = self.apply_profile_skill_exclusions(session_id, &plugins).await {
+            self.profile_configuration.lock().await.insert(session_id.into(), crate::session_profiles::ProfileConfigurationState {
+                blocked: true,
+                error: Some(format!("Plugin-skill exclusions could not be verified. Reapply the profile before sending. {error}")),
+                ..Default::default()
+            });
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn apply_profile_skill_exclusions(&self, session_id: &str, plugins: &[String]) -> Result<()> {
+        let previous = self.metadata.read().await.get(session_id)
+            .map(|meta| meta.profile_disabled_skills.clone()).unwrap_or_default();
+        if plugins.is_empty() && previous.is_empty() { return Ok(()); }
+        let session = self.attached_session(session_id).await?;
+        let current = session.rpc().skills().list().await?.skills;
+        let mut owned = previous.clone();
+        let mut restore = Vec::new();
+        let mut disable = Vec::new();
+        for skill in &current {
+            let plugin = skill.plugin_name.as_deref();
+            let matched = plugin.is_some_and(|name| plugins.iter().any(|excluded| excluded == name));
+            let prior = previous.iter().find(|entry| entry.name == skill.name && Some(entry.plugin.as_str()) == plugin);
+            if matched && skill.enabled {
+                let entry = ProfileDisabledSkill { name: skill.name.clone(), plugin: plugin.unwrap().into() };
+                if !owned.contains(&entry) { owned.push(entry); }
+                disable.push(skill.name.clone());
+            } else if !matched && prior.is_some() {
+                restore.push(skill.name.clone());
+            }
+        }
+        // Retain ownership before changing native flags so partial failures can
+        // restore only skills we disabled, not pre-existing user exclusions.
+        {
+            let mut metadata = self.metadata.write().await;
+            let meta = metadata.get_mut(session_id).ok_or_else(|| ServiceError::SessionNotActive(session_id.into()))?;
+            meta.profile_disabled_skills = owned.clone();
+        }
+        if let Err(error) = self.persist_metadata().await {
+            if let Some(meta) = self.metadata.write().await.get_mut(session_id) {
+                meta.profile_disabled_skills = previous;
+            }
+            return Err(error);
+        }
+        for name in &restore {
+            session.rpc().skills().enable(SkillsEnableRequest { name: name.clone() }).await?;
+        }
+        for name in &disable {
+            session.rpc().skills().disable(SkillsDisableRequest { name: name.clone() }).await?;
+        }
+        let effective = session.rpc().skills().list().await?.skills;
+        if effective.iter().any(|skill| skill.enabled &&
+            skill.plugin_name.as_ref().is_some_and(|plugin| plugins.contains(plugin)))
+            || restore.iter().any(|name| !effective.iter().any(|skill| &skill.name == name && skill.enabled))
+        {
+            return Err(ServiceError::CommandFailed("The runtime did not apply the profile's plugin-skill exclusions.".into()));
+        }
+        owned.retain(|entry| !restore.contains(&entry.name));
+        self.metadata.write().await.get_mut(session_id)
+            .ok_or_else(|| ServiceError::SessionNotActive(session_id.into()))?.profile_disabled_skills = owned;
+        self.persist_metadata().await?;
+        Ok(())
+    }
+
     pub async fn session_skills(&self, session_id: &str) -> Result<SessionSkills> {
         let _lifecycle = self.lifecycle_gate.read().await;
         let gate = self.turn_gate(session_id).await;
@@ -111,6 +188,8 @@ impl SessionService {
         crate::session_configuration::SessionConfiguration
             .apply_discovery(&self.client().await?, &request.session_id, &cwd).await?;
         let diagnostics = session.rpc().skills().reload().await?;
+        self.sync_profile_skill_exclusions(&request.session_id).await?;
+        self.verify_profile_mcps(&request.session_id).await?;
         let mut result = self.read_session_skills(&request.session_id).await.map_err(|error| {
             ServiceError::CommandFailed(format!("Skill reload returned, but its resulting skill list could not be read: {error}. Refresh the skill list before retrying."))
         })?;

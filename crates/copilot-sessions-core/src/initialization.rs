@@ -463,6 +463,8 @@ impl SessionService {
     async fn initialize_deferred(&self, id: &str, run: &Arc<InitializationRun>) -> Result<()> {
         self.require_accepting_work()?;
         self.sync_initial_session_name(id).await?;
+        self.sync_profile_skill_exclusions(id).await?;
+        self.verify_profile_mcps(id).await?;
         let client = self.client().await?;
         let params = Some(serde_json::json!({ "sessionId": id }));
         let started = Instant::now();

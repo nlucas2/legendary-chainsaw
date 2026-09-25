@@ -1,4 +1,4 @@
-import { test, expect, type Page } from "@playwright/test";
+import { test, expect, type Page, type Route } from "@playwright/test";
 
 const liveEvent = (sessionId: string, type: string, agentId?: string) => ({
   type: "session_event", sessionId,
@@ -28,6 +28,8 @@ async function setup(page: Page, options: { gate?: Promise<void>; count?: number
     requests: [] as { command: string; sessionId: string }[],
     activeReads: 0,
     maxReads: 0,
+    abortError: "", holdAbort: false, pendingAborts: new Map<string, Route>(),
+    terminalInput: [] as string[],
   };
   await page.addInitScript(() => {
     class ActivityEventSource extends EventTarget {
@@ -55,6 +57,10 @@ async function setup(page: Page, options: { gate?: Promise<void>; count?: number
     }
     Object.defineProperty(window, "EventSource", { value: ActivityEventSource });
   });
+  await page.routeWebSocket("**/api/terminal**", (socket) => {
+    socket.send(JSON.stringify({ type: "ready", shell: "Shortcut fixture", cwd: "Q:\\example", hasControl: true, viewers: 1 }));
+    socket.onMessage((message) => { state.terminalInput.push(String(message)); });
+  });
   await page.route("**/api/**", async (route) => {
     const command = new URL(route.request().url()).pathname.split("/").at(-1)!;
     const args = route.request().postDataJSON() ?? {};
@@ -65,6 +71,11 @@ async function setup(page: Page, options: { gate?: Promise<void>; count?: number
       case "resume_session": result = sessions.find((session) => session.sessionId === args.sessionId); break;
       case "runtime_status": result = { connected: true, acceptingWork: true, activeSessions: sessions.filter((session) => session.isActive).length }; break;
       case "session_state": result = { sessionId: args.sessionId, processing: state.processing[args.sessionId], mode: "interactive" }; break;
+      case "abort_session":
+        if (state.holdAbort) { state.pendingAborts.set(args.sessionId, route); return; }
+        if (state.abortError) return route.fulfill({ status: 500, body: state.abortError });
+        result = null; break;
+      case "available_models": result = { models: [] }; break;
       case "agent_tasks":
         if (state.taskFailures[args.sessionId]) return route.fulfill({ status: 500, body: state.taskFailures[args.sessionId] });
         result = { sessionId: args.sessionId, tasks: state.tasks[args.sessionId] ?? [] }; break;
@@ -96,6 +107,68 @@ async function setup(page: Page, options: { gate?: Promise<void>; count?: number
   return { state, emit };
 }
 
+test("Escape stops the current parent while drafting once and preserves the draft", async ({ page }) => {
+  const { state, emit } = await setup(page);
+  await expect(page.locator(".composer-status strong")).toHaveText("Copilot is working");
+  const prompt = page.locator(".parent-session-view .composer textarea");
+  await prompt.fill("Keep this unsent draft");
+  state.holdAbort = true;
+  await prompt.press("Escape");
+  await expect.poll(() => state.pendingAborts.has("a")).toBe(true);
+  await expect(page.locator(".composer-status strong")).toHaveText("Stopping turn");
+  await prompt.press("Escape");
+  await prompt.dispatchEvent("keydown", { key: "Escape", repeat: true, bubbles: true });
+  await expect(prompt).toHaveValue("Keep this unsent draft");
+  expect(state.requests.filter((request) => request.command === "abort_session")).toEqual([{ command: "abort_session", sessionId: "a" }]);
+  await state.pendingAborts.get("a")!.fulfill({ json: null });
+  state.processing.a = false;
+  await emit(liveEvent("a", "session.idle"));
+  await expect(page.locator(".composer-status strong")).toHaveText("Session attached · idle");
+  await prompt.press("Escape");
+  expect(state.requests.filter((request) => request.command === "abort_session")).toHaveLength(1);
+});
+
+test("Escape closes dialogs first, ignores repeats and modified/composing keys, and preserves Ctrl period", async ({ page }) => {
+  const { state } = await setup(page);
+  await expect(page.locator(".composer-status strong")).toHaveText("Copilot is working");
+  const prompt = page.locator(".parent-session-view .composer textarea");
+  await prompt.press("Control+n");
+  const dialog = page.getByRole("dialog", { name: "New session", exact: true });
+  await expect(dialog).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+  await prompt.dispatchEvent("keydown", { key: "Escape", repeat: true, bubbles: true });
+  await prompt.dispatchEvent("keydown", { key: "Escape", isComposing: true, bubbles: true });
+  await prompt.press("Shift+Escape");
+  expect(state.requests.filter((request) => request.command === "abort_session")).toHaveLength(0);
+  await prompt.press("Control+.");
+  await expect.poll(() => state.requests.filter((request) => request.command === "abort_session").length).toBe(1);
+});
+
+test("Escape stays terminal input and a failed Stop can be retried without affecting another session", async ({ page }) => {
+  const { state } = await setup(page);
+  await expect(page.locator(".composer-status strong")).toHaveText("Copilot is working");
+  await page.getByTitle("Open terminal", { exact: true }).click();
+  const terminal = page.locator(".terminal-host .xterm-helper-textarea");
+  await terminal.focus();
+  await terminal.press("Escape");
+  await expect.poll(() => state.terminalInput.some((message) => message.includes("\\u001b"))).toBe(true);
+  expect(state.requests.filter((request) => request.command === "abort_session")).toHaveLength(0);
+  const prompt = page.locator(".parent-session-view .composer textarea");
+  state.abortError = "Synthetic stop failure";
+  await prompt.press("Escape");
+  await expect(page.locator(".error-banner")).toContainText("Synthetic stop failure");
+  await expect(page.locator(".composer-status strong")).toHaveText("Copilot is working");
+  state.abortError = "";
+  await prompt.press("Escape");
+  await expect.poll(() => state.requests.filter((request) => request.command === "abort_session").length).toBe(2);
+  expect(state.requests.filter((request) => request.command === "abort_session").every((request) => request.sessionId === "a")).toBe(true);
+  await page.locator("[data-session-id='b'] .session-open").click();
+  await expect(page.locator(".composer-status strong")).toHaveText("Session attached · idle");
+  await prompt.press("Escape");
+  expect(state.requests.filter((request) => request.command === "abort_session")).toHaveLength(2);
+});
+
 test("small working and idle dots cover unselected attached sessions without resuming saved ones", async ({ page }, testInfo) => {
   const { state, emit } = await setup(page);
   const a = page.locator("[data-session-id='a']");
@@ -123,6 +196,37 @@ test("small working and idle dots cover unselected attached sessions without res
   await page.locator(".sidebar").screenshot({ path: testInfo.outputPath("session-activity-dots.png") });
 });
 
+test("desktop session rows use compact padding, separators, and visible keyboard-accessible expand arrows", async ({ page }) => {
+  await setup(page);
+  const nodes = page.locator(".session-node");
+  for (const width of [1440, 1100]) {
+    await page.setViewportSize({ width, height: 1000 });
+    const rows = await nodes.locator(".session-node-row").evaluateAll((elements) => elements.map((element) => {
+      const open = element.querySelector(".session-open")!;
+      const arrow = element.querySelector(".session-expander")!;
+      return {
+        height: element.getBoundingClientRect().height,
+        padding: getComputedStyle(open).paddingTop,
+        arrowWidth: arrow.getBoundingClientRect().width,
+        fits: element.scrollWidth <= element.clientWidth + 1,
+      };
+    }));
+    expect(rows.every((row) => row.height <= 44 && row.padding === "3px" && row.arrowWidth >= 24 && row.fits)).toBe(true);
+    await expect(nodes.nth(1)).toHaveCSS("border-top-style", "solid");
+    await expect(nodes.nth(1)).toHaveCSS("border-top-width", "1px");
+  }
+  const arrow = page.getByRole("button", { name: "Subagents for Session B", exact: true });
+  await arrow.focus();
+  await arrow.press("Enter");
+  await expect(arrow).toHaveAttribute("aria-expanded", "true");
+  await arrow.press("Space");
+  await expect(arrow).toHaveAttribute("aria-expanded", "false");
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.getByRole("button", { name: "Open sessions", exact: true }).click();
+  const open = page.locator("[data-session-id='b'] .session-open");
+  expect((await open.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+  expect((await arrow.boundingBox())!.width).toBeGreaterThanOrEqual(44);
+});
 test("activity remains live when browsing an archived attached session", async ({ page }) => {
   const { state, emit } = await setup(page);
   await expect(page.locator("[data-session-id='a'] .session-activity-dot")).toHaveAttribute("aria-label", "Working");

@@ -35,23 +35,37 @@ impl SessionService {
         Ok(ProfileLibrary::open(self.data_dir())?)
     }
 
-    pub(crate) fn resolve_new_profile(&self, request: &NewSession) -> Result<Option<ResolvedProfile>> {
+    pub async fn installed_plugins(&self) -> Result<Value> {
+        let _lifecycle = self.lifecycle_gate.read().await;
+        let mut plugins = self.client().await?.rpc().plugins().list().await?.plugins;
+        plugins.sort_by(|a, b| a.name.cmp(&b.name).then(a.marketplace.cmp(&b.marketplace)));
+        // The editor needs names and status, not installation paths or source IDs.
+        Ok(json!({"plugins": plugins.into_iter().map(|plugin| json!({
+            "name": plugin.name, "marketplace": plugin.marketplace,
+            "version": plugin.version, "enabled": plugin.enabled,
+        })).collect::<Vec<_>>()}))
+    }
+
+    pub(crate) async fn resolve_new_profile(&self, request: &NewSession) -> Result<(Option<ResolvedProfile>, crate::mcp_resolution::McpResolution)> {
         if request.profile_id.is_none() && request.profile_revision.is_none() {
-            return Ok(None);
+            return Ok((None, Default::default()));
         }
         let revision = request.profile_revision.as_deref().ok_or_else(|| ServiceError::InvalidArgument(
             "Preview the selected profile before creating this session (profileRevision is required)".into()))?;
-        Ok(Some(self.resolve_profile_preview(request.profile_id.as_deref(), &request.cwd, revision)?))
+        let (profile, resolution) = self.resolve_profile_preview(request.profile_id.as_deref(), &request.cwd, revision).await?;
+        Ok((Some(profile), resolution))
     }
 
-    fn resolve_profile_preview(&self, profile_id: Option<&str>, cwd: &str, revision: &str) -> Result<ResolvedProfile> {
+    async fn resolve_profile_preview(&self, profile_id: Option<&str>, cwd: &str, revision: &str) -> Result<(ResolvedProfile, crate::mcp_resolution::McpResolution)> {
         let profile = self.profile_library()?.resolve(profile_id)?;
-        if preview_revision(&profile, cwd)? != revision {
+        let resolution = self.resolve_profile_mcps(&profile, cwd).await?;
+        resolution.require_resolved()?;
+        if preview_revision(&profile, cwd, &resolution.revision)? != revision {
             return Err(ServiceError::InvalidArgument(
                 "Profile sources or working directory changed. Preview and confirm again.".into(),
             ));
         }
-        Ok(profile)
+        Ok((profile, resolution))
     }
 
     pub async fn get_session_profile(&self, session_id: &str) -> Result<Value> {
@@ -69,8 +83,11 @@ impl SessionService {
     pub async fn preview_session_profile(&self, request: PreviewSessionProfile) -> Result<Value> {
         crate::validate_cwd(&request.cwd)?;
         let resolved = self.profile_library()?.resolve(request.profile_id.as_deref())?;
+        let resolution = self.resolve_profile_mcps(&resolved, &request.cwd).await?;
         let mut value = serde_json::to_value(resolved.preview()).map_err(crate::runtime_api::invalid_argument)?;
-        value["revision"] = json!(preview_revision(&resolved, &request.cwd)?);
+        value["revision"] = json!(preview_revision(&resolved, &request.cwd, &resolution.revision)?);
+        value["mcpExclusions"] = json!(resolution.decisions);
+        value["resolutionIssues"] = json!(resolution.issues);
         let mut current = Vec::<String>::new();
         if let Some(id) = &request.session_id {
             if self.cwd_for(id).await.as_deref() != Some(&request.cwd) {
@@ -107,24 +124,27 @@ impl SessionService {
                 "The previous runtime acknowledgement was lost. Reconnect the saved session before applying a profile again.".into(),
             ));
         }
-        let metadata = self.metadata.read().await.get(&request.session_id).cloned()
+        let mut metadata = self.metadata.read().await.get(&request.session_id).cloned()
             .ok_or_else(|| ServiceError::SessionNotActive(request.session_id.clone()))?;
         let cwd = metadata.cwd.as_deref().ok_or_else(|| ServiceError::InvalidArgument("Set a working directory before selecting a profile".into()))?;
-        let profile = self.resolve_profile_preview(request.profile_id.as_deref(), cwd, &request.revision)?;
         let recovering = !self.active.read().await.contains_key(&request.session_id);
         let session = if recovering {
+            self.resolve_profile_preview(request.profile_id.as_deref(), cwd, &request.revision).await?;
             self.require_initialized(&request.session_id).await?;
             self.profile_configuration.lock().await.insert(request.session_id.clone(), ProfileConfigurationState {
                 blocked: true, error: Some("The saved session must finish profile verification before accepting messages.".into()),
                 ..Default::default()
             });
-            let config = github_copilot_sdk::ResumeSessionConfig::new(request.session_id.clone().into())
+            let mut config = github_copilot_sdk::ResumeSessionConfig::new(request.session_id.clone().into())
                 .with_streaming(true).with_continue_pending_work(false)
                 .with_permission_handler(self.approvals.clone())
                 .with_user_input_handler(self.interactions.clone())
                 .with_elicitation_handler(self.interactions.clone())
                 .with_exit_plan_mode_handler(self.interactions.clone())
                 .with_auto_mode_switch_handler(self.interactions.clone());
+            if let Some(state) = &metadata.profile_mcps {
+                config = config.with_disabled_mcp_servers(state.disabled.clone());
+            }
             let session = Arc::new(self.client().await?.resume_session(config).await?);
             self.attach(session.clone()).await?;
             session
@@ -135,23 +155,54 @@ impl SessionService {
         let ask_gate = self.ask_gate(&request.session_id).await;
         let _ask = ask_gate.try_lock().map_err(|_| ServiceError::SessionProcessing("/ask is still running".into()))?;
         self.require_accepting_work()?;
+        let (profile, resolution) = self.resolve_profile_preview(request.profile_id.as_deref(), cwd, &request.revision).await?;
         let previous = match metadata.profile.as_ref() {
             Some(selection) => crate::profiles::resolve_snapshot(selection).ok(),
             None if metadata.tool_controls_created => Some(self.profile_library()?.resolve(None)?),
             None => None,
         };
         let client = self.client().await?;
+        let prior_disabled = if !profile.excluded_mcp_plugins.is_empty() || metadata.profile_mcps.is_some() {
+            Some(crate::mcp_resolution::disabled_servers(&client, &request.session_id).await?)
+        } else { None };
+        let next_mcp_state = prior_disabled.as_ref().map(|disabled| resolution.state(disabled,
+            metadata.profile_mcps.as_ref().map(|state| state.owned.as_slice()).unwrap_or(&[])));
+        if let Some(disabled) = &prior_disabled {
+            // Save the pre-change names even when no profile owned MCP filters before.
+            // A lost acknowledgement must not leave a resident session's new filters
+            // in place when it is reattached with the previous approved profile.
+            let previous_state = metadata.profile_mcps.clone();
+            let mut baseline = previous_state.clone().unwrap_or_default();
+            baseline.disabled = disabled.clone();
+            self.metadata.write().await.get_mut(&request.session_id).unwrap().profile_mcps = Some(baseline.clone());
+            if let Err(error) = self.persist_metadata().await {
+                self.metadata.write().await.get_mut(&request.session_id).unwrap().profile_mcps = previous_state;
+                return Err(error);
+            }
+            metadata.profile_mcps = Some(baseline);
+        }
         self.profile_configuration.lock().await.insert(request.session_id.clone(), ProfileConfigurationState {
             applying: true, blocked: true, ..Default::default()
         });
         let applied = tokio::time::timeout(Duration::from_secs(60), async {
             crate::session_configuration::SessionConfiguration.apply_profile(
-                &client, &request.session_id, cwd, &profile, recovering.then_some(&metadata),
+                &client, &request.session_id, cwd, &profile, recovering.then_some(&metadata), &resolution,
+                next_mcp_state.as_ref().map(|state| state.disabled.as_slice()),
             ).await?;
+            self.apply_profile_skill_exclusions(&request.session_id, &profile.excluded_skill_plugins).await?;
             crate::profiles::resolve_snapshot(&profile.selection())?;
-            self.metadata.write().await.get_mut(&request.session_id).unwrap().profile = Some(profile.selection());
+            if self.resolve_profile_mcps(&profile, cwd).await?.revision != resolution.revision {
+                return Err(ServiceError::InvalidArgument("MCP sources changed during application. Preview again.".into()));
+            }
+            {
+                let mut metas = self.metadata.write().await;
+                let meta = metas.get_mut(&request.session_id).unwrap();
+                meta.profile = Some(profile.selection());
+                meta.profile_mcps = next_mcp_state.clone();
+            }
             if let Err(error) = self.persist_metadata().await {
                 self.metadata.write().await.get_mut(&request.session_id).unwrap().profile = metadata.profile.clone();
+                self.metadata.write().await.get_mut(&request.session_id).unwrap().profile_mcps = metadata.profile_mcps.clone();
                 return Err(error);
             }
             Ok::<_, ServiceError>(())
@@ -167,10 +218,17 @@ impl SessionService {
         if let Some((cause, uncertain)) = failure {
             let restored = if !uncertain {
                 if let Some(previous) = previous {
-                    matches!(tokio::time::timeout(Duration::from_secs(60),
+                    matches!(tokio::time::timeout(Duration::from_secs(60), async {
+                        let old_resolution = self.resolve_profile_mcps(&previous, cwd).await?;
+                        old_resolution.require_resolved()?;
+                        if metadata.profile_mcps.as_ref().is_some_and(|state| state.revision != old_resolution.revision) {
+                            return Err(ServiceError::InvalidArgument("Previous MCP sources changed; cannot restore them without approval.".into()));
+                        }
                         crate::session_configuration::SessionConfiguration.apply_profile(
-                            &client, &request.session_id, cwd, &previous, None,
-                        )).await, Ok(Ok(())))
+                            &client, &request.session_id, cwd, &previous, None, &old_resolution, prior_disabled.as_deref(),
+                        ).await?;
+                        self.apply_profile_skill_exclusions(&request.session_id, &previous.excluded_skill_plugins).await
+                    }).await, Ok(Ok(())))
                 } else { false }
             } else { false };
             let message = if restored {
@@ -200,7 +258,8 @@ impl SessionService {
     }
 }
 
-fn preview_revision(profile: &ResolvedProfile, cwd: &str) -> Result<String> {
+fn preview_revision(profile: &ResolvedProfile, cwd: &str, source_revision: &str) -> Result<String> {
     let cwd = std::fs::canonicalize(cwd).map_err(|_| ServiceError::InvalidWorkingDirectory(cwd.into()))?;
-    Ok(format!("{}:{:x}", profile.revision, Sha256::digest(cwd.to_string_lossy().as_bytes())))
+    let base = format!("{}:{:x}", profile.revision, Sha256::digest(cwd.to_string_lossy().as_bytes()));
+    Ok(if source_revision.is_empty() { base } else { format!("{base}:{source_revision}") })
 }

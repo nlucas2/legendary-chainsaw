@@ -29,6 +29,17 @@
 .agent-chat-notice { margin: 8px 20px; font-size: 12px; }
 .agent-chat-error { color: var(--danger); margin: 8px 20px; overflow-wrap: anywhere; }
 .agent-conversation [hidden] { display: none; }
+@media (min-width: 821px) {
+  .sidebar .session-node + .session-node { border-top: 1px solid var(--line); }
+  .sidebar .session-node-row > .session-item { margin-block: 0; padding: 2px 6px; border-radius: 5px; contain-intrinsic-size: auto 44px; }
+  .sidebar .session-open { padding-block: 3px; }
+  .sidebar .session-main small { margin-top: 2px; gap: 2px; }
+  .sidebar .session-tags { margin-top: 3px; }
+  .sidebar .session-expander { display: flex; justify-content: center; align-items: flex-start; padding-top: 7px; border-radius: 4px; color: var(--text); }
+  .sidebar .session-expander[aria-expanded="true"] { color: var(--accent-bright); }
+  .sidebar .session-expander:hover { background: var(--surface-2); }
+  .sidebar .session-expander:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+}
 @media (max-width: 700px) {
   .session-expander { flex-basis: 36px; }
   .subagent-link { min-height: 44px; }

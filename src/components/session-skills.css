@@ -1,7 +1,22 @@
 .skills-cwd { display: block; max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
 .session-skills-panel .ct-status p { margin: 0; }
-.session-skills-panel .reference-item { margin-block: 8px; }
+.session-skills-panel .reference-item { margin-block: 4px; }
+.session-skills-panel .reference-item > summary { min-height: 30px; box-sizing: border-box; padding: 4px 8px; }
+.session-skills-panel .reference-item > summary > .skill-summary-text { flex-direction: row; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; }
+.session-skills-panel .skill-summary-text strong, .session-skills-panel .skill-summary-text small { max-width: 100%; white-space: normal; overflow: visible; overflow-wrap: anywhere; line-height: 1.5; }
+.session-skills-panel .skill-summary-text strong { font-size: 12px; }
+.session-skills-panel .skill-summary-text small { font-size: 11px; }
 .session-skills-panel .reference-detail { display: grid; gap: 8px; }
+.skills-visibility { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 4px 12px; margin-block: 10px; }
+.skills-visibility .ct-help { margin: 0; }
+.skills-show-disabled { display: inline-flex; align-items: center; gap: 8px; min-height: 44px; cursor: pointer; font-size: 12px; }
+.skills-show-disabled input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
+.context-drawer .session-skills-panel .reference-item.skill-disabled { border-style: dashed; border-inline-start: 4px solid var(--muted); background: var(--surface-0); }
+.session-skills-panel .reference-item.skill-disabled > summary strong { color: var(--muted); text-decoration: line-through; }
+.session-skills-panel .reference-item > summary > .skill-disabled-badge { display: inline-flex; flex: 0 0 auto; flex-direction: row; align-items: center; gap: 5px; padding: 3px 6px; border: 1px solid var(--muted); border-radius: 4px; background: var(--surface-2); color: var(--text); font-size: 11px; font-weight: 600; }
 @media (max-width: 820px) {
+  .session-skills-panel .reference-item { margin-block: 8px; }
+  .session-skills-panel .reference-item > summary { min-height: 44px; padding: 8px 10px; }
+  .session-skills-panel .reference-item > summary > .skill-summary-text { flex-direction: column; flex-wrap: nowrap; align-items: stretch; gap: 3px; }
   .session-skills-panel button { min-height: 44px; }
 }
