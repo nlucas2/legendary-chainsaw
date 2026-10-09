@@ -47,6 +47,7 @@
 }
 
 .context-tools-panel {
+  position: relative;
   --ct-line: var(--line, #34465b);
   --ct-muted: var(--muted, #a3b1c4);
   --ct-accent: var(--accent, #7dd3fc);
@@ -54,6 +55,19 @@
   color: var(--text, #dbe6f3);
   font-size: 13px;
   line-height: 1.5;
+}
+
+.ct-refresh-status {
+  position: absolute;
+  top: 0;
+  right: 6px;
+  z-index: 1;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--panel, #121a24);
+  color: var(--ct-muted);
+  font-size: 11px;
+  pointer-events: none;
 }
 
 .context-tools-panel button,

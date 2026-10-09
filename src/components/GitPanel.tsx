@@ -2,8 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUpToLine, ChevronLeft, ChevronRight, GitBranch, RefreshCw, X } from "lucide-react";
 import { daemonInvoke } from "../lib/daemon";
 import {
-  comparisonTargetGroups, gitFilesForView, gitViewLabels, loadGitComments, MAX_COMMENTS, GIT_COMMENTS_KEY, saveGitComments, visiblePath,
-  type GitComment, type GitDiff, type GitView, type GitWorkspace,
+  comparisonTargetGroups, gitFilesForView, gitViewLabels, loadGitComments, MAX_COMMENTS, GIT_COMMENTS_KEY, normalizeGitReferences, saveGitComments, visiblePath,
+  type GitComment, type GitDiff, type GitReferences, type GitView, type GitWorkspace,
 } from "../lib/gitWorkspace";
 import { createGitDiffLoader } from "../lib/gitDiffLoader";
 import { GitFileReview } from "./GitFileReview";
@@ -50,6 +50,11 @@ function WorkspacePanel({ sessionId, cwd, onClose, onAsk, onDiscuss }: GitPanelP
   const compact = useCompactGit();
   const [workspace, setWorkspace] = useState<GitWorkspace | null>(null);
   const [base, setBase] = useState("");
+  const [refQuery, setRefQuery] = useState("");
+  const [refResults, setRefResults] = useState<GitReferences | null>(null);
+  const [refLoading, setRefLoading] = useState(false);
+  const [refError, setRefError] = useState("");
+  const [refRevision, setRefRevision] = useState(0);
   const [revision, setRevision] = useState(0);
   const [view, setView] = useState<GitView>("unstaged");
   const [layout, setLayout] = useState<"file" | "continuous">("file");
@@ -102,6 +107,19 @@ function WorkspacePanel({ sessionId, cwd, onClose, onAsk, onDiscuss }: GitPanelP
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
   }, [sessionId, cwd, base, revision]);
+  useEffect(() => {
+    setRefResults(null); setRefError("");
+    if (!refQuery.trim() || !workspace?.refsHasMore) { setRefLoading(false); return; }
+    const controller = new AbortController();
+    setRefLoading(true);
+    const timer = setTimeout(() => {
+      void daemonInvoke<unknown>("git_refs", { sessionId, query: refQuery.trim() }, controller.signal)
+        .then((value) => { if (!controller.signal.aborted) setRefResults(normalizeGitReferences(value)); })
+        .catch((cause) => { if (!controller.signal.aborted) setRefError(String(cause)); })
+        .finally(() => { if (!controller.signal.aborted) setRefLoading(false); });
+    }, 250);
+    return () => { controller.abort(); clearTimeout(timer); };
+  }, [sessionId, cwd, refQuery, workspace?.refsHasMore, revision, refRevision]);
 
   const fileViews = useMemo(() => ({
     staged: gitFilesForView(workspace, "staged"),
@@ -110,7 +128,12 @@ function WorkspacePanel({ sessionId, cwd, onClose, onAsk, onDiscuss }: GitPanelP
     untracked: gitFilesForView(workspace, "untracked"),
   }), [workspace]);
   const files = fileViews[view];
-  const targets = useMemo(() => comparisonTargetGroups(workspace?.refs ?? [], workspace?.upstream ?? null), [workspace]);
+  const targets = useMemo(() => {
+    const refs = refQuery.trim() && workspace?.refsHasMore ? refResults?.refs ?? [] : workspace?.refs ?? [];
+    const chosen = workspace?.refs.find((ref) => ref.name === base);
+    return comparisonTargetGroups(chosen && !refs.some((ref) => ref.name === chosen.name) ? [chosen, ...refs] : refs,
+      workspace?.upstream ?? null);
+  }, [workspace, refQuery, refResults, base]);
   const selectedIndex = files.findIndex((file) => file.path === selectedPath);
   const selectedFile = files[selectedIndex];
   const onActivePathChange = useCallback((path: string) => setSelectedPath(path), []);
@@ -153,13 +176,23 @@ function WorkspacePanel({ sessionId, cwd, onClose, onAsk, onDiscuss }: GitPanelP
   }
   const reviewProps = workspace ? { sessionId, workspace, view, comments, onCommentsChange: setComments, onAsk, onDiscuss, load: loadDiff } : null;
   const comparisonControls = workspace?.state === "repository" && <>
+    {workspace.refsHasMore && <div className="git-ref-search">
+      <label>Search comparison refs<input aria-label="Search comparison refs" value={refQuery} maxLength={256}
+        onChange={(event) => setRefQuery(event.target.value)} placeholder="Branch or remote name" /></label>
+      <small>{!refQuery.trim() ? "Showing a bounded set of suggestions. Search any locally available branch or remote-tracking ref."
+        : refLoading ? "Searching local refs..." : refResults
+          ? `${refResults.refs.length} matches${refResults.hasMore ? " shown; narrow the search for more specific results" : ""}.`
+          : "Ref search unavailable."}</small>
+      {refError && <p role="alert" className="git-panel-error">{refError} <button type="button" onClick={() => setRefRevision((value) => value + 1)}>Retry ref search</button></p>}
+      {refResults?.warnings.map((warning, index) => <p className="git-panel-warning" key={index}>{warning}</p>)}
+    </div>}
     <div className="git-panel-metadata">
       <p><strong>{workspace.detached ? "Detached HEAD" : visiblePath(workspace.branch ?? "No branch")}</strong>
         {" · "}{workspace.unborn ? "Unborn branch (no commits)" : `HEAD ${workspace.head?.slice(0, 12) ?? "unavailable"}`}
         <br /><span title={visiblePath(workspace.repoRoot ?? "")}>{visiblePath(workspace.repoRoot ?? "")}</span>
       </p>
       <label>Comparison target
-        <select aria-label="Comparison target" value={base} onChange={(event) => {
+        <select aria-label="Comparison target" value={base} disabled={refLoading} onChange={(event) => {
           setBase(event.target.value);
           if (compact && options.current) options.current.open = false;
         }}>

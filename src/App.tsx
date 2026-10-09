@@ -77,6 +77,9 @@ import { DEFAULT_PROFILE_CHOICE, type NewSessionProfileChoice } from "./lib/prof
 import { NewSessionProfilePicker, ProfileConfigurationNotice } from "./components/SessionProfilePanel";
 import { SessionStartupBanner } from "./components/SessionStartupBanner";
 import { useDeliveryDefault } from "./lib/useDeliveryDefault";
+import { useModelDefaults } from "./lib/useModelDefaults";
+import { useModelCatalog } from "./lib/useModelCatalog";
+import { ModelSelection } from "./components/ModelSelection";
 import type { MessageDelivery } from "./lib/deliveryPreference";
 import { adjacentSession } from "./lib/shortcuts";
 import { atComposerEdge, PromptHistoryNavigation, recentPrompts } from "./lib/promptHistory";
@@ -105,10 +108,7 @@ import {
   subscribeToDaemon,
 } from "./lib/daemon";
 import {
-  aggregateModelConfiguration,
-  labelModelValue,
-  normalizeModelOptions,
-  type ModelOption,
+  DEFAULT_MODEL_SELECTION, modelSelectionError, modelSelectionSummary,
 } from "./lib/models";
 import {
   activityFromEvent,
@@ -134,7 +134,6 @@ import type {
   PermissionRequest,
   PendingInteraction,
   QueueItems,
-  ReasoningSummary,
   SessionEvent,
   SessionReferences,
   SessionRefresh,
@@ -143,7 +142,6 @@ import type {
   SessionState,
 } from "./lib/types";
 
-const DEFAULT_MODEL = "";
 type HistoryState = "idle" | "loading" | "ready" | "error";
 type CachedHistory = HistoryPage;
 
@@ -323,13 +321,15 @@ function App() {
   const [newSessionProfile, setNewSessionProfile] = useState<NewSessionProfileChoice>(DEFAULT_PROFILE_CHOICE);
   const [newCwd, setNewCwd] = useState("");
   const [newSessionName, setNewSessionName] = useState("");
-  const [newModel, setNewModel] = useState(DEFAULT_MODEL);
-  const [newReasoningEffort, setNewReasoningEffort] = useState("");
-  const [newReasoningSummary, setNewReasoningSummary] =
-    useState<ReasoningSummary>("detailed");
-  const [newContextTier, setNewContextTier] = useState("");
-  const [newSessionModels, setNewSessionModels] = useState<ModelOption[]>([]);
-  const [newSessionModelsLoading, setNewSessionModelsLoading] = useState(false);
+  const modelDefaults = useModelDefaults();
+  const [newModelSelection, setNewModelSelection] = useState(DEFAULT_MODEL_SELECTION);
+  const [newModelExpanded, setNewModelExpanded] = useState(false);
+  const [newModelDefaultError, setNewModelDefaultError] = useState("");
+  const newModelCatalog = useModelCatalog(newSessionOpen);
+  const newModelError = newModelCatalog.loading ? "" : modelSelectionError(newModelSelection, newModelCatalog.options, true);
+  useEffect(() => {
+    if (newSessionOpen && (newModelError || newModelCatalog.error || newModelDefaultError)) setNewModelExpanded(true);
+  }, [newSessionOpen, newModelError, newModelCatalog.error, newModelDefaultError]);
   const [terminalOpen, setTerminalOpen] = useState(false);
   const [terminalFocusSession, setTerminalFocusSession] = useState<string | null>(null);
   useEffect(() => {
@@ -378,12 +378,6 @@ function App() {
   const sseConnectedRef = useRef(false);
   const pendingResponseRef = useRef<string | null>(null);
   const initialSessionIdRef = useRef(new URLSearchParams(window.location.search).get("session"));
-  const selectedNewSessionModel = useMemo(
-    () =>
-      newSessionModels.find((model) => model.id === newModel) ??
-      aggregateModelConfiguration(newSessionModels),
-    [newModel, newSessionModels],
-  );
 
   function scrollToLatestHumanTurn() {
     requestAnimationFrame(() => {
@@ -861,6 +855,8 @@ function App() {
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.defaultPrevented || event.isComposing) return;
+      // This dialog owns dismissal, including its non-dismissible apply phase.
+      if (modelPickerOpen) return;
       const key = event.key.toLowerCase();
       const editing = isEditableTarget(event.target);
       const inComposer = event.target === composerRef.current;
@@ -994,7 +990,7 @@ function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [queue.items, shortcutsOpen, newSessionOpen, modeConfirmation, modelPickerOpen,
       settingsOpen, organizingSession, runtimeOpen, referenceOpen, modeBusy,
-      composer, trackedCwd, activeSession, newSessionModels, newSessionModelsLoading, selectedAgent, renamingSession, forkingSession, askPanel, gitOpen, schedulesOpen, profilesOpen, optionsOpen, events, keybindings.overrides, narrowLayout]);
+      composer, trackedCwd, activeSession, selectedAgent, renamingSession, forkingSession, askPanel, gitOpen, schedulesOpen, profilesOpen, optionsOpen, events, keybindings.overrides, narrowLayout, modelDefaults.value, modelDefaults.error]);
 
   useEffect(() => {
     if (!activeSession || !sessionReady || runtimeStatus?.connected === false) {
@@ -1210,6 +1206,11 @@ function App() {
   async function createSession(event: FormEvent) {
     event.preventDefault();
     if (createSessionPendingRef.current || !newCwd.trim() || newSessionProfile.pending || newSessionProfile.error) return;
+    if (newModelCatalog.loading || newModelCatalog.error || newModelError || newModelDefaultError) {
+      setNewModelExpanded(true);
+      setCreationError(newModelCatalog.error || newModelError || newModelDefaultError || "Wait for the model catalog to finish loading.");
+      return;
+    }
     createSessionPendingRef.current = true;
     setBusy(true);
     setCreationError("");
@@ -1217,10 +1218,10 @@ function App() {
       const session = await daemonInvoke<SessionSummary>("create_session", {
         cwd: newCwd.trim(),
         ...(newSessionName.trim() ? { name: newSessionName.trim() } : {}),
-        model: newModel || null,
-        reasoningEffort: newReasoningEffort || null,
-        reasoningSummary: newReasoningSummary,
-        contextTier: newContextTier || null,
+        model: newModelSelection.modelId || null,
+        reasoningEffort: newModelSelection.reasoningEffort || null,
+        reasoningSummary: newModelSelection.reasoningSummary,
+        contextTier: newModelSelection.contextTier || null,
         deferInitialization: true,
         ...(newSessionProfile.profileId ? { profileId: newSessionProfile.profileId, profileRevision: newSessionProfile.revision } : {}),
       });
@@ -1781,22 +1782,15 @@ function App() {
 
   function openNewSession() {
     if (createSessionPendingRef.current) return;
+    setSidebarOpen(false);
     setNewSessionName("");
     setNewSessionProfile(DEFAULT_PROFILE_CHOICE);
     setCreationError("");
     setNewCwd(trackedCwd || activeSession?.cwd || "");
-    setNewModel(DEFAULT_MODEL);
-    setNewReasoningEffort("");
-    setNewReasoningSummary("detailed");
-    setNewContextTier("");
+    setNewModelSelection({ ...modelDefaults.value });
+    setNewModelDefaultError(modelDefaults.error);
+    setNewModelExpanded(false);
     setNewSessionOpen(true);
-    if (newSessionModels.length === 0 && !newSessionModelsLoading) {
-      setNewSessionModelsLoading(true);
-      void daemonInvoke<{ models?: unknown[] }>("available_models")
-        .then((result) => setNewSessionModels(normalizeModelOptions(result.models)))
-        .catch((cause) => handleError(cause, setError, setNeedsLogin))
-        .finally(() => setNewSessionModelsLoading(false));
-    }
   }
 
   const loadReferences = useCallback(async () => {
@@ -2969,6 +2963,7 @@ function App() {
         ]} />}
       {settingsOpen && (
         <SettingsPanel
+          modelDefaults={modelDefaults}
           typography={typography}
           chatWidth={chatWidth.width}
           onChatWidthChange={chatWidth.setWidth}
@@ -3010,6 +3005,7 @@ function App() {
       {modelPickerOpen && activeSession && (
         <ModelPicker
           sessionId={activeSession.sessionId}
+          preferredModelId={modelDefaults.value.modelId}
           onClose={() => setModelPickerOpen(false)}
           onChanged={(model) => {
             setActiveSession((current) => (current ? { ...current, model } : current));
@@ -3097,95 +3093,15 @@ function App() {
                 disabled={creatingSession} onChange={(event) => setNewSessionName(event.currentTarget.value)}
                 placeholder="Leave blank for the default name" />
             </label>
-            <label>
-              Model
-              <select
-                value={newModel}
-                onChange={(event) => {
-                  const modelId = event.currentTarget.value;
-                  const option = newSessionModels.find((model) => model.id === modelId);
-                  setNewModel(modelId);
-                  setNewReasoningEffort(option?.defaultReasoningEffort ?? "");
-                  setNewReasoningSummary(
-                    !option || option.reasoningEfforts.length > 0 ? "detailed" : "none",
-                  );
-                  setNewContextTier("");
-                }}
-                disabled={creatingSession || newSessionModelsLoading}
-              >
-                <option value="">
-                  {newSessionModelsLoading ? "Loading models…" : "Auto — Copilot chooses"}
-                </option>
-                {newSessionModels.map((model) => (
-                  <option value={model.id} key={model.id}>
-                    {model.name} ({model.id})
-                  </option>
-                ))}
-              </select>
-              <small>
-                Auto lets Copilot resolve the model based on the session and prompt.
-              </small>
-            </label>
-            <div className="new-session-configuration">
-              <label>
-                Reasoning effort
-                <select
-                  value={newReasoningEffort}
-                  onChange={(event) => setNewReasoningEffort(event.currentTarget.value)}
-                  disabled={
-                    creatingSession ||
-                    !selectedNewSessionModel ||
-                    selectedNewSessionModel.reasoningEfforts.length === 0
-                  }
-                >
-                  <option value="">Model default</option>
-                  {selectedNewSessionModel?.reasoningEfforts.map((effort) => (
-                    <option value={effort} key={effort}>
-                      {labelModelValue(effort)}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label>
-                Visible reasoning
-                <select
-                  value={newReasoningSummary}
-                  onChange={(event) =>
-                    setNewReasoningSummary(
-                      event.currentTarget.value as ReasoningSummary,
-                    )
-                  }
-                  disabled={
-                    creatingSession ||
-                    selectedNewSessionModel.reasoningEfforts.length === 0
-                  }
-                >
-                  <option value="detailed">Detailed</option>
-                  <option value="concise">Concise</option>
-                  <option value="none">Off</option>
-                </select>
-              </label>
-              <label>
-                Context window
-                <select
-                  value={newContextTier}
-                  onChange={(event) => setNewContextTier(event.currentTarget.value)}
-                  disabled={
-                    creatingSession ||
-                    !selectedNewSessionModel ||
-                    selectedNewSessionModel.contextTiers.length === 0
-                  }
-                >
-                  <option value="">Model default</option>
-                  {selectedNewSessionModel?.contextTiers.map((tier) => (
-                    <option value={tier} key={tier}>
-                      {labelModelValue(tier)}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            </div>
             <NewSessionProfilePicker cwd={newCwd} disabled={creatingSession} onChange={setNewSessionProfile} />
+            <details className="model-selection-disclosure" open={newModelExpanded}
+              onToggle={(event) => setNewModelExpanded(event.currentTarget.open)}>
+              <summary><strong>Model selection</strong>{newModelSelection.modelId && <span>{modelSelectionSummary(newModelSelection, newModelCatalog.options)}</span>}</summary>
+              <ModelSelection value={newModelSelection} onChange={(value) => { setNewModelSelection(value); setNewModelDefaultError(""); }}
+                options={newModelCatalog.options} preferredModelId={modelDefaults.value.modelId} allowEmpty loading={newModelCatalog.loading}
+                error={newModelCatalog.error} disabled={creatingSession} onRefresh={newModelCatalog.refresh} />
+              {newModelDefaultError && <p className="model-selection-error" role="alert">{newModelDefaultError}</p>}
+            </details>
             {newSessionProfile.pending && <p role="status">Resolving selected profile...</p>}
             {creatingSession && <p role="status" aria-label="Session creation">
               Creating the native session… Waiting for Copilot to confirm its session ID.
@@ -3204,7 +3120,8 @@ function App() {
               <button
                 className="button primary"
                 type="submit"
-                disabled={creatingSession || !newCwd.trim() || newSessionProfile.pending || !!newSessionProfile.error}
+                disabled={creatingSession || !newCwd.trim() || newSessionProfile.pending || !!newSessionProfile.error ||
+                  newModelCatalog.loading || !!newModelCatalog.error || !!newModelError || !!newModelDefaultError}
               >
                 <Plus size={16} />
                 {creatingSession ? "Creating..." : "Create session"}

@@ -279,7 +279,9 @@ function ReadStatus({ name, loading, error, hasData, retry }: {
   name: string; loading: boolean; error: string | null; hasData: boolean; retry: () => void;
 }) {
   return <>
-    {loading && <div className="ct-status" role="status">{hasData ? "Refreshing" : "Reading"} {name}…</div>}
+    {loading && (hasData
+      ? <span className="ct-refresh-status" role="status">Refreshing {name}…</span>
+      : <div className="ct-status" role="status">Reading {name}…</div>)}
     {error && <div className="ct-status ct-error" role="alert">
       <strong>Could not {hasData ? "refresh" : "read"} {name}.</strong>
       <span>{error}</span>

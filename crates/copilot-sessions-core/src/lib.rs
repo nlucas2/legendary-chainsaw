@@ -1738,7 +1738,15 @@ impl SessionService {
                 })),
             )
             .await?;
-        let selected = optional_value_string(&result, "modelId").unwrap_or(model_id);
+        // A queued or unconfirmed selection has not changed the live session.
+        if result.get("deferred").and_then(serde_json::Value::as_bool) == Some(true)
+            || result.get("status").and_then(serde_json::Value::as_str)
+                .is_some_and(|status| !matches!(status, "applied" | "success" | "switched"))
+        {
+            return Ok(result);
+        }
+        let selected = optional_value_string(&result, "modelId").ok_or_else(||
+            ServiceError::CommandFailed("The runtime did not confirm the selected model.".into()))?;
         let mut metadata = self.metadata.write().await;
         let local = metadata.entry(session_id.to_string()).or_default();
         local.model = Some(selected);

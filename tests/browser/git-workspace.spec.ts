@@ -86,6 +86,8 @@ async function setup(page: Page) {
     delayedPath: "",
     delay: 0,
     overrideDiff: {} as Record<string, unknown>,
+    refError: "", refDelay: 0,
+    refSearch: { refs: [] as { name: string; commit: string }[], hasMore: false, warnings: [] as string[] },
   };
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
@@ -103,6 +105,12 @@ async function setup(page: Page) {
         if (args.path === state.delayedPath) await new Promise((resolve) => setTimeout(resolve, state.delay));
         if (state.diffError) return route.fulfill({ status: 500, body: state.diffError });
         return route.fulfill({ json: preview(args.path, args.view, { context: args.context ?? "changes", ...state.overrideDiff, ...(args.base ? { base: args.base } : {}) }) });
+      }
+      if (command === "git_refs") {
+        const result = structuredClone(state.refSearch);
+        if (state.refDelay) await new Promise((resolve) => setTimeout(resolve, state.refDelay));
+        if (state.refError) return route.fulfill({ status: 503, body: state.refError });
+        return route.fulfill({ json: result });
       }
       return route.fulfill({ status: 405, body: `Unexpected endpoint: ${command}` });
     }
@@ -141,6 +149,59 @@ test("inspection is explicit, status is fetched once, and only selected file pat
   expect(requests.every((request) => ["git_workspace", "git_diff"].includes(request.command))).toBe(true);
 });
 
+test("large ref catalogs keep file previews available and search does not reload the workspace", async ({ page }) => {
+  const { state, requests } = await setup(page);
+  Object.assign(state.workspace, { refsHasMore: true });
+  state.refSearch = { refs: [{ name: "refs/remotes/origin/users/deep/target", commit: "f".repeat(40) }], hasMore: false, warnings: [] };
+  await open(page);
+  await expect(page.getByRole("button", { name: /working file.txt/ })).toBeVisible();
+  await page.getByRole("button", { name: /working file.txt/ }).click();
+  await expect(page.getByRole("region", { name: "Selected file unified diff" })).toContainText("+new unstaged");
+  await page.getByLabel("Search comparison refs", { exact: true }).fill("deep");
+  await expect(page.getByText("1 matches.", { exact: true })).toBeVisible();
+  expect(requests.filter((request) => request.command === "git_workspace")).toHaveLength(1);
+  expect(requests.filter((request) => request.command === "git_refs")).toEqual([{ command: "git_refs", args: { sessionId: "a", query: "deep" } }]);
+  await page.getByLabel("Comparison target", { exact: true }).selectOption("refs/remotes/origin/users/deep/target");
+  await expect.poll(() => requests.filter((request) => request.command === "git_workspace").length).toBe(2);
+  expect(requests.filter((request) => request.command === "git_workspace")[1].args.base).toBe("refs/remotes/origin/users/deep/target");
+});
+
+test("ref search failures remain local to the selector and can retry without losing local changes", async ({ page }) => {
+  const { state, requests } = await setup(page);
+  Object.assign(state.workspace, { refsHasMore: true });
+  state.refError = "Synthetic ref search failure";
+  await open(page);
+  await page.getByLabel("Search comparison refs", { exact: true }).fill("branch");
+  await expect(page.getByRole("alert")).toContainText("Synthetic ref search failure");
+  await expect(page.getByRole("button", { name: /working file.txt/ })).toBeVisible();
+  state.refError = "";
+  state.refSearch = { refs: [], hasMore: false, warnings: [] };
+  await page.getByRole("button", { name: "Retry ref search" }).click();
+  await expect(page.getByText("0 matches.", { exact: true })).toBeVisible();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await page.getByLabel("Search comparison refs", { exact: true }).fill("");
+  await expect(page.getByLabel("Comparison target").locator("option[value='refs/heads/main']")).toHaveCount(1);
+  expect(requests.filter((request) => request.command === "git_workspace")).toHaveLength(1);
+});
+
+test("late ref search replies cannot replace a newer query", async ({ page }) => {
+  const { state, requests } = await setup(page);
+  Object.assign(state.workspace, { refsHasMore: true });
+  state.refDelay = 1000;
+  state.refSearch = { refs: [{ name: "refs/heads/old-query", commit: "a".repeat(40) }], hasMore: false, warnings: [] };
+  await open(page);
+  const search = page.getByLabel("Search comparison refs", { exact: true });
+  await search.fill("old");
+  await expect.poll(() => requests.filter((request) => request.command === "git_refs").length).toBe(1);
+  state.refDelay = 0;
+  state.refSearch = { refs: [{ name: "refs/heads/new-query", commit: "b".repeat(40) }], hasMore: true, warnings: [] };
+  await search.fill("new");
+  await expect(page.getByLabel("Comparison target").locator("option[value='refs/heads/new-query']")).toHaveCount(1);
+  await expect(page.getByText(/narrow the search for more specific results/)).toBeVisible();
+  await page.waitForTimeout(1100);
+  await expect(page.getByLabel("Comparison target").locator("option[value='refs/heads/old-query']")).toHaveCount(0);
+  expect(requests.filter((request) => request.command === "git_workspace")).toHaveLength(1);
+});
 test("PR comparison explains committed-only merge-base semantics and target selection", async ({ page }) => {
   const { requests } = await setup(page);
   await open(page);

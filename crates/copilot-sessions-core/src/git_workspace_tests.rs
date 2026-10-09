@@ -9,6 +9,83 @@ use std::{
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 #[tokio::test]
+async fn large_ref_catalog_keeps_workspace_and_diff_usable_with_bounded_search() {
+    let repo = Repo::new();
+    repo.write("tracked.txt", "base\n");
+    let base = repo.commit();
+    repo.git(&["checkout", "--quiet", "-b", "user/fixture/current"]);
+    repo.write("tracked.txt", "feature\n");
+    repo.commit();
+    repo.write("tracked.txt", "worktree\n");
+    repo.write("new.txt", "new\n");
+    let mut packed = String::from("# pack-refs with: sorted\n");
+    for index in 0..22_000 {
+        packed.push_str(&format!("{base} refs/remotes/origin/users/team-{index:05}/a-long-branch-name-for-inspection-scale-{index:05}\n"));
+    }
+    packed.push_str(&format!("{base} refs/remotes/origin/z-comparison-target\n"));
+    assert!(packed.len() > LIST_LIMIT);
+    repo.write(".git/packed-refs", &packed);
+    repo.git(&["config", "remote.origin.url", "https://example.invalid/not-contacted"]);
+    repo.git(&["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
+    repo.git(&["config", "branch.user/fixture/current.remote", "origin"]);
+    repo.git(&["config", "branch.user/fixture/current.merge", "refs/heads/z-comparison-target"]);
+    let index_before = fs::read(repo.0.join(".git/index")).unwrap();
+    let original = git(repo.cwd(), &["for-each-ref", "--format=%(refname)%00%(objectname)%00%(upstream)",
+        "refs/heads/", "refs/remotes/"], LIST_LIMIT).await.unwrap();
+    assert!(original.truncated, "fixture must reproduce the old 2 MiB failure");
+    let state = workspace(repo.cwd(), None).await.unwrap();
+    assert_eq!(state.state, "repository");
+    assert!(state.refs_has_more);
+    assert!(state.refs.len() <= 202);
+    assert!(state.refs.iter().any(|r| r.name == "refs/heads/main"));
+    assert!(state.refs.iter().any(|r| r.name == "refs/heads/user/fixture/current"));
+    assert_eq!(state.upstream.as_deref(), Some("refs/remotes/origin/z-comparison-target"));
+    assert_eq!(state.base_commit.as_deref(), Some(base.as_str()));
+    assert_eq!(state.unstaged.len(), 1);
+    assert_eq!(state.untracked.len(), 1);
+    assert_eq!(state.compare.len(), 1);
+    assert!(repo.diff(GitView::Unstaged, "tracked.txt", None).await.patch.contains("+worktree"));
+    let found = reference_targets(repo.cwd(), "TEAM-21999").await.unwrap();
+    assert!(!found.has_more);
+    assert_eq!(found.refs.len(), 1);
+    let selected = &found.refs[0].name;
+    let comparison = workspace(repo.cwd(), Some(selected)).await.unwrap();
+    assert_eq!(comparison.base.as_deref(), Some(selected.as_str()));
+    assert_eq!(comparison.base_commit.as_deref(), Some(base.as_str()));
+    assert!(comparison.refs.iter().any(|r| &r.name == selected));
+    assert!(repo.diff(GitView::Compare, "tracked.txt", Some(selected)).await.patch.contains("+feature"));
+    assert!(reference_targets(repo.cwd(), "users").await.unwrap().has_more);
+    assert!(reference_targets(repo.cwd(), "*").await.unwrap().refs.is_empty(), "search is literal, not Git glob syntax");
+    assert!(reference_targets(repo.cwd(), "unmatched").await.unwrap().refs.is_empty());
+    assert_eq!(fs::read_to_string(repo.0.join(".git/packed-refs")).unwrap(), packed);
+    assert_eq!(fs::read(repo.0.join(".git/index")).unwrap(), index_before);
+}
+
+#[tokio::test]
+async fn ref_listing_bounds_complete_records_and_rejects_unsafe_search_and_targets() {
+    let oid = "a".repeat(40);
+    let mut source = String::new();
+    for i in 0..250 { source.push_str(&format!("refs/heads/branch-{i:04}\0{oid}\n")); }
+    source.push_str(&format!("refs/remotes/origin/main\0{oid}\n"));
+    let (bytes, more) = refs::read_ref_listing(source.as_bytes(), "").await.unwrap();
+    assert!(more);
+    assert_eq!(bytes.iter().filter(|b| **b == b'\n').count(), 200);
+    assert!(String::from_utf8(bytes).unwrap().contains("refs/remotes/origin/main"));
+    let (bytes, more) = refs::read_ref_listing(source.as_bytes(), "BRANCH-0249").await.unwrap();
+    assert!(!more);
+    assert_eq!(String::from_utf8(bytes).unwrap(), format!("refs/heads/branch-0249\0{oid}\n"));
+    assert!(refs::read_ref_listing(b"missing newline".as_slice(), "").await.is_err());
+    assert!(refs::read_ref_listing("x".repeat(16 * 1024 + 1).as_bytes(), "").await.is_err());
+    let repo = Repo::new();
+    for name in ["HEAD", "--output=file", "refs/tags/tag", "refs/heads/main~1", "refs/heads/main:path", "refs/heads/../main", "refs/heads/a\nb"] {
+        assert!(refs::resolve(repo.cwd(), name, &mut vec![]).await.is_err(), "{name}");
+    }
+    for query in ["x".repeat(257), "a\nb".into()] {
+        assert!(reference_targets(repo.cwd(), &query).await.is_err());
+    }
+}
+
+#[tokio::test]
 async fn untracked_text_previews_preserve_contents_and_response_contract() {
     let repo = Repo::new();
     repo.write("tracked", "baseline\n");

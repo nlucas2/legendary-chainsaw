@@ -63,8 +63,39 @@ Mobile/web browser ──┘                                  │
   Raw diagnostics** is off by default. Its checkbox shows the current On/Off state and enables
   a JSON viewer for the latest 100 live events with additional filtered telemetry, not full model
   payloads. Normal streaming, event logging, and the Context usage view do not depend on this setting.
+- **Code and command output** preserve literal command/log line breaks, blank lines, and indentation.
+  Shell arguments get PowerShell/Bash highlighting; complete JSON text is formatted readably. Tool
+  arguments, progress/results, and slash-command results have a **Show raw output** checkbox to inspect
+  the original string or complete JSON payload. Recognizable Markdown results still render as Markdown.
+  Fenced code in chat, reasoning, subagent output, Ask, and plans shares language-aware syntax highlighting
+  and **Show raw source**. Unknown languages remain plain text. `mermaid` fences render as local diagrams,
+  with source always available; invalid diagrams display an error and retain their source.
+  Highlighting runs in a lazily loaded worker. Renderers start only near visible content, and wait until
+  streamed messages finish; blocks above 100,000 characters (highlighting) or 30,000 characters (diagrams)
+  remain source-only. Mermaid also caps graphs at 200 edges. No content is sent to an external rendering
+  service. Standard Mermaid node styles, class definitions, and link styles are supported.
+  Configuration directives, external CSS/resource loads, CSS rule injection, and click actions
+  are not enabled; SVG output is sanitized. Rejected diagrams explain
+  the reason and retain their source. Raw mode is a display choice, never an execution action.
 - **Models** are resolved from the live session rather than labeled "default." The header opens the
   session-specific model catalog and switches via the Copilot runtime.
+  **Settings → Default model for new sessions** saves the preferred model, reasoning effort,
+  visible reasoning, and context window locally for this browser/desktop installation. Opening
+  New session copies that default into the draft; changing it never switches existing sessions or
+  modifies profiles/schedules. A one-off creation override does not overwrite the saved default.
+  The configured default model appears first in the shared list, without a duplicate entry. When unset,
+  the list stays in catalog order with no extra default choice or placeholder.
+  **Model selection** sits below the profile selector in New session and starts collapsed, showing
+  the selected configuration only when there is one. The section has no extra enclosing box;
+  the model list retains its bounded height and its own scrollbar, keeping the controls below it accessible.
+  Settings, creation, and live-session switching share the same searchable model menu and configuration
+  controls, including unavailable-model handling, compatible-option preservation, and catalog refresh.
+  Missing/unavailable saved models are shown as errors, not silently replaced; clear the default in
+  Settings or select an available model.
+  A native Auto choice is retained whenever the runtime catalog supplies it; an existing-session picker
+  only offers targets returned by that session's catalog. Applying a live change locks its controls and
+  dismissal until acknowledged, and queued/confirmation-required results are not presented as applied.
+  A confirmed `applied` model change closes the picker and updates the displayed model.
 - **Profiles and groups** are configured in Settings, not hardcoded launch aliases. Groups link
   CLI-shaped MCP JSON files (`mcpServers`) and skill directories; profiles combine groups in an
   explicit order. Existing linked files are read-only to the app. You can create new managed MCP
@@ -245,6 +276,10 @@ Mobile/web browser ──┘                                  │
   the selected target's merge base to HEAD. Choose a local target ref; the tracking upstream may
   not be the intended PR target. Existing remote default refs (`origin/HEAD`), main/master branches,
   and the upstream appear first under **Likely PR targets**. No refs are invented or fetched.
+  Large repositories show up to 200 ref suggestions plus the current branch and selected/upstream
+  target. **Search comparison refs** searches all locally available branch/tracking names, without
+  loading thousands of dropdown options or blocking file previews. Ref discovery streams complete
+  records with bounded memory; selecting a search result resolves that exact ref independently.
   There is no fetch, stage, commit, or push action.
   **Unstaged** includes tracked working-tree edits and clearly marked new, untracked files;
   **Untracked** remains available as a new-files-only filter. Regular untracked text files are

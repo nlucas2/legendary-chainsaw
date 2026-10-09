@@ -194,3 +194,24 @@ test("Markdown tables retain semantic cells and alignment inside a focusable ove
   assert.match(html, /<a href="https:\/\/example.com\/file" target="_blank" rel="noopener noreferrer">file.rs:3<\/a>/);
   assert.match(html, /<strong>Important<\/strong>/);
 });
+
+test("shell commands and output preserve newlines and indentation as text rather than Markdown paragraphs", () => {
+  const html = render([
+    event("tool.execution_start", { toolCallId: "p", toolName: "powershell",
+      arguments: { command: '$n = 1\nWrite-Output "two"\n\n  # indentation' } }),
+    event("tool.execution_complete", { toolCallId: "p", result: { output: "first\n  second\n\nthird <script>not executable</script>" } }),
+  ], { toolDetailsExpanded: true });
+  assert.match(html, /data-language="powershell"/);
+  assert.match(html, /\$n = 1\nWrite-Output &quot;two&quot;\n\n  # indentation/);
+  assert.match(html, /first\n  second\n\nthird &lt;script&gt;not executable&lt;\/script&gt;/);
+  assert.match(html, /Show raw output/);
+  assert.doesNotMatch(html, /<script>/);
+});
+
+test("fenced code has a shared raw-source control without wrapping block elements inside pre", () => {
+  const html = render([event("assistant.message", { content: "```javascript\nconst x = '<script>';\n```" })]);
+  assert.match(html, /data-language="javascript"/);
+  assert.match(html, /Show raw source/);
+  assert.match(html, /const x = &#x27;&lt;script&gt;&#x27;;/);
+  assert.doesNotMatch(html, /<pre[^>]*><div/);
+});

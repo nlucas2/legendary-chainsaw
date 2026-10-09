@@ -23,12 +23,33 @@ export interface GitWorkspace {
   detached: boolean;
   unborn: boolean;
   refs: { name: string; commit: string }[];
+  refsHasMore?: boolean;
   staged: GitFile[];
   unstaged: GitFile[];
   untracked: GitFile[];
   compare: GitFile[];
   compareUnavailableReason: string | null;
   warnings: string[];
+}
+
+export interface GitReferences {
+  refs: GitWorkspace["refs"];
+  hasMore: boolean;
+  warnings: string[];
+}
+
+export function normalizeGitReferences(value: unknown): GitReferences {
+  if (!value || typeof value !== "object" || !("refs" in value) || !Array.isArray(value.refs)
+    || !("hasMore" in value) || typeof value.hasMore !== "boolean"
+    || !("warnings" in value) || !Array.isArray(value.warnings)
+    || !value.warnings.every((warning): warning is string => typeof warning === "string")) throw new Error("Invalid Git ref search response.");
+  const refs = value.refs.map((ref: unknown) => {
+    if (!ref || typeof ref !== "object" || !("name" in ref) || typeof ref.name !== "string"
+      || !ref.name.startsWith("refs/") || !("commit" in ref) || typeof ref.commit !== "string"
+      || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(ref.commit)) throw new Error("Invalid Git reference.");
+    return { name: ref.name, commit: ref.commit };
+  });
+  return { refs, hasMore: value.hasMore, warnings: value.warnings };
 }
 
 export interface GitReviewFile extends GitFile {

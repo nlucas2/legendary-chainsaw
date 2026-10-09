@@ -1,3 +1,5 @@
+import type { ReasoningSummary } from "./types.ts";
+
 export interface ModelOption {
   id: string;
   name: string;
@@ -17,7 +19,7 @@ export function normalizeModelOptions(values: unknown[] | undefined): ModelOptio
       stringValue(model.id) ||
       stringValue(model.modelId) ||
       stringValue(model.model_id);
-    if (!id || id.toLowerCase() === "auto") return [];
+    if (!id) return [];
     const capabilities = objectValue(model.capabilities);
     const supports = objectValue(capabilities.supports);
     return [
@@ -62,19 +64,56 @@ export function labelModelValue(value: string): string {
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
-export function aggregateModelConfiguration(options: ModelOption[]): ModelOption {
+export interface ModelSelectionValue {
+  modelId: string;
+  reasoningEffort: string;
+  reasoningSummary: ReasoningSummary;
+  contextTier: string;
+}
+
+export const DEFAULT_MODEL_SELECTION: ModelSelectionValue = {
+  modelId: "", reasoningEffort: "", reasoningSummary: "detailed", contextTier: "",
+};
+
+export function selectedModelOption(options: ModelOption[], modelId: string): ModelOption | undefined {
+  return options.find((option) => option.id === modelId);
+}
+
+export function preferredModelOptions(options: ModelOption[], preferredModelId?: string): ModelOption[] {
+  const preferred = options.find((option) => option.id === preferredModelId);
+  return preferred ? [preferred, ...options.filter((option) => option.id !== preferredModelId)] : options;
+}
+
+export function selectModel(current: ModelSelectionValue, option: ModelOption): ModelSelectionValue {
+  const reasoning = option.reasoningEfforts.length > 0;
   return {
-    id: "auto",
-    name: "Auto",
-    description: "Copilot chooses a compatible model",
-    unavailable: false,
-    reasoningEfforts: [
-      ...new Set(options.flatMap((option) => option.reasoningEfforts)),
-    ],
-    contextTiers: [
-      ...new Set(options.flatMap((option) => option.contextTiers)),
-    ],
+    modelId: option.id,
+    reasoningEffort: option.reasoningEfforts.includes(current.reasoningEffort) ? current.reasoningEffort
+      : option.defaultReasoningEffort && option.reasoningEfforts.includes(option.defaultReasoningEffort) ? option.defaultReasoningEffort : "",
+    reasoningSummary: reasoning ? current.reasoningSummary : "none",
+    contextTier: option.contextTiers.includes(current.contextTier) ? current.contextTier : "",
   };
+}
+
+export function modelSelectionError(value: ModelSelectionValue, options: ModelOption[], allowEmpty: boolean): string {
+  if (!value.modelId) return allowEmpty ? "" : "Choose a model.";
+  const selected = selectedModelOption(options, value.modelId);
+  if (!selected) return `Model "${value.modelId}" is not in the current catalog. Choose an available model.`;
+  if (selected.unavailable) return `Model "${selected.name}" is unavailable. Choose an available model.`;
+  if (value.reasoningEffort && !selected.reasoningEfforts.includes(value.reasoningEffort)) {
+    return `Reasoning effort "${value.reasoningEffort}" is not supported by this model. Choose a supported value or Model default.`;
+  }
+  if (value.contextTier && !selected.contextTiers.includes(value.contextTier)) {
+    return `Context window "${value.contextTier}" is not supported by this model. Choose a supported value or Model default.`;
+  }
+  return "";
+}
+
+export function modelSelectionSummary(value: ModelSelectionValue, options: ModelOption[] = []): string {
+  if (!value.modelId) return "";
+  const name = options.find((option) => option.id === value.modelId)?.name ?? value.modelId;
+  return `${name} · Reasoning: ${value.reasoningEffort ? labelModelValue(value.reasoningEffort) : "model default"} · Summary: ${
+    value.reasoningSummary === "none" ? "off" : value.reasoningSummary} · Context: ${value.contextTier ? labelModelValue(value.contextTier) : "model default"}`;
 }
 
 function contextTiers(model: Record<string, unknown>): string[] {

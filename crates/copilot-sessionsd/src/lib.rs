@@ -314,6 +314,14 @@ async fn dispatch(state: &DaemonState, command: &str, body: Value) -> Result<Val
                     context: request.context,
                 }).await.map_err(ServiceError::CommandFailed)?)
         }
+        "git_refs" => {
+            let request = decode::<GitRefsArgs>(body)?;
+            let cwd = service.cwd_for(&request.session_id).await.ok_or_else(|| ServiceError::InvalidArgument(
+                "This session has no working directory.".into(),
+            ))?;
+            json_result(copilot_sessions_core::git_workspace::reference_targets(&cwd, &request.query)
+                .await.map_err(ServiceError::CommandFailed)?)
+        }
         "resume_session" => {
             let session_id = string_arg(&body, "sessionId")?;
             json_result(service.resume_session(session_id).await?)
@@ -632,6 +640,13 @@ fn decode<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, ServiceErro
 struct GitWorkspaceArgs {
     session_id: String,
     base: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GitRefsArgs {
+    session_id: String,
+    query: String,
 }
 
 #[derive(Deserialize)]

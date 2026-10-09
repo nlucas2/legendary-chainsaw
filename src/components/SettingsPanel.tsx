@@ -16,6 +16,8 @@ import {
 import type { TypographyController } from "../lib/useTypography";
 import type { ChatWidth } from "../lib/chatWidth";
 import type { MessageDelivery } from "../lib/deliveryPreference";
+import type { ModelDefaultsController } from "../lib/useModelDefaults";
+import { ModelDefaultsSettings } from "./ModelDefaultsSettings";
 import "../typography.css";
 
 export type ThemePreference = "auto" | "light" | "dark";
@@ -34,6 +36,7 @@ interface SettingsPanelProps {
   deliveryDefaultError?: string;
   onOpenShortcuts?: () => void;
   onOpenProfiles?: () => void;
+  modelDefaults?: ModelDefaultsController;
 }
 
 const schemes: {
@@ -76,6 +79,7 @@ export function SettingsPanel({
   deliveryDefaultError,
   onOpenShortcuts,
   onOpenProfiles,
+  modelDefaults,
 }: SettingsPanelProps) {
   return (
     <div className="settings-backdrop">
@@ -131,6 +135,7 @@ export function SettingsPanel({
           {chatWidthError && <p role="alert" className="typography-error">{chatWidthError}</p>}
         </div>
 
+        {modelDefaults && <ModelDefaultsSettings defaults={modelDefaults} />}
         {onOpenProfiles && <div className="settings-section">
           <button type="button" className="settings-navigation" onClick={onOpenProfiles}>
             <span className="settings-navigation-icon"><Layers size={17} /></span>

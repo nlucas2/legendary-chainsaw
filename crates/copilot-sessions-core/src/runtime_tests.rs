@@ -74,6 +74,36 @@ fn new_session(deferred: bool) -> NewSession {
     }
 
     #[tokio::test]
+    async fn model_switch_does_not_persist_queued_unconfirmed_or_missing_results() {
+        for result in [
+            json!({"deferred":true,"modelId":"old","message":"Queued"}),
+            json!({"status":"confirmation_required","modelId":"old"}),
+            json!({"status":"failed","modelId":"old"}),
+            json!({}),
+            json!({"modelId":"new"}),
+            json!({"status":"applied","deferred":false,"modelId":"new","message":"Model changed"}),
+        ] {
+            let runtime = mock_runtime();
+            runtime.service.resume_session("a".into()).await.unwrap();
+            runtime.service.metadata.write().await.get_mut("a").unwrap().model = Some("old".into());
+            runtime.hold("session.model.switchTo");
+            let service = runtime.service.clone();
+            let apply = tokio::spawn(async move {
+                service.switch_model("a", "new".into(), Some("high".into()), Some("concise".into()), Some("long_context".into())).await
+            });
+            let call = runtime.request("session.model.switchTo", 1).await;
+            runtime.reply(&call, result.clone()).await;
+            let response = apply.await.unwrap();
+            if result == json!({}) { assert!(response.is_err()); }
+            else { assert_eq!(response.unwrap(), result); }
+            let metadata = runtime.service.metadata.read().await;
+            let applied = result["modelId"] == "new";
+            assert_eq!(metadata["a"].model.as_deref(), Some(if applied { "new" } else { "old" }));
+            assert_eq!(metadata["a"].reasoning_effort.as_deref(), if applied { Some("high") } else { None });
+        }
+    }
+
+    #[tokio::test]
     async fn creation_name_is_persisted_and_published_before_native_name_sync_finishes() {
         let runtime = mock_runtime();
         runtime.hold("session.name.set");

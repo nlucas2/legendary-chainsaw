@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {
   parseUnifiedDiff, diffIdentity, createGitComment, gitAskDraft,
   loadGitComments, saveGitComments, GIT_COMMENTS_KEY, visiblePath, visibleBidi,
-  comparisonTargetGroups, assertGitDiffMatches, gitFilesForView,
+  comparisonTargetGroups, assertGitDiffMatches, gitFilesForView, normalizeGitReferences,
 } from "../src/lib/gitWorkspace.ts";
 
 const patch = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,3 +1,3 @@\n context\n-old\n+new\n tail\n@@ -20,0 +21,2 @@\n+++looks like header\n+last\n\\ No newline at end of file\n";
@@ -17,6 +17,16 @@ function storage() {
   const entries = new Map();
   return { getItem: (key) => entries.get(key) ?? null, setItem: (key, value) => entries.set(key, value) };
 }
+
+test("ref searches preserve bounded results and reject malformed metadata", () => {
+  const result = { refs: [{ name: "refs/remotes/origin/user/branch", commit: "a".repeat(40) }], hasMore: true, warnings: [] };
+  assert.deepEqual(normalizeGitReferences(result), result);
+  assert.deepEqual(normalizeGitReferences({ refs: [], hasMore: false, warnings: ["warning"] }), { refs: [], hasMore: false, warnings: ["warning"] });
+  for (const value of [{}, { ...result, hasMore: "true" }, { ...result, refs: [{ name: "HEAD", commit: "a".repeat(40) }] },
+    { ...result, refs: [{ name: "refs/heads/main", commit: "bad" }] }]) {
+    assert.throws(() => normalizeGitReferences(value));
+  }
+});
 
 test("unified diff numbers additions, deletions, context and header-like code correctly", () => {
   const lines = parseUnifiedDiff(patch);

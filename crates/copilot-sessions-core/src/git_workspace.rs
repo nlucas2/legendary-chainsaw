@@ -17,6 +17,9 @@ const TIMEOUT: Duration = Duration::from_secs(15);
 
 #[path = "git_untracked.rs"]
 mod untracked;
+#[path = "git_refs.rs"]
+mod refs;
+pub use refs::{GitReferences, reference_targets};
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -78,6 +81,7 @@ pub struct GitWorkspace {
     pub detached: bool,
     pub unborn: bool,
     pub refs: Vec<GitRef>,
+    pub refs_has_more: bool,
     pub staged: Vec<GitFile>,
     pub unstaged: Vec<GitFile>,
     pub untracked: Vec<GitFile>,
@@ -143,6 +147,16 @@ async fn run_git(
     limit: usize,
     filter_keys: &[String],
 ) -> Result<Output, String> {
+    run_git_output(cwd, args, limit, filter_keys, None).await
+}
+
+async fn run_git_output(
+    cwd: &str,
+    args: &[&str],
+    limit: usize,
+    filter_keys: &[String],
+    ref_query: Option<&str>,
+) -> Result<Output, String> {
     let mut command = Command::new("git");
     #[cfg(windows)]
     command.creation_flags(0x0800_0000);
@@ -206,9 +220,15 @@ async fn run_git(
     let stdout = child.stdout.take().ok_or("Git stdout unavailable")?;
     let stderr = child.stderr.take().ok_or("Git stderr unavailable")?;
     let execution = async {
+        let read_stdout = Box::pin(async {
+            match ref_query {
+                Some(query) => refs::read_ref_listing(stdout, query).await,
+                None => bounded_read(stdout, limit).await,
+            }
+        });
         let (status, stdout, stderr) = tokio::try_join!(
             child.wait(),
-            bounded_read(stdout, limit),
+            read_stdout,
             bounded_read(stderr, 32 * 1024)
         )?;
         Ok::<_, std::io::Error>((status, stdout, stderr))
@@ -381,6 +401,7 @@ async fn metadata(cwd: &str, requested_base: Option<&str>) -> Result<GitWorkspac
         detached: false,
         unborn: false,
         refs: vec![],
+        refs_has_more: false,
         staged: vec![],
         unstaged: vec![],
         untracked: vec![],
@@ -460,57 +481,33 @@ async fn metadata(cwd: &str, requested_base: Option<&str>) -> Result<GitWorkspac
             checked(head)?;
         }
     }
-    let refs = listing(
-        root,
-        &[
-            "for-each-ref",
-            "--format=%(refname)%00%(objectname)%00%(upstream)",
-            "refs/heads/",
-            "refs/remotes/",
-        ],
-        &mut workspace.warnings,
-    )
-    .await?;
-    for entry in text(&refs)?.split_terminator('\n') {
-        let fields: Vec<_> = entry.split('\0').collect();
-        if fields.len() != 3 || !valid_oid(fields[1]) {
-            return Err("Cannot parse Git local ref metadata.".into());
-        }
-        if workspace
-            .branch
-            .as_ref()
-            .is_some_and(|name| fields[0] == format!("refs/heads/{name}"))
-            && !fields[2].is_empty()
-        {
-            workspace.upstream = Some(fields[2].into());
-        }
-        workspace.refs.push(GitRef {
-            name: fields[0].into(),
-            commit: fields[1].into(),
-        });
-    }
-    if workspace.refs.len() > FILE_LIMIT {
-        return Err(
-            "Git has more than 4000 local refs; the target selector cannot be shown safely.".into(),
-        );
+    let targets = refs::list(root, "").await?;
+    workspace.refs = targets.refs;
+    workspace.refs_has_more = targets.has_more;
+    workspace.warnings.extend(targets.warnings);
+    if let Some(branch) = &workspace.branch {
+        let full_name = format!("refs/heads/{branch}");
+        let upstream = listing(root, &["for-each-ref", "--count=1", "--format=%(upstream)", &full_name],
+            &mut workspace.warnings).await?;
+        let upstream = line(&upstream)?;
+        if !upstream.is_empty() { workspace.upstream = Some(upstream); }
     }
     if let Some(base) = requested_base {
-        if !workspace
-            .refs
-            .iter()
-            .any(|reference| reference.name == base)
-        {
-            return Err("Choose an existing local branch or locally available remote-tracking ref as the comparison base.".into());
-        }
+        let reference = refs::resolve(root, base, &mut workspace.warnings).await?
+            .ok_or("Choose an existing local branch or locally available remote-tracking ref as the comparison base.")?;
+        workspace.base_commit = Some(reference.commit.clone());
+        refs::include(&mut workspace.refs, reference);
         workspace.base = Some(base.into());
-    } else {
-        workspace.base.clone_from(&workspace.upstream);
+    } else if let Some(upstream) = &workspace.upstream {
+        workspace.base = Some(upstream.clone());
+        if let Some(reference) = refs::resolve(root, upstream, &mut workspace.warnings).await? {
+            workspace.base_commit = Some(reference.commit.clone());
+            refs::include(&mut workspace.refs, reference);
+        }
     }
-    workspace.base_commit = workspace
-        .refs
-        .iter()
-        .find(|reference| Some(&reference.name) == workspace.base.as_ref())
-        .map(|reference| reference.commit.clone());
+    if let (Some(branch), Some(head)) = (&workspace.branch, &workspace.head) {
+        refs::include(&mut workspace.refs, GitRef { name: format!("refs/heads/{branch}"), commit: head.clone() });
+    }
     workspace.compare_unavailable_reason = if workspace.head.is_none() {
         Some(
             "This branch has no commit yet. Staged and unstaged changes are still available."

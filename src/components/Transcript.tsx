@@ -1,5 +1,7 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { MarkdownContent as Markdown } from "./MarkdownContent";
+import { CodeBlock } from "./CodeBlock";
+import { formattedJson, hasMarkdownFormatting, rawOutput, shellLanguage } from "../lib/codeRendering";
 import {
   Bot,
   Brain,
@@ -209,18 +211,7 @@ const TimelineEntry = memo(function TimelineEntry({
     return <ToolEntry item={item} defaultExpanded={toolDetailsExpanded} />;
   }
   if (item.kind === "command") {
-    return (
-      <details className="command-result">
-        <summary>
-          <TerminalSquare size={15} />
-          <strong>{item.command}</strong>
-          <ChevronRight className="details-chevron" size={14} />
-        </summary>
-        <div className="command-result-content">
-          <Markdown>{commandResultText(item.result)}</Markdown>
-        </div>
-      </details>
-    );
+    return <CommandResult item={item} />;
   }
   if (item.kind === "subagent") {
     return (
@@ -262,7 +253,7 @@ const MessageEntry = memo(function MessageEntry({
           </div>
         )}
         {role === "assistant" ? (
-          <><Markdown>{content}</Markdown>{streaming && <span className="streaming-caret" />}</>
+          <><Markdown streaming={streaming}>{content}</Markdown>{streaming && <span className="streaming-caret" />}</>
         ) : (
           <>
             {content && <p className="user-message-text">{content}</p>}
@@ -365,7 +356,7 @@ const ReasoningEntry = memo(function ReasoningEntry({
             {item.streaming && <span className="reasoning-live"><i />live</span>}
             <ChevronRight className={expanded ? "details-chevron expanded" : "details-chevron"} size={14} />
           </button>
-          {expanded && <div className="reasoning-content"><Markdown>{item.content}</Markdown></div>}
+          {expanded && <div className="reasoning-content"><Markdown streaming={item.streaming}>{item.content}</Markdown></div>}
         </section>
       </div>
     </div>
@@ -398,10 +389,10 @@ const ToolEntry = memo(function ToolEntry({
       {expanded && (
         <div className="tool-details">
           <div className="tool-call-id">call {item.callId}</div>
-          {item.arguments !== undefined && <DetailBlock label="Arguments" value={item.arguments} />}
-          {item.arguments === undefined && item.inputBuffer && <DetailBlock label="Arguments" value={item.inputBuffer} />}
-          {item.progress.length > 0 && <DetailBlock label="Progress" value={item.progress} />}
-          {item.result !== undefined && <DetailBlock label="Result" value={item.result} />}
+          {item.arguments !== undefined && <DetailBlock label="Arguments" value={item.arguments} commandLanguage={shellLanguage(item.name)} />}
+          {item.arguments === undefined && item.inputBuffer && <DetailBlock label="Arguments" value={item.inputBuffer} streaming={active} />}
+          {item.progress.length > 0 && <DetailBlock label="Progress" value={item.progress} plainText streaming={active} />}
+          {item.result !== undefined && <DetailBlock label="Result" value={item.result} plainText={!!shellLanguage(item.name)} streaming={active} />}
         </div>
       )}
     </section>
@@ -477,30 +468,58 @@ const CollapsibleSubagentMessage = memo(function CollapsibleSubagentMessage({
         <ChevronRight className={expanded ? "details-chevron expanded" : "details-chevron"} size={14} />
       </button>
       {expanded && (
-        <div className="message-content subagent-message-content"><Markdown>{item.content}</Markdown></div>
+        <div className="message-content subagent-message-content"><Markdown streaming={item.streaming}>{item.content}</Markdown></div>
       )}
     </section>
   );
 });
 
-const DetailBlock = memo(function DetailBlock({ label, value }: { label: string; value: unknown }) {
+const CommandResult = memo(function CommandResult({ item }: { item: Extract<TimelineItem, { kind: "command" }> }) {
+  const [expanded, setExpanded] = useState(false);
+  const [raw, setRaw] = useState(false);
+  return <details className="command-result" open={expanded} onToggle={(event) => setExpanded(event.currentTarget.open)}>
+    <summary><TerminalSquare size={15} /><strong>{item.command}</strong><ChevronRight className="details-chevron" size={14} /></summary>
+    {expanded && <div className="command-result-content output-preserve-lines">
+      <label className="output-raw-toggle"><input type="checkbox" checked={raw} onChange={(event) => setRaw(event.target.checked)} />Show raw output</label>
+      {raw ? <CodeBlock source={rawOutput(item.result)} forceRaw controls={false} />
+        : <OutputText value={commandResultText(item.result)} />}
+    </div>}
+  </details>;
+});
+
+const DetailBlock = memo(function DetailBlock({ label, value, plainText = false, commandLanguage, streaming = false }: {
+  label: string; value: unknown; plainText?: boolean; commandLanguage?: string; streaming?: boolean;
+}) {
+  const [raw, setRaw] = useState(false);
   return (
     <section className="detail-block">
       <h4>{label}</h4>
-      <div className="detail-value"><PrettyValue value={value} /></div>
+      <label className="output-raw-toggle"><input type="checkbox" checked={raw} onChange={(event) => setRaw(event.target.checked)} />Show raw output</label>
+      <div className="detail-value output-preserve-lines">{raw
+        ? <CodeBlock source={rawOutput(value)} forceRaw controls={false} />
+        : <PrettyValue value={value} plainText={plainText} commandLanguage={commandLanguage} streaming={streaming} />}</div>
     </section>
   );
 });
 
-const PrettyValue = memo(function PrettyValue({ value }: { value: unknown }) {
+const PrettyValue = memo(function PrettyValue({ value, plainText = false, commandLanguage, field, streaming = false }: {
+  value: unknown; plainText?: boolean; commandLanguage?: string; field?: string; streaming?: boolean;
+}) {
   if (value === null || value === undefined) return <span className="pretty-empty">No content</span>;
-  if (typeof value === "string") return <Markdown>{value}</Markdown>;
+  if (typeof value === "string") {
+    const language = commandLanguage && ["command", "script", "code"].includes(field ?? "") ? commandLanguage : undefined;
+    if (language) {
+      return <CodeBlock source={value} language={language} controls={false} streaming={streaming} />;
+    }
+    return <OutputText value={value} streaming={streaming}
+      plainText={plainText || ["stdout", "stderr", "output", "partialOutput"].includes(field ?? "")} />;
+  }
   if (typeof value === "number" || typeof value === "boolean") return <code>{String(value)}</code>;
   if (Array.isArray(value)) {
     return (
       <div className="pretty-list">
         {value.map((item, index) => (
-          <div className="pretty-list-item" key={index}><PrettyValue value={item} /></div>
+          <div className="pretty-list-item" key={index}><PrettyValue value={item} plainText={plainText} commandLanguage={commandLanguage} field={field} streaming={streaming} /></div>
         ))}
       </div>
     );
@@ -509,12 +528,19 @@ const PrettyValue = memo(function PrettyValue({ value }: { value: unknown }) {
     return (
       <dl className="pretty-object">
         {Object.entries(value).map(([key, item]) => (
-          <div key={key}><dt>{humanizeKey(key)}</dt><dd><PrettyValue value={item} /></dd></div>
+          <div key={key}><dt>{humanizeKey(key)}</dt><dd><PrettyValue value={item} field={key} plainText={plainText} commandLanguage={commandLanguage} streaming={streaming} /></dd></div>
         ))}
       </dl>
     );
   }
   return <span>{String(value)}</span>;
+});
+
+const OutputText = memo(function OutputText({ value, streaming = false, plainText = false }: { value: string; streaming?: boolean; plainText?: boolean }) {
+  const json = useMemo(() => streaming ? null : formattedJson(value), [value, streaming]);
+  if (json !== null) return <CodeBlock source={json} language="json" controls={false} />;
+  return !plainText && hasMarkdownFormatting(value) ? <Markdown streaming={streaming}>{value}</Markdown>
+    : <CodeBlock source={value} language="plaintext" controls={false} streaming={streaming} />;
 });
 
 function formatTime(timestamp: string): string {
@@ -523,6 +549,7 @@ function formatTime(timestamp: string): string {
 }
 
 function commandResultText(value: unknown): string {
+  if (typeof value === "string") return value;
   if (!value || typeof value !== "object") return "Command completed.";
   const result = value as Record<string, unknown>;
   if (typeof result.text === "string") return result.text;
@@ -540,7 +567,7 @@ function commandResultText(value: unknown): string {
       });
     return options.length > 0 ? options.join("\n") : "Command completed.";
   }
-  return "Command completed.";
+  return rawOutput(value);
 }
 
 function humanizeKey(key: string): string {
