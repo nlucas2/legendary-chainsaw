@@ -401,10 +401,10 @@ fn workspace_candidates(cwd: &Path) -> Result<HashMap<String, Vec<String>>> {
                 .map_err(|_| {
                     ServiceError::InvalidArgument("Cannot read repository MCP source".into())
                 })?;
-            let (servers, _) = crate::profiles::parse_mcp(&bytes, &file)?;
-            for name in servers.keys() {
+            let names = crate::profiles::parse_mcp_server_names(&bytes, &file)?;
+            for name in names {
                 result
-                    .entry(name.clone())
+                    .entry(name)
                     .or_default()
                     .push(file.to_string_lossy().into());
             }

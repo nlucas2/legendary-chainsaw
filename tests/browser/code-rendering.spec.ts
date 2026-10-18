@@ -1,8 +1,8 @@
 import { test, expect, type Page, type Route } from "@playwright/test";
 
 const event = (id: string, type: string, data: Record<string, unknown>) => ({ id, type, timestamp: "", data });
-async function setup(page: Page, events: ReturnType<typeof event>[]) {
-  const session = { sessionId: "rendering", title: "Rendering fixture", cwd: "Q:\\fixture", model: "model",
+async function setup(page: Page, events: ReturnType<typeof event>[], model = "model") {
+  const session = { sessionId: "rendering", title: "Rendering fixture", cwd: "Q:\\fixture", model,
     isActive: true, isRemote: false, pinned: false, archived: false, tags: [], startTime: "", modifiedTime: "" };
   const requests: string[] = [];
   page.on("request", (request) => requests.push(request.url()));
@@ -57,6 +57,48 @@ test("fenced source is highlighted locally with exact raw-source switching and s
   await expect(other.locator("img")).toHaveCount(0);
   expect(requests.some((url) => url.includes("highlight.worker"))).toBe(true);
   expect(requests.some((url) => url.includes("renderMermaid"))).toBe(false);
+});
+
+test("tool-first turns show Copilot above its tools during streaming and after reload", async ({ page }, testInfo) => {
+  const prompt = event("u", "user.message", { content: "Inspect before answering." });
+  const model = event("model", "session.start", { model: "reported-model" });
+  const tool = event("tool", "tool.execution_start", { toolCallId: "view", toolName: "view", arguments: { path: "example.txt" } });
+  let reloadedEvents = [model, prompt, tool];
+  const { emit } = await setup(page, reloadedEvents, "reported-model");
+  const transcript = page.locator(".parent-session-view .transcript");
+  const heading = transcript.locator(".assistant-activity-heading");
+  await expect(heading).toContainText("Copilot");
+  await expect(heading).toContainText("reported-model");
+  await expect(transcript.locator(".message.assistant")).toHaveCount(0);
+  const userBottom = (await transcript.locator(".message.user").boundingBox())!;
+  const assistant = (await heading.boundingBox())!;
+  const firstTool = (await transcript.locator(".tool-card").boundingBox())!;
+  expect(assistant.y).toBeGreaterThanOrEqual(userBottom.y + userBottom.height);
+  expect(assistant.y + assistant.height).toBeLessThanOrEqual(firstTool.y);
+  await expect(transcript.locator(".message.user .tool-card")).toHaveCount(0);
+
+  const reason = event("r", "assistant.reasoning", { content: "Actual summary after inspecting." });
+  const answer = event("a", "assistant.message", { content: "Inspection complete.", model: "reported-model" });
+  await emit(reason);
+  await emit(answer);
+  await expect(transcript.locator(".message.assistant")).toContainText("Inspection complete.");
+  await expect(transcript.locator(".message-role").filter({ hasText: "Copilot" })).toHaveCount(1);
+  await expect(transcript.locator(".reasoning-row .message-avatar")).toHaveClass(/placeholder/);
+  await expect(transcript.locator(".message.assistant .message-avatar")).toHaveClass(/placeholder/);
+  reloadedEvents = [...reloadedEvents, reason, answer];
+  await page.route("**/api/session_history_window", (route) => route.fulfill({
+    json: { events: reloadedEvents, hasMore: false, cursor: "", loadedPages: 1, humanMessages: 1 },
+  }));
+  await page.reload();
+  await expect(heading).toContainText("reported-model");
+  await expect(transcript.locator(".message-role").filter({ hasText: "Copilot" })).toHaveCount(1);
+  await page.screenshot({ path: testInfo.outputPath("tool-first-heading.png") });
+  await page.setViewportSize({ width: 320, height: 844 });
+  expect(await transcript.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+  await emit(event("u2", "user.message", { content: "Inspect again." }));
+  await emit(event("t2", "tool.execution_start", { toolCallId: "glob", toolName: "glob", arguments: { pattern: "*.txt" } }));
+  await expect(transcript.locator(".assistant-activity-heading")).toHaveCount(2);
+  await expect(transcript.locator(".message-role").filter({ hasText: "Copilot" })).toHaveCount(2);
 });
 
 test("PowerShell execution output keeps line breaks and indentation while raw output preserves the complete payload", async ({ page }) => {
@@ -123,6 +165,45 @@ test("Mermaid renders locally with a raw-source checkbox and responds to theme c
   await page.evaluate(() => { document.documentElement.dataset.theme = document.documentElement.dataset.theme === "light" ? "dark" : "light"; });
   await expect(block.locator("svg")).not.toHaveAttribute("id", before!);
   expect(requests.every((url) => new URL(url).hostname === "127.0.0.1")).toBe(true);
+});
+
+test("Mermaid init applies spacing and step curves per diagram while preserving raw source", async ({ page }) => {
+  const graph = 'flowchart TB\nsubgraph Container[" "]\nA-->B\nA-->C\nend\nstyle Container fill:none,stroke:none\n';
+  const source = '%%{init: {"flowchart": {"curve": "stepAfter", "nodeSpacing": 35, "rankSpacing": 65}}}%%\n' + graph;
+  const { requests, emit } = await setup(page, [event("layout", "assistant.message", { content: "```mermaid\n" + source + "```" })]);
+  const configured = page.locator(".diagram-block").first();
+  await configured.scrollIntoViewIfNeeded();
+  const svg = configured.locator("svg");
+  await expect(svg).toBeVisible();
+  const configuredPaths = await svg.locator("path.flowchart-link").evaluateAll((paths) => paths.map((path) => path.getAttribute("d")));
+  expect(configuredPaths.length).toBe(2);
+  expect(configuredPaths.every((path) => path && !/[CQ]/i.test(path))).toBe(true);
+  const height = await svg.evaluate((element) => element.viewBox.baseVal.height);
+  await expect(svg.locator(".cluster > rect")).toHaveCSS("fill", "none");
+  await configured.getByRole("checkbox", { name: "Show raw source" }).check();
+  expect(await configured.locator("pre code").textContent()).toBe(source);
+  await configured.getByRole("checkbox", { name: "Show raw source" }).uncheck();
+
+  await emit(event("default-layout", "assistant.message", { content: "```mermaid\n" + graph + "```" }));
+  const following = page.locator(".diagram-block").nth(1);
+  await following.scrollIntoViewIfNeeded();
+  const defaultSvg = following.locator("svg");
+  await expect(defaultSvg).toBeVisible();
+  expect(await defaultSvg.evaluate((element) => element.viewBox.baseVal.height)).not.toBe(height);
+  const defaultPaths = await defaultSvg.locator("path.flowchart-link").evaluateAll((paths) => paths.map((path) => path.getAttribute("d")));
+  expect(defaultPaths.some((path) => path && /[CQ]/i.test(path))).toBe(true);
+  expect(requests.every((url) => new URL(url).hostname === "127.0.0.1")).toBe(true);
+});
+
+test("Mermaid init cannot override security or load resources and reports the rejected configuration", async ({ page }) => {
+  const source = '%%{init: {"flowchart": {"curve":"stepAfter"}, "themeCSS":"@import url(https://diagram-external.invalid/a.css);", "securityLevel":"loose"}}%%\nflowchart LR\nA-->B\n';
+  const { requests } = await setup(page, [event("unsafe-config", "assistant.message", { content: "```mermaid\n" + source + "```" })]);
+  const block = page.locator(".diagram-block");
+  await block.scrollIntoViewIfNeeded();
+  await expect(block.getByRole("status")).toContainText("Diagram configuration only supports flowchart layout settings");
+  await expect(block.locator("svg")).toHaveCount(0);
+  expect(await block.locator("pre code").textContent()).toBe(source);
+  expect(requests.some((url) => url.includes("diagram-external.invalid"))).toBe(false);
 });
 
 test("nested Mermaid subgraphs render with node styling and preserve the original source", async ({ page }) => {
@@ -289,4 +370,100 @@ test("failed renderer loading leaves source visible with an explicit diagnostic"
   expect(await block.locator("pre code").textContent()).toBe(source);
   await block.getByRole("checkbox", { name: "Show raw source" }).check();
   await expect(block.getByRole("status")).toHaveCount(0);
+});
+
+test("apply_patch shows file operations and diff colors with exact raw arguments and no repository calls", async ({ page }, testInfo) => {
+  const patch = "*** Begin Patch\r\n*** Update File: src/old.ts\r\n*** Move to: src/new.ts\r\n@@ function render\r\n context\r\n-before\r\n+after <script>not executable</script>\r\n*** Add File: added.txt\r\n+first\r\n+\r\n+third\r\n*** Delete File: deleted.txt\r\n*** End Patch\r\n";
+  const args = { input: patch, explanation: "Extra argument stays inspectable" };
+  const { requests } = await setup(page, [
+    event("patch-start", "tool.execution_start", { toolCallId: "patch", toolName: "functions.apply_patch", arguments: args }),
+    event("patch-end", "tool.execution_complete", { toolCallId: "patch", success: true, result: "Applied the requested patch." }),
+  ]);
+  await expect(page.getByRole("region", { name: "Patch request", exact: true })).toHaveCount(0);
+  await page.locator(".tool-card .timeline-disclosure").click();
+  const preview = page.getByRole("region", { name: "Patch request", exact: true });
+  await expect(preview.locator(".patch-file")).toHaveCount(3);
+  await expect(preview.locator(".patch-summary")).toContainText("3 files");
+  await expect(preview.locator(".patch-file").first().locator("summary")).toContainText("src/old.ts → src/new.ts");
+  await expect(preview.locator(".patch-summary")).toContainText("+4 −1");
+  await expect(preview).toContainText("Delete file; contents are not included in the patch.");
+  const diff = preview.getByRole("region", { name: "Patch for src/old.ts", exact: true });
+  await expect(diff.locator(".add")).toContainText("+after <script>not executable</script>");
+  await expect(diff.locator(".delete")).toHaveText("-before");
+  await expect(diff.locator(".git-diff-number")).toHaveCount(0);
+  const before = await diff.locator(".add").evaluate((element) => getComputedStyle(element).backgroundColor);
+  expect(before).not.toBe(await diff.locator(".delete").evaluate((element) => getComputedStyle(element).backgroundColor));
+  await expect(preview.locator("script")).toHaveCount(0);
+  await preview.getByText("Other arguments", { exact: true }).click();
+  await expect(preview.locator(".patch-extra")).toContainText("Extra argument stays inspectable");
+  await preview.getByRole("checkbox", { name: "Show raw patch" }).check();
+  expect(await preview.locator("pre code").textContent()).toBe(JSON.stringify(args, null, 2));
+  await preview.getByRole("checkbox", { name: "Show raw patch" }).uncheck();
+  await expect(preview.locator(".patch-file")).toHaveCount(3);
+  await page.evaluate(() => { document.documentElement.dataset.theme = document.documentElement.dataset.theme === "light" ? "dark" : "light"; });
+  await expect(diff.locator(".add")).not.toHaveCSS("background-color", before);
+  await preview.locator(".patch-file").first().scrollIntoViewIfNeeded();
+  await page.screenshot({ path: testInfo.outputPath("apply-patch-diff.png") });
+  await page.setViewportSize({ width: 320, height: 844 });
+  await preview.locator(".patch-file").first().scrollIntoViewIfNeeded();
+  expect(await preview.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+  const selector = preview.locator(".patch-file").first().locator("summary");
+  await selector.focus();
+  await selector.press("Enter");
+  await expect(diff).toHaveCount(0);
+  await selector.press("Enter");
+  await expect(diff).toBeVisible();
+  expect(requests.some((url) => /\/api\/(?:git_diff|git_workspace|execute_command|send_message|set_)/.test(url))).toBe(false);
+});
+
+test("patch argument streaming uses raw text until complete and failures never claim edits were applied", async ({ page }) => {
+  const { emit } = await setup(page, [
+    event("delta", "assistant.tool_call_delta", { toolCallId: "patch", toolName: "apply_patch", inputDelta: "*** Begin Patch\n*** Update File: file.txt\n" }),
+  ]);
+  await page.locator(".tool-card .timeline-disclosure").click();
+  const preview = page.getByRole("region", { name: "Patch request", exact: true });
+  await expect(preview).toContainText("Receiving patch arguments...");
+  await expect(preview.locator(".patch-file")).toHaveCount(0);
+  const patch = "*** Begin Patch\n*** Update File: file.txt\n@@\n-before\n+after\n*** End Patch\n";
+  await emit(event("start", "tool.execution_start", { toolCallId: "patch", toolName: "apply_patch", arguments: patch }));
+  await expect(preview.locator(".patch-file")).toHaveCount(1);
+  await emit(event("failed", "tool.execution_complete", { toolCallId: "patch", success: false, error: "Context not found" }));
+  await expect(preview).toContainText("Patch tool failed. These are the requested edits");
+  await expect(page.locator(".tool-card.failed")).toContainText("Context not found");
+  await preview.getByRole("checkbox", { name: "Show raw patch" }).check();
+  expect(await preview.locator("pre code").textContent()).toBe(patch);
+});
+
+test("patch previews paginate long changes and fall back without losing malformed input", async ({ page }) => {
+  const large = "*** Begin Patch\n*** Add File: many.txt\n" + "+line\n".repeat(250) + "*** End Patch";
+  const malformed = "*** Begin Patch\n*** Update File: file.txt\nmissing line prefix\n*** End Patch";
+  await setup(page, [
+    event("first", "tool.execution_start", { toolCallId: "first", toolName: "apply_patch", arguments: large }),
+    event("second", "tool.execution_start", { toolCallId: "second", toolName: "apply_patch", arguments: malformed }),
+  ]);
+  await page.locator(".tool-card .timeline-disclosure").first().click();
+  const first = page.getByRole("region", { name: "Patch request", exact: true }).first();
+  await expect(first.locator(".git-diff-line")).toHaveCount(200);
+  await first.getByRole("button", { name: "Show more lines (50 remaining)", exact: true }).click();
+  await expect(first.locator(".git-diff-line")).toHaveCount(250);
+  await page.locator(".tool-card .timeline-disclosure").nth(1).click();
+  const second = page.getByRole("region", { name: "Patch request", exact: true }).nth(1);
+  await expect(second.getByRole("status")).toContainText("Could not interpret the complete patch");
+  await expect(second.locator(".patch-file")).toHaveCount(0);
+  expect(await second.locator("pre code").textContent()).toBe(malformed);
+});
+
+test("patch file groups load on demand and move-only, empty additions and deletions remain explicit", async ({ page }) => {
+  const patch = "*** Begin Patch\n*** Update File: old.txt\n*** Move to: new.txt\n*** Add File: empty.txt\n"
+    + Array.from({ length: 10 }, (_, index) => `*** Delete File: old-${index}.txt\n`).join("") + "*** End Patch";
+  await setup(page, [event("files", "tool.execution_start", { toolCallId: "files", toolName: "apply_patch", arguments: { patch } })]);
+  await page.locator(".tool-card .timeline-disclosure").click();
+  const preview = page.getByRole("region", { name: "Patch request", exact: true });
+  await expect(preview.locator(".patch-file")).toHaveCount(10);
+  await expect(preview).toContainText("Move only; no content changes.");
+  await expect(preview).toContainText("Create an empty file.");
+  await preview.getByRole("button", { name: "Show more files (2 remaining)" }).click();
+  await expect(preview.locator(".patch-file")).toHaveCount(12);
+  await expect(preview.locator(".patch-summary")).toContainText("Deleted-file contents not included in counts");
+  await expect(preview.getByRole("button", { name: /Show more files/ })).toHaveCount(0);
 });

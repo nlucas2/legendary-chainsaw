@@ -48,7 +48,7 @@ test("HTTP acceptance before user.message does not lose the submission clock", (
 });
 
 test("diagnostic metadata never invalidates transcript", () => {
-  for (const type of ["model.messages_snapshot", "system.message", "assistant.streaming_delta", "assistant.usage"]) {
+  for (const type of ["model.messages_snapshot", "system.message", "assistant.streaming_delta", "assistant.usage", "session.usage_checkpoint"]) {
     assert.equal(isTranscriptEvent(event(type)), false, type);
   }
   assert.equal(isTranscriptEvent(event("assistant.reasoning_delta")), true);

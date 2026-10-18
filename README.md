@@ -63,6 +63,9 @@ Mobile/web browser ──┘                                  │
   Raw diagnostics** is off by default. Its checkbox shows the current On/Off state and enables
   a JSON viewer for the latest 100 live events with additional filtered telemetry, not full model
   payloads. Normal streaming, event logging, and the Context usage view do not depend on this setting.
+  Assistant headings begin at the first visible response activity, including tools or delegation,
+  so tool-first responses do not appear under **You**. Later reasoning and answer text share that
+  heading; nested and focused subagents keep their own labels and model provenance.
 - **Code and command output** preserve literal command/log line breaks, blank lines, and indentation.
   Shell arguments get PowerShell/Bash highlighting; complete JSON text is formatted readably. Tool
   arguments, progress/results, and slash-command results have a **Show raw output** checkbox to inspect
@@ -74,9 +77,17 @@ Mobile/web browser ──┘                                  │
   streamed messages finish; blocks above 100,000 characters (highlighting) or 30,000 characters (diagrams)
   remain source-only. Mermaid also caps graphs at 200 edges. No content is sent to an external rendering
   service. Standard Mermaid node styles, class definitions, and link styles are supported.
-  Configuration directives, external CSS/resource loads, CSS rule injection, and click actions
+  JSON `init`/`initialize` directives support flowchart `curve`, `nodeSpacing` and `rankSpacing`
+  (spacing from 0 to 1000). These layout options are applied per diagram without changing renderer safety settings.
+  Other configuration, external CSS/resource loads, CSS rule injection, and click actions
   are not enabled; SVG output is sanitized. Rejected diagrams explain
   the reason and retain their source. Raw mode is a display choice, never an execution action.
+  **apply_patch** arguments display as file-by-file diffs: additions in green, removals in red,
+  context/hunk anchors, and explicit Add/Update/Move/Delete headers. **Show raw patch** retains the
+  original arguments. The preview describes the request; the tool's result remains below it, and
+  failed calls are clearly marked. No repository reads or writes are made to display the patch.
+  Update hunks do not invent line numbers; deleted-file contents are not fetched. Incomplete or
+  unsupported input stays raw with an explanation, and large previews load more files/lines on demand.
 - **Models** are resolved from the live session rather than labeled "default." The header opens the
   session-specific model catalog and switches via the Copilot runtime.
   **Settings → Default model for new sessions** saves the preferred model, reasoning effort,
@@ -136,6 +147,9 @@ Mobile/web browser ──┘                                  │
   Repository `.mcp.json` and `.github/mcp.json` were not discovered automatically by the pinned
   runtime in the isolated probe. The app detects potential overlapping declarations in those files
   but does not silently load them; explicitly link the intended CLI-shaped file in a group.
+  Overlap discovery checks document structure and server names, not transport settings; a
+  repository URL without an explicit transport does not block unrelated plugin exclusions.
+  Explicitly linked definitions and base definitions copied into a session still undergo full SDK validation.
   Exclusions survive native MCP/plugin reloads and are supplied on create/resume. Removing a profile
   restores only its owned disabled names and removes its base overrides. The app retains observed
   independent disabled choices across reattachment. Source decisions and base overrides are
@@ -160,6 +174,11 @@ Mobile/web browser ──┘                                  │
   catalogs: optional discovery uses a shared cache with bounded background requests and publishes updates
   through the daemon event bus. Slow or failing servers show warnings without hiding the controls.
   Reopening the drawer retains its last snapshot while refreshing authoritative state.
+  **Context → Context → AI credits used** reads the native session total, including subagents,
+  independently of token attribution and Raw diagnostics. Missing accounting is shown as unavailable,
+  not zero; failed reads retain a visibly stale snapshot with Retry. Totals refresh after usage and
+  checkpoint events and stream recovery. This is session consumption, not an account balance or quota,
+  and is never estimated from token counts or model multipliers.
 - **Repository skills** use normal runtime configuration discovery when an app session is created
   or resumed. With terminal **Track CWD** enabled, the recorded session directory follows the
   terminal; the runtime can update its discovered repository skills on that directory change.
@@ -271,7 +290,11 @@ Mobile/web browser ──┘                                  │
   **Scheduled task**, not **You**. Schedules and the latest 20 runs per task persist in the daemon's
   `schedules.json` (up to 100 tasks); unreadable storage disables scheduling without blocking chat.
   No briefing prompts, schedules, or data-source access are enabled by default.
-- **Git workspace** discovers the repository from the session's current directory. Its read-only
+- **Git workspace** follows the session directory by default. **Add working path** pins another
+  absolute directory on the daemon's computer; the selector can inspect up to eight additional
+  repositories without changing the session or terminal CWD. Paths and the selected pin are saved
+  per session in this browser. Removing a pin never deletes files or saved review notes.
+  Its read-only
   views cover staged, unstaged and untracked paths, plus a PR-style **committed** comparison from
   the selected target's merge base to HEAD. Choose a local target ref; the tracking upstream may
   not be the intended PR target. Existing remote default refs (`origin/HEAD`), main/master branches,
@@ -281,6 +304,12 @@ Mobile/web browser ──┘                                  │
   loading thousands of dropdown options or blocking file previews. Ref discovery streams complete
   records with bounded memory; selecting a search result resolves that exact ref independently.
   There is no fetch, stage, commit, or push action.
+  Working changes load before comparison refs and committed changes. Background details must match
+  the displayed repository and HEAD; failures leave working changes available with a separate Retry.
+  The details request does not repeat the worktree scan. Working-file line counts load with selected
+  previews rather than blocking the initial file list; committed-comparison counts arrive with its details.
+  Reopening can display a labeled cached snapshot while refreshing. File previews do not repeat the
+  full comparison-ref scan, and fresh diff identities still guard notes against moved comparisons.
   **Unstaged** includes tracked working-tree edits and clearly marked new, untracked files;
   **Untracked** remains available as a new-files-only filter. Regular untracked text files are
   previewed as additions against an empty file and support the same line comments and Ask drafts.
@@ -309,6 +338,9 @@ Mobile/web browser ──┘                                  │
   a range, or Ctrl/Cmd-click to toggle individual lines. Keyboard Up/Down, Home/End and Space/Enter
   work too; touch taps toggle lines without preventing scrolling. Added, deleted, and unchanged
   context lines are selectable; diff metadata is not. Each note can cover up to 40 source lines.
+  Desktop selection opens a nearby local-note editor instead of requiring a scroll to the end
+  of a large file. Escape dismisses that editor before the Git panel; mobile keeps the normal
+  in-flow editor. Native text selection and the existing line-selection keyboard controls remain available.
   Save local review notes across files, then use **Bring all notes into chat** to triage the
   repository's collected notes together. The bundle includes stable note IDs, file/line references,
   original snapshot identities, and saved code excerpts. Other repositories are excluded; older
@@ -326,6 +358,10 @@ Mobile/web browser ──┘                                  │
   written into repository files.
 - **Appearance** follows mkb's Auto / Light / Dark model. Auto tracks the OS, and Light uses mkb's
   warm Catppuccin-Latte-inspired paper palette. The preference follows open browser tabs.
+  Dark uses layered Mocha-inspired surfaces rather than near-black navy. User messages have blue
+  panels; reasoning is lavender, tools teal, commands/approvals amber, and failures rose.
+  Both themes use readable secondary text, distinct selected states, and visible input borders
+  and keyboard focus. Color reinforces the existing labels and icons rather than replacing them.
   **Font & spacing** offers an optional CLI-like monospace preset, custom local font families,
   chat size/line/paragraph spacing, and independent terminal typography. Changes apply immediately;
   terminal font changes resize the existing terminal instead of restarting it. No CLI settings

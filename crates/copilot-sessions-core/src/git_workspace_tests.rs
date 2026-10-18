@@ -9,6 +9,355 @@ use std::{
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 #[tokio::test]
+#[ignore = "read-only timing against an explicitly selected local working tree"]
+async fn local_git_inspection_timings() {
+    let cwd = std::env::var("COPILOT_GIT_TIMING_CWD").expect("set COPILOT_GIT_TIMING_CWD");
+    for iteration in 1..=3 {
+        let start = std::time::Instant::now();
+        let repository = repository(&cwd).await.unwrap();
+        println!("repository {iteration}: {} ms", start.elapsed().as_millis());
+        assert!(repository.is_repository);
+        let start = std::time::Instant::now();
+        let changes = workspace_with_scope(&cwd, None, GitWorkspaceScope::Changes)
+            .await
+            .unwrap();
+        println!("changes {iteration}: {} ms", start.elapsed().as_millis());
+            assert!(!changes.details_loaded && changes.changes_loaded);
+            let start = std::time::Instant::now();
+            let details = workspace_with_scope(&cwd, None, GitWorkspaceScope::Details)
+                .await
+                .unwrap();
+            println!("details {iteration}: {} ms", start.elapsed().as_millis());
+            assert!(details.details_loaded && !details.changes_loaded);
+        let start = std::time::Instant::now();
+        let state = workspace(&cwd, None).await.unwrap();
+        println!("workspace {iteration}: {} ms", start.elapsed().as_millis());
+        if let Some((view, file)) = state
+            .unstaged
+            .first()
+            .map(|file| (GitView::Unstaged, file))
+            .or_else(|| state.staged.first().map(|file| (GitView::Staged, file)))
+        {
+            let start = std::time::Instant::now();
+            let result = diff(
+                &cwd,
+                GitDiffRequest {
+                    view,
+                    path: file.path.clone(),
+                    base: None,
+                    context: GitDiffContext::Changes,
+                },
+            )
+            .await
+            .unwrap();
+            println!(
+                "diff {iteration}: {} ms ({} bytes)",
+                start.elapsed().as_millis(),
+                result.patch.len()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn explicit_working_path_selects_a_repository_without_changing_session_cwd() {
+    let session_repo = Repo::new();
+    let selected_repo = Repo::new();
+    for (repo, contents) in [(&session_repo, "session\n"), (&selected_repo, "selected\n")] {
+        repo.write("same.txt", "base\n");
+        repo.commit();
+        repo.write("same.txt", contents);
+    }
+    selected_repo.write("nested/.keep", "");
+    let session_cwd = session_repo.cwd().to_owned();
+    let selected_path = selected_repo.0.join("nested").join("..");
+    let index_before = fs::read(selected_repo.0.join(".git/index")).unwrap();
+    let source_before = fs::read(selected_repo.0.join("same.txt")).unwrap();
+    let cwd = working_directory(Some(&session_cwd), Some(selected_path.to_str().unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(Path::new(&cwd), selected_repo.0);
+    let probe = repository(&cwd).await.unwrap();
+    assert_eq!(
+        Path::new(probe.repo_root.as_deref().unwrap())
+            .canonicalize()
+            .unwrap(),
+        selected_repo.0
+    );
+    let state = workspace(&cwd, None).await.unwrap();
+    assert!(state.details_loaded);
+    assert_eq!(state.unstaged[0].path, "same.txt");
+    let refs = reference_targets(&cwd, "main").await.unwrap();
+    assert_eq!(refs.refs[0].commit, state.head.as_deref().unwrap());
+    let selected = diff(
+        &cwd,
+        GitDiffRequest {
+            view: GitView::Unstaged,
+            path: "same.txt".into(),
+            base: None,
+            context: GitDiffContext::Full,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(selected.patch.contains("+selected"));
+    assert!(!selected.patch.contains("+session"));
+    let default_cwd = working_directory(Some(&session_cwd), None).await.unwrap();
+    assert_eq!(default_cwd, session_cwd);
+    let original = session_repo.diff(GitView::Unstaged, "same.txt", None).await;
+    assert!(original.patch.contains("+session"));
+    assert_ne!(original.repo_root, selected.repo_root);
+    assert_eq!(
+        fs::read(selected_repo.0.join(".git/index")).unwrap(),
+        index_before
+    );
+    assert_eq!(
+        fs::read(selected_repo.0.join("same.txt")).unwrap(),
+        source_before
+    );
+    assert_eq!(
+        working_directory(None, Some(selected_repo.cwd()))
+            .await
+            .unwrap(),
+        selected_repo.cwd()
+    );
+    assert!(working_directory(None, None).await.is_err());
+}
+
+#[tokio::test]
+async fn explicit_working_path_rejects_invalid_paths_without_falling_back_to_session() {
+    let repo = Repo::new();
+    repo.write("not-directory", "file\n");
+    let missing = repo.0.join("missing");
+    let file = repo.0.join("not-directory");
+    for path in [
+        "",
+        " ",
+        ".",
+        "relative",
+        "relative\\directory",
+        "relative/directory",
+        "bad\0path",
+        missing.to_str().unwrap(),
+        file.to_str().unwrap(),
+    ] {
+        assert!(
+            working_directory(Some(repo.cwd()), Some(path))
+                .await
+                .is_err(),
+            "{path:?}"
+        );
+    }
+    #[cfg(windows)]
+    for path in ["Q:relative", "\\rooted-without-drive"] {
+        assert!(
+            working_directory(Some(repo.cwd()), Some(path))
+                .await
+                .is_err(),
+            "{path:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn changes_snapshot_defers_ref_comparison_and_line_count_commands() {
+    let repo = Repo::new();
+    repo.write("same.txt", "base\n");
+    let base = repo.commit();
+    repo.git(&["checkout", "--quiet", "-b", "feature"]);
+    repo.git(&["branch", "--set-upstream-to=main"]);
+    repo.write("same.txt", "commit\n");
+    let head = repo.commit();
+    repo.write("same.txt", "staged\n");
+    repo.git(&["add", "--all"]);
+    repo.write("same.txt", "worktree\n");
+    repo.write("new.txt", "untracked\n");
+    let index_before = fs::read(repo.0.join(".git/index")).unwrap();
+    let (changes, commands) = GIT_COMMANDS
+        .scope(Default::default(), async {
+            let changes = workspace_with_scope(
+                repo.cwd(),
+                Some("refs/heads/main"),
+                GitWorkspaceScope::Changes,
+            )
+            .await
+            .unwrap();
+            (
+                changes,
+                GIT_COMMANDS.with(|commands| commands.borrow().clone()),
+            )
+        })
+        .await;
+    assert!(!changes.details_loaded);
+    assert!(changes.changes_loaded);
+    assert_eq!(serde_json::to_value(&changes).unwrap()["detailsLoaded"], false);
+    assert_eq!(changes.branch.as_deref(), Some("feature"));
+    assert_eq!(changes.head.as_deref(), Some(head.as_str()));
+    assert_eq!(changes.staged[0].path, "same.txt");
+    assert_eq!(changes.unstaged[0].path, "same.txt");
+    assert_eq!(changes.untracked[0].path, "new.txt");
+    assert!(changes.staged[0].added.is_none());
+    assert!(changes.unstaged[0].deleted.is_none());
+    assert!(changes.refs.is_empty() && changes.compare.is_empty());
+    assert!(changes.upstream.is_none() && changes.base.is_none() && changes.merge_base.is_none());
+    assert!(changes.compare_unavailable_reason.is_none());
+    assert!(
+        !commands.iter().any(|args| matches!(
+            args[0].as_str(),
+            "for-each-ref" | "merge-base" | "check-ref-format" | "diff"
+        )),
+        "{commands:?}"
+    );
+    let full = workspace(repo.cwd(), Some("refs/heads/main"))
+        .await
+        .unwrap();
+    assert!(full.details_loaded);
+    assert!(full.changes_loaded);
+    assert_eq!(full.merge_base.as_deref(), Some(base.as_str()));
+    assert_eq!(full.compare.len(), 1);
+    assert_eq!(full.staged[0].added, Some(1));
+    assert_eq!(full.unstaged[0].deleted, Some(1));
+    repo.write("same.txt", "fresh worktree\n");
+    let fresh = repo.diff(GitView::Unstaged, "same.txt", None).await;
+    assert!(fresh.patch.contains("+fresh worktree"));
+    assert_eq!(fs::read(repo.0.join(".git/index")).unwrap(), index_before);
+}
+
+#[tokio::test]
+async fn details_snapshot_preserves_full_comparison_without_loading_local_changes() {
+    let repo = Repo::new();
+    repo.write("same.txt", "base\n");
+    let base = repo.commit();
+    repo.git(&["checkout", "--quiet", "-b", "feature"]);
+    repo.git(&["branch", "--set-upstream-to=main"]);
+    repo.write("same.txt", "commit\n");
+    let head = repo.commit();
+    repo.write("same.txt", "worktree\n");
+    repo.write("new.txt", "untracked\n");
+    let index_before = fs::read(repo.0.join(".git/index")).unwrap();
+    let source_before = fs::read(repo.0.join("same.txt")).unwrap();
+    let changes = workspace_with_scope(repo.cwd(), None, GitWorkspaceScope::Changes).await.unwrap();
+    let (snapshot, commands) = GIT_COMMANDS.scope(Default::default(), async {
+        let snapshot = workspace_with_scope(repo.cwd(), None, GitWorkspaceScope::Details).await.unwrap();
+        (snapshot, GIT_COMMANDS.with(|commands| commands.borrow().clone()))
+    }).await;
+    assert!(snapshot.details_loaded && !snapshot.changes_loaded);
+    assert!(snapshot.staged.is_empty() && snapshot.unstaged.is_empty() && snapshot.untracked.is_empty());
+    assert_eq!(snapshot.repo_root, changes.repo_root);
+    assert_eq!(snapshot.branch, changes.branch);
+    assert_eq!(snapshot.head.as_deref(), Some(head.as_str()));
+    assert_eq!(snapshot.head, changes.head);
+    assert_eq!(snapshot.upstream.as_deref(), Some("refs/heads/main"));
+    assert_eq!(snapshot.base_commit.as_deref(), Some(base.as_str()));
+    assert_eq!(snapshot.merge_base.as_deref(), Some(base.as_str()));
+    assert_eq!(snapshot.compare[0].added, Some(1));
+    assert_eq!(snapshot.compare[0].deleted, Some(1));
+    let json = serde_json::to_value(&snapshot).unwrap();
+    assert_eq!(json["detailsLoaded"], true);
+    assert_eq!(json["changesLoaded"], false);
+    assert!(!commands.iter().any(|args| args[0] == "status"), "{commands:?}");
+    for args in commands.iter().filter(|args| args[0] == "diff") {
+        assert!(args.contains(&base) && args.contains(&head), "{args:?}");
+        assert!(!args.iter().any(|arg| arg == "--cached"), "{args:?}");
+    }
+    let full = workspace(repo.cwd(), None).await.unwrap();
+    assert_eq!(serde_json::to_value(&snapshot.compare).unwrap(), serde_json::to_value(&full.compare).unwrap());
+    assert_eq!(serde_json::to_value(&snapshot.refs).unwrap(), serde_json::to_value(&full.refs).unwrap());
+    assert_eq!(snapshot.compare_unavailable_reason, full.compare_unavailable_reason);
+    assert_eq!(fs::read(repo.0.join(".git/index")).unwrap(), index_before);
+    assert_eq!(fs::read(repo.0.join("same.txt")).unwrap(), source_before);
+    assert!(workspace_with_scope(repo.cwd(), Some("refs/heads/missing"), GitWorkspaceScope::Details).await.is_err());
+    let new_head = repo.commit();
+    let fresh = workspace_with_scope(repo.cwd(), None, GitWorkspaceScope::Details).await.unwrap();
+    assert_eq!(fresh.head.as_deref(), Some(new_head.as_str()));
+    assert_ne!(fresh.head, changes.head);
+}
+
+#[tokio::test]
+async fn noncomparison_diffs_skip_all_ref_and_merge_metadata_even_with_a_supplied_base() {
+    let repo = Repo::new();
+    repo.write("same.txt", "base\n");
+    repo.commit();
+    repo.git(&["checkout", "--quiet", "-b", "feature"]);
+    repo.git(&["branch", "--set-upstream-to=main"]);
+    repo.write("same.txt", "staged\n");
+    repo.git(&["add", "--all"]);
+    repo.write("same.txt", "worktree\n");
+    repo.write("new.txt", "untracked\n");
+    let commands = GIT_COMMANDS.scope(Default::default(), async {
+        for (view, path) in [
+            (GitView::Staged, "same.txt"),
+            (GitView::Unstaged, "same.txt"),
+            (GitView::Untracked, "new.txt"),
+        ] {
+            for base in [None, Some("refs/heads/main"), Some("--not-a-comparison-ref")] {
+                let preview = repo.diff(view, path, base).await;
+                assert!(preview.head.is_some());
+                assert!(preview.base.is_none() && preview.base_commit.is_none() && preview.merge_base.is_none());
+                assert!(preview.unavailable_reason.is_none());
+            }
+        }
+        GIT_COMMANDS.with(|commands| commands.borrow().clone())
+    }).await;
+    assert!(!commands.iter().any(|args| matches!(args[0].as_str(),
+        "for-each-ref" | "merge-base" | "check-ref-format")), "{commands:?}");
+    assert!(!commands.iter().flatten().any(|arg| arg.starts_with("refs/")), "{commands:?}");
+}
+
+#[tokio::test]
+async fn repository_and_selected_diffs_never_enumerate_the_ref_catalog() {
+    let repo = Repo::new();
+    repo.write("same.txt", "base\n");
+    repo.commit();
+    repo.git(&["checkout", "--quiet", "-b", "feature"]);
+    repo.git(&["branch", "--set-upstream-to=main"]);
+    repo.write("same.txt", "commit\n");
+    repo.commit();
+    repo.write("same.txt", "staged\n");
+    repo.git(&["add", "--all"]);
+    repo.write("same.txt", "worktree\n");
+    repo.write("new.txt", "untracked\n");
+    let commands = GIT_COMMANDS
+        .scope(Default::default(), async {
+            assert!(repository(repo.cwd()).await.unwrap().is_repository);
+            assert_eq!(GIT_COMMANDS.with(|commands| commands.borrow().len()), 1);
+            for (view, path) in [
+                (GitView::Staged, "same.txt"),
+                (GitView::Unstaged, "same.txt"),
+                (GitView::Compare, "same.txt"),
+                (GitView::Untracked, "new.txt"),
+            ] {
+                repo.diff(view, path, Some("refs/heads/main")).await;
+            }
+            GIT_COMMANDS.with(|commands| commands.borrow().clone())
+        })
+        .await;
+    assert!(
+        !commands
+            .iter()
+            .any(|args| args[0] == "for-each-ref" && !args.iter().any(|arg| arg == "--count=1")),
+        "{commands:?}"
+    );
+}
+
+#[tokio::test]
+async fn lightweight_repository_probe_preserves_bare_and_invalid_directory_behavior() {
+    let bare = Repo::empty();
+    bare.git(&["init", "--bare", "--quiet"]);
+    let probe = repository(bare.cwd()).await.unwrap();
+    assert!(!probe.is_repository && probe.repo_root.is_none());
+    for scope in [GitWorkspaceScope::Changes, GitWorkspaceScope::Full, GitWorkspaceScope::Details] {
+        let state = workspace_with_scope(bare.cwd(), None, scope).await.unwrap();
+        assert_eq!(state.state, "noRepo");
+        assert_eq!(state.details_loaded, scope != GitWorkspaceScope::Changes);
+        assert_eq!(state.changes_loaded, scope != GitWorkspaceScope::Details);
+        assert!(state.warnings.iter().any(|warning| warning.contains("Bare")));
+    }
+    let missing = bare.0.join("missing");
+    assert!(repository(missing.to_str().unwrap()).await.is_err());
+}
+
+#[tokio::test]
 async fn large_ref_catalog_keeps_workspace_and_diff_usable_with_bounded_search() {
     let repo = Repo::new();
     repo.write("tracked.txt", "base\n");
@@ -33,7 +382,13 @@ async fn large_ref_catalog_keeps_workspace_and_diff_usable_with_bounded_search()
     let original = git(repo.cwd(), &["for-each-ref", "--format=%(refname)%00%(objectname)%00%(upstream)",
         "refs/heads/", "refs/remotes/"], LIST_LIMIT).await.unwrap();
     assert!(original.truncated, "fixture must reproduce the old 2 MiB failure");
+    let changes = workspace_with_scope(repo.cwd(), None, GitWorkspaceScope::Changes).await.unwrap();
+    assert!(!changes.details_loaded);
+    assert!(changes.refs.is_empty() && changes.compare.is_empty());
+    assert_eq!(changes.unstaged.len(), 1);
+    assert_eq!(changes.untracked.len(), 1);
     let state = workspace(repo.cwd(), None).await.unwrap();
+    assert!(state.details_loaded);
     assert_eq!(state.state, "repository");
     assert!(state.refs_has_more);
     assert!(state.refs.len() <= 202);
@@ -711,6 +1066,13 @@ async fn no_repository_unborn_and_detached_are_explicit() {
     let result = workspace(not_repo.cwd(), None).await.unwrap();
     assert_eq!(result.state, "noRepo");
     assert!(result.repo_root.is_none());
+    assert!(result.details_loaded);
+    assert!(
+        !workspace_with_scope(not_repo.cwd(), None, GitWorkspaceScope::Changes)
+            .await
+            .unwrap()
+            .details_loaded
+    );
     let repo = Repo::new();
     repo.write("first.txt", "first\n");
     repo.git(&["add", "--", "first.txt"]);
@@ -718,6 +1080,11 @@ async fn no_repository_unborn_and_detached_are_explicit() {
     assert!(unborn.unborn);
     assert_eq!(unborn.branch.as_deref(), Some("main"));
     assert_eq!(unborn.staged.len(), 1);
+    let changes = workspace_with_scope(repo.cwd(), None, GitWorkspaceScope::Changes)
+        .await
+        .unwrap();
+    assert!(changes.unborn && !changes.details_loaded);
+    assert_eq!(changes.staged.len(), 1);
     assert!(
         repo.diff(GitView::Staged, "first.txt", None)
             .await
@@ -735,6 +1102,11 @@ async fn no_repository_unborn_and_detached_are_explicit() {
     assert!(detached.detached);
     assert!(!detached.unborn);
     assert!(detached.head.is_some());
+    let changes = workspace_with_scope(repo.cwd(), None, GitWorkspaceScope::Changes)
+        .await
+        .unwrap();
+    assert!(changes.detached && !changes.unborn && !changes.details_loaded);
+    assert_eq!(changes.head, detached.head);
     assert!(
         detached
             .compare_unavailable_reason

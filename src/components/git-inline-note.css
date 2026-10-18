@@ -1,0 +1,48 @@
+.git-file-review.continuous.git-has-inline-note {
+  content-visibility: visible;
+}
+
+.git-inline-note {
+  position: fixed;
+  z-index: 6;
+  box-sizing: border-box;
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid var(--accent, #79c0ff);
+  border-radius: 8px;
+  color: var(--text, #e6edf3);
+  background: var(--panel, #161b22);
+  box-shadow: 0 8px 28px #0008;
+}
+
+.git-note-editor > label {
+  font-weight: 600;
+}
+
+.git-inline-note > .git-note-file {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.git-note-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.git-inline-note textarea {
+  max-height: 160px;
+}
+
+@media (max-width: 760px) {
+  .git-note-editor.git-inline-note {
+    position: static;
+    width: auto !important;
+    max-height: none !important;
+    border: 0;
+    padding: 0;
+    box-shadow: none;
+  }
+}

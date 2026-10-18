@@ -294,20 +294,16 @@ async fn dispatch(state: &DaemonState, command: &str, body: Value) -> Result<Val
         "rename_session" => json_result(service.rename_session(decode::<RenameSessionRequest>(body)?).await?),
         "git_repository" | "git_workspace" => {
             let request = decode::<GitWorkspaceArgs>(body)?;
-            let cwd = service.cwd_for(&request.session_id).await.ok_or_else(|| ServiceError::InvalidArgument(
-                "This session has no working directory.".into(),
-            ))?;
+            let cwd = service.git_cwd_for(&request.session_id, request.working_path.as_deref()).await?;
             if command == "git_repository" {
                 json_result(copilot_sessions_core::git_workspace::repository(&cwd).await.map_err(ServiceError::CommandFailed)?)
             } else {
-                json_result(copilot_sessions_core::git_workspace::workspace(&cwd, request.base.as_deref()).await.map_err(ServiceError::CommandFailed)?)
+                json_result(copilot_sessions_core::git_workspace::workspace_with_scope(&cwd, request.base.as_deref(), request.scope).await.map_err(ServiceError::CommandFailed)?)
             }
         }
         "git_diff" => {
             let request = decode::<GitDiffArgs>(body)?;
-            let cwd = service.cwd_for(&request.session_id).await.ok_or_else(|| ServiceError::InvalidArgument(
-                "This session has no working directory.".into(),
-            ))?;
+            let cwd = service.git_cwd_for(&request.session_id, request.working_path.as_deref()).await?;
             json_result(copilot_sessions_core::git_workspace::diff(&cwd,
                 copilot_sessions_core::git_workspace::GitDiffRequest {
                     view: request.view, path: request.path, base: request.base,
@@ -316,9 +312,7 @@ async fn dispatch(state: &DaemonState, command: &str, body: Value) -> Result<Val
         }
         "git_refs" => {
             let request = decode::<GitRefsArgs>(body)?;
-            let cwd = service.cwd_for(&request.session_id).await.ok_or_else(|| ServiceError::InvalidArgument(
-                "This session has no working directory.".into(),
-            ))?;
+            let cwd = service.git_cwd_for(&request.session_id, request.working_path.as_deref()).await?;
             json_result(copilot_sessions_core::git_workspace::reference_targets(&cwd, &request.query)
                 .await.map_err(ServiceError::CommandFailed)?)
         }
@@ -455,6 +449,10 @@ async fn dispatch(state: &DaemonState, command: &str, body: Value) -> Result<Val
         "context_attribution" => {
             let session_id = string_arg(&body, "sessionId")?;
             json_result(service.context_attribution(&session_id).await?)
+        }
+        "session_usage" => {
+            let session_id = string_arg(&body, "sessionId")?;
+            json_result(service.session_usage(&session_id).await?)
         }
         "reference_section" => {
             let session_id = string_arg(&body, "sessionId")?;
@@ -639,13 +637,17 @@ fn decode<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, ServiceErro
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct GitWorkspaceArgs {
     session_id: String,
+    working_path: Option<String>,
     base: Option<String>,
+    #[serde(default)]
+    scope: copilot_sessions_core::git_workspace::GitWorkspaceScope,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct GitRefsArgs {
     session_id: String,
+    working_path: Option<String>,
     query: String,
 }
 
@@ -653,6 +655,7 @@ struct GitRefsArgs {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct GitDiffArgs {
     session_id: String,
+    working_path: Option<String>,
     view: copilot_sessions_core::git_workspace::GitView,
     path: String,
     base: Option<String>,
@@ -688,6 +691,53 @@ pub fn default_bind() -> SocketAddr {
 #[cfg(test)]
 mod api_contract_tests {
     use super::*;
+
+    #[test]
+    fn git_requests_accept_explicit_paths_and_default_to_full_workspace() {
+        use copilot_sessions_core::git_workspace::{GitDiffContext, GitWorkspaceScope};
+        let path = if cfg!(windows) { r"Q:\selected\repository" } else { "/selected/repository" };
+        let default = decode::<GitWorkspaceArgs>(json!({"sessionId": "s"})).unwrap();
+        assert!(default.working_path.is_none());
+        assert_eq!(default.scope, GitWorkspaceScope::Full);
+        for (scope, expected) in [
+            ("full", GitWorkspaceScope::Full),
+            ("changes", GitWorkspaceScope::Changes),
+            ("details", GitWorkspaceScope::Details),
+        ] {
+            let request = decode::<GitWorkspaceArgs>(json!({
+                "sessionId": "s", "workingPath": path, "scope": scope, "base": "refs/heads/main",
+            })).unwrap();
+            assert_eq!(request.working_path.as_deref(), Some(path));
+            assert_eq!(request.scope, expected);
+        }
+        let refs = decode::<GitRefsArgs>(json!({
+            "sessionId": "s", "workingPath": path, "query": "main",
+        })).unwrap();
+        assert_eq!(refs.working_path.as_deref(), Some(path));
+        assert!(decode::<GitRefsArgs>(json!({"sessionId": "s", "query": ""})).unwrap().working_path.is_none());
+        let diff = decode::<GitDiffArgs>(json!({
+            "sessionId": "s", "workingPath": path, "view": "unstaged", "path": "same.txt",
+        })).unwrap();
+        assert_eq!(diff.working_path.as_deref(), Some(path));
+        assert_eq!(diff.context, GitDiffContext::Changes);
+        assert!(decode::<GitDiffArgs>(json!({
+            "sessionId": "s", "view": "unstaged", "path": "same.txt",
+        })).unwrap().working_path.is_none());
+    }
+
+    #[test]
+    fn git_requests_reject_invalid_path_types_and_workspace_scopes() {
+        for path in [json!(42), json!(false), json!([]), json!({})] {
+            assert!(decode::<GitWorkspaceArgs>(json!({"sessionId":"s", "workingPath":path})).is_err());
+            assert!(decode::<GitRefsArgs>(json!({"sessionId":"s", "workingPath":path, "query":""})).is_err());
+            assert!(decode::<GitDiffArgs>(json!({
+                "sessionId":"s", "workingPath":path, "view":"unstaged", "path":"same.txt",
+            })).is_err());
+        }
+        for scope in [json!("partial"), json!("Changes"), json!(42), json!(null)] {
+            assert!(decode::<GitWorkspaceArgs>(json!({"sessionId":"s", "scope":scope})).is_err());
+        }
+    }
 
     #[test]
     fn archive_command_requires_exact_typed_fields() {

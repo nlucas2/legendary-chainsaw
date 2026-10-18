@@ -13,6 +13,8 @@ export interface GitFile {
 
 export interface GitWorkspace {
   state: "repository" | "noRepo";
+  detailsLoaded?: boolean;
+  changesLoaded?: boolean;
   repoRoot: string | null;
   branch: string | null;
   head: string | null;
@@ -36,6 +38,12 @@ export interface GitReferences {
   refs: GitWorkspace["refs"];
   hasMore: boolean;
   warnings: string[];
+}
+
+export function gitDirectoryIdentity(value: string): string {
+  return /^[a-z]:[\\/]|^\\\\/i.test(value)
+    ? value.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase()
+    : value.replace(/\/+$/, "") || "/";
 }
 
 export function normalizeGitReferences(value: unknown): GitReferences {

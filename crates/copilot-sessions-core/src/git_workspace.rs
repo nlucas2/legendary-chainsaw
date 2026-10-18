@@ -1,4 +1,4 @@
-//! Read-only, local Git inspection. Callers must resolve CWD from the session service.
+//! Read-only, local Git inspection of a session CWD or an explicitly selected directory.
 use std::{
     collections::HashMap,
     path::{Component, Path},
@@ -15,10 +15,15 @@ const PATCH_LINES: usize = 2500;
 const FILE_LIMIT: usize = 4000;
 const TIMEOUT: Duration = Duration::from_secs(15);
 
-#[path = "git_untracked.rs"]
-mod untracked;
+#[cfg(test)]
+tokio::task_local! {
+    static GIT_COMMANDS: std::cell::RefCell<Vec<Vec<String>>>;
+}
+
 #[path = "git_refs.rs"]
 mod refs;
+#[path = "git_untracked.rs"]
+mod untracked;
 pub use refs::{GitReferences, reference_targets};
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -36,6 +41,15 @@ pub enum GitDiffContext {
     #[default]
     Changes,
     Full,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum GitWorkspaceScope {
+    #[default]
+    Full,
+    Changes,
+    Details,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,9 +81,11 @@ pub struct GitFile {
     pub binary: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitWorkspace {
+    pub details_loaded: bool,
+    pub changes_loaded: bool,
     pub state: String,
     pub repo_root: Option<String>,
     pub branch: Option<String>,
@@ -157,6 +173,12 @@ async fn run_git_output(
     filter_keys: &[String],
     ref_query: Option<&str>,
 ) -> Result<Output, String> {
+    #[cfg(test)]
+    let _ = GIT_COMMANDS.try_with(|commands| {
+        commands
+            .borrow_mut()
+            .push(args.iter().map(|arg| (*arg).to_owned()).collect());
+    });
     let mut command = Command::new("git");
     #[cfg(windows)]
     command.creation_flags(0x0800_0000);
@@ -226,11 +248,8 @@ async fn run_git_output(
                 None => bounded_read(stdout, limit).await,
             }
         });
-        let (status, stdout, stderr) = tokio::try_join!(
-            child.wait(),
-            read_stdout,
-            bounded_read(stderr, 32 * 1024)
-        )?;
+        let (status, stdout, stderr) =
+            tokio::try_join!(child.wait(), read_stdout, bounded_read(stderr, 32 * 1024))?;
         Ok::<_, std::io::Error>((status, stdout, stderr))
     };
     match tokio::time::timeout(TIMEOUT, execution).await {
@@ -388,8 +407,85 @@ fn invalid_windows_component(part: &str) -> bool {
         || part.eq_ignore_ascii_case("git~1")
 }
 
-async fn metadata(cwd: &str, requested_base: Option<&str>) -> Result<GitWorkspace, String> {
+/// Explicit paths are daemon-local, absolute directories, never session CWD updates.
+pub async fn working_directory(
+    session_cwd: Option<&str>,
+    working_path: Option<&str>,
+) -> Result<String, String> {
+    let Some(path) = working_path else {
+        return session_cwd
+            .map(str::to_owned)
+            .ok_or("This session has no working directory.".into());
+    };
+    if path.is_empty() || path.contains('\0') || !Path::new(path).is_absolute() {
+        return Err("Git workingPath must be an absolute directory path.".into());
+    }
+    let canonical = tokio::fs::canonicalize(path)
+        .await
+        .map_err(|error| format!("Cannot resolve Git workingPath: {error}"))?;
+    if !tokio::fs::metadata(&canonical)
+        .await
+        .map_err(|error| format!("Cannot inspect Git workingPath: {error}"))?
+        .is_dir()
+    {
+        return Err("Git workingPath must be a directory.".into());
+    }
+    canonical
+        .into_os_string()
+        .into_string()
+        .map_err(|_| "Git workingPath is not valid UTF-8.".into())
+}
+
+async fn repository_root(cwd: &str) -> Result<(Option<String>, Vec<String>), String> {
+    let probe = git(
+        cwd,
+        &["rev-parse", "--is-inside-work-tree", "--show-toplevel"],
+        16 * 1024,
+    )
+    .await?;
+    if probe.truncated {
+        return Err("Repository root exceeds the inspection limit.".into());
+    }
+    if probe.code != Some(0) && probe.stderr.contains("not a git repository") {
+        return Ok((
+            None,
+            vec![
+                "The selected directory is not in a Git working tree.".into(),
+                probe.stderr,
+            ],
+        ));
+    }
+    // --show-toplevel fails for bare repositories, but the first probe identifies them.
+    if text(&probe.stdout)?.starts_with("false\n") {
+        return Ok((
+            None,
+            vec![
+                "Bare repositories are not supported; select a directory in a working tree.".into(),
+            ],
+        ));
+    }
+    let probe = checked(probe)?;
+    let root = text(&probe.stdout)?
+        .strip_prefix("true\n")
+        .ok_or("Cannot parse Git repository root.")?;
+    let root = line(root.as_bytes())?;
+    if root.is_empty() {
+        return Err("Git returned an empty repository root.".into());
+    }
+    Ok((
+        Some(root),
+        if probe.stderr.is_empty() {
+            vec![]
+        } else {
+            vec![probe.stderr]
+        },
+    ))
+}
+
+async fn identity(cwd: &str) -> Result<GitWorkspace, String> {
     let mut workspace = GitWorkspace {
+        details_loaded: false,
+        changes_loaded: false,
         state: "noRepo".into(),
         repo_root: None,
         branch: None,
@@ -409,43 +505,19 @@ async fn metadata(cwd: &str, requested_base: Option<&str>) -> Result<GitWorkspac
         compare_unavailable_reason: None,
         warnings: vec![],
     };
-    let probe = git(cwd, &["rev-parse", "--is-inside-work-tree"], 4096).await?;
-    if probe.code != Some(0) {
-        if probe.stderr.contains("not a git repository") {
-            workspace
-                .warnings
-                .push("The session directory is not in a Git working tree.".into());
-            workspace.warnings.push(probe.stderr);
-            return Ok(workspace);
-        }
-        checked(probe)?;
-        unreachable!();
-    }
-    if !probe.stderr.is_empty() {
-        workspace.warnings.push(probe.stderr);
-    }
-    if line(&probe.stdout)? != "true" {
-        workspace.warnings.push(
-            "Bare repositories are not supported; select a session in a working tree.".into(),
-        );
+    (workspace.repo_root, workspace.warnings) = repository_root(cwd).await?;
+    let Some(root) = workspace.repo_root.as_deref() else {
         return Ok(workspace);
-    }
+    };
     workspace.state = "repository".into();
-    workspace.repo_root = Some(line(
-        &listing(
-            cwd,
-            &["rev-parse", "--show-toplevel"],
-            &mut workspace.warnings,
-        )
-        .await?,
-    )?);
-    let root = workspace.repo_root.as_deref().unwrap();
-    let branch = git(
-        root,
-        &["symbolic-ref", "--quiet", "--short", "HEAD"],
-        16 * 1024,
-    )
-    .await?;
+    let (branch, head) = tokio::try_join!(
+        git(root, &["symbolic-ref", "--quiet", "HEAD"], 16 * 1024),
+        git(
+            root,
+            &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+            4096
+        ),
+    )?;
     if branch.truncated {
         return Err("Git branch name exceeds the inspection limit.".into());
     }
@@ -453,18 +525,22 @@ async fn metadata(cwd: &str, requested_base: Option<&str>) -> Result<GitWorkspac
         workspace.warnings.push(branch.stderr.clone());
     }
     match branch.code {
-        Some(0) => workspace.branch = Some(line(&branch.stdout)?),
+        Some(0) => {
+            workspace.branch = Some(
+                line(&branch.stdout)?
+                    .strip_prefix("refs/heads/")
+                    .ok_or("Git HEAD does not identify a local branch.")?
+                    .to_owned(),
+            );
+        }
         Some(1) if branch.stderr.is_empty() => workspace.detached = true,
         _ => {
             checked(branch)?;
         }
     }
-    let head = git(
-        root,
-        &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
-        4096,
-    )
-    .await?;
+    if head.truncated {
+        return Err("Git HEAD object ID exceeds the inspection limit.".into());
+    }
     if head.code == Some(0) && !head.stderr.is_empty() {
         workspace.warnings.push(head.stderr.clone());
     }
@@ -481,16 +557,34 @@ async fn metadata(cwd: &str, requested_base: Option<&str>) -> Result<GitWorkspac
             checked(head)?;
         }
     }
-    let targets = refs::list(root, "").await?;
-    workspace.refs = targets.refs;
-    workspace.refs_has_more = targets.has_more;
-    workspace.warnings.extend(targets.warnings);
+    Ok(workspace)
+}
+
+async fn comparison_metadata(
+    mut workspace: GitWorkspace,
+    requested_base: Option<&str>,
+) -> Result<GitWorkspace, String> {
+    let Some(root) = workspace.repo_root.clone() else {
+        return Ok(workspace);
+    };
+    let root = root.as_str();
     if let Some(branch) = &workspace.branch {
         let full_name = format!("refs/heads/{branch}");
-        let upstream = listing(root, &["for-each-ref", "--count=1", "--format=%(upstream)", &full_name],
-            &mut workspace.warnings).await?;
+        let upstream = listing(
+            root,
+            &[
+                "for-each-ref",
+                "--count=1",
+                "--format=%(upstream)",
+                &full_name,
+            ],
+            &mut workspace.warnings,
+        )
+        .await?;
         let upstream = line(&upstream)?;
-        if !upstream.is_empty() { workspace.upstream = Some(upstream); }
+        if !upstream.is_empty() {
+            workspace.upstream = Some(upstream);
+        }
     }
     if let Some(base) = requested_base {
         let reference = refs::resolve(root, base, &mut workspace.warnings).await?
@@ -506,7 +600,13 @@ async fn metadata(cwd: &str, requested_base: Option<&str>) -> Result<GitWorkspac
         }
     }
     if let (Some(branch), Some(head)) = (&workspace.branch, &workspace.head) {
-        refs::include(&mut workspace.refs, GitRef { name: format!("refs/heads/{branch}"), commit: head.clone() });
+        refs::include(
+            &mut workspace.refs,
+            GitRef {
+                name: format!("refs/heads/{branch}"),
+                commit: head.clone(),
+            },
+        );
     }
     workspace.compare_unavailable_reason = if workspace.head.is_none() {
         Some(
@@ -549,6 +649,37 @@ async fn metadata(cwd: &str, requested_base: Option<&str>) -> Result<GitWorkspac
             }
         }
     };
+    Ok(workspace)
+}
+
+async fn details(
+    workspace: GitWorkspace,
+    base: Option<&str>,
+    include_refs: bool,
+) -> Result<GitWorkspace, String> {
+    let Some(root) = workspace.repo_root.clone() else {
+        return Ok(GitWorkspace {
+            details_loaded: true,
+            ..workspace
+        });
+    };
+    let targets = async {
+        if include_refs {
+            refs::list(&root, "").await.map(Some)
+        } else {
+            Ok(None)
+        }
+    };
+    let (mut workspace, targets) = tokio::try_join!(comparison_metadata(workspace, base), targets)?;
+    if let Some(mut targets) = targets {
+        for reference in workspace.refs {
+            refs::include(&mut targets.refs, reference);
+        }
+        workspace.refs = targets.refs;
+        workspace.refs_has_more = targets.has_more;
+        workspace.warnings.extend(targets.warnings);
+    }
+    workspace.details_loaded = true;
     Ok(workspace)
 }
 
@@ -744,6 +875,17 @@ async fn diff_listing(
     .await
 }
 
+async fn diff_listing_result(
+    root: &str,
+    metadata: &GitWorkspace,
+    view: GitView,
+    format: &str,
+) -> Result<(Vec<u8>, Vec<String>), String> {
+    let mut warnings = vec![];
+    let bytes = diff_listing(root, metadata, view, format, &mut warnings).await?;
+    Ok((bytes, warnings))
+}
+
 fn apply_numstat(files: &mut [GitFile], bytes: &[u8]) -> Result<(), String> {
     let mut records = bytes
         .split(|byte| *byte == 0)
@@ -789,7 +931,7 @@ fn apply_numstat(files: &mut [GitFile], bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// Inspect the repository discovered from the authoritative session CWD.
+/// Inspect only the working-tree root, without loading HEAD, refs or file changes.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitRepository {
@@ -798,37 +940,23 @@ pub struct GitRepository {
 }
 
 pub async fn repository(cwd: &str) -> Result<GitRepository, String> {
-    let probe = git(cwd, &["rev-parse", "--is-inside-work-tree"], 4096).await?;
-    if probe.code != Some(0) && probe.stderr.contains("not a git repository") {
-        return Ok(GitRepository {
-            is_repository: false,
-            repo_root: None,
-        });
-    }
-    let probe = checked(probe)?;
-    if line(&probe.stdout)? != "true" {
-        return Ok(GitRepository {
-            is_repository: false,
-            repo_root: None,
-        });
-    }
-    let root = checked(git(cwd, &["rev-parse", "--show-toplevel"], 16 * 1024).await?)?;
-    if root.truncated {
-        return Err("Repository root exceeds the inspection limit.".into());
-    }
+    let (repo_root, _) = repository_root(cwd).await?;
     Ok(GitRepository {
-        is_repository: true,
-        repo_root: Some(line(&root.stdout)?),
+        is_repository: repo_root.is_some(),
+        repo_root,
     })
 }
 
 pub async fn workspace(cwd: &str, base: Option<&str>) -> Result<GitWorkspace, String> {
-    let mut metadata = metadata(cwd, base).await?;
-    let Some(root) = metadata.repo_root.clone() else {
-        return Ok(metadata);
-    };
+    workspace_with_scope(cwd, base, GitWorkspaceScope::Full).await
+}
+
+async fn status_files(
+    root: &str,
+) -> Result<(Vec<GitFile>, Vec<GitFile>, Vec<GitFile>, Vec<String>), String> {
+    let mut warnings = vec![];
     let status = listing(
-        &root,
+        root,
         &[
             "status",
             "--porcelain=v2",
@@ -836,42 +964,94 @@ pub async fn workspace(cwd: &str, base: Option<&str>) -> Result<GitWorkspace, St
             "--untracked-files=all",
             "--ignore-submodules=dirty",
         ],
-        &mut metadata.warnings,
+        &mut warnings,
     )
     .await?;
-    (metadata.staged, metadata.unstaged, metadata.untracked) = parse_status(&status)?;
+    let (staged, unstaged, untracked) = parse_status(&status)?;
+    Ok((staged, unstaged, untracked, warnings))
+}
+
+async fn file_stats(
+    root: &str,
+    metadata: &GitWorkspace,
+    view: GitView,
+    mut files: Vec<GitFile>,
+) -> Result<(Vec<GitFile>, Vec<String>), String> {
     let mut warnings = vec![];
-    let staged = diff_listing(
-        &root,
-        &metadata,
-        GitView::Staged,
-        "--numstat",
-        &mut warnings,
-    )
-    .await?;
-    let unstaged = diff_listing(
-        &root,
-        &metadata,
-        GitView::Unstaged,
-        "--numstat",
-        &mut warnings,
-    )
-    .await?;
-    apply_numstat(&mut metadata.staged, &staged)?;
-    apply_numstat(&mut metadata.unstaged, &unstaged)?;
-    if metadata.merge_base.is_some() {
-        metadata.compare = parse_raw(
-            &diff_listing(&root, &metadata, GitView::Compare, "--raw", &mut warnings).await?,
+    if !files.is_empty() {
+        let stats = diff_listing(root, metadata, view, "--numstat", &mut warnings).await?;
+        apply_numstat(&mut files, &stats)?;
+    }
+    Ok((files, warnings))
+}
+
+async fn working_changes(
+    root: &str,
+    metadata: &GitWorkspace,
+    include_stats: bool,
+) -> Result<(Vec<GitFile>, Vec<GitFile>, Vec<GitFile>, Vec<String>), String> {
+    let (mut staged, mut unstaged, untracked, mut warnings) = status_files(root).await?;
+    if include_stats {
+        let ((staged_files, staged_warnings), (unstaged_files, unstaged_warnings)) = tokio::try_join!(
+            file_stats(root, metadata, GitView::Staged, staged),
+            file_stats(root, metadata, GitView::Unstaged, unstaged),
         )?;
-        let stats = diff_listing(
-            &root,
-            &metadata,
-            GitView::Compare,
-            "--numstat",
-            &mut warnings,
-        )
-        .await?;
+        staged = staged_files;
+        unstaged = unstaged_files;
+        warnings.extend(staged_warnings);
+        warnings.extend(unstaged_warnings);
+    }
+    Ok((staged, unstaged, untracked, warnings))
+}
+
+/// Changes omit details/counts; details omit local changes. Full loads both by default.
+pub async fn workspace_with_scope(
+    cwd: &str,
+    base: Option<&str>,
+    scope: GitWorkspaceScope,
+) -> Result<GitWorkspace, String> {
+    let mut metadata = identity(cwd).await?;
+    let Some(root) = metadata.repo_root.clone() else {
+        metadata.details_loaded = scope != GitWorkspaceScope::Changes;
+        metadata.changes_loaded = scope != GitWorkspaceScope::Details;
+        return Ok(metadata);
+    };
+    let load_details = async {
+        if scope != GitWorkspaceScope::Changes {
+            details(metadata.clone(), base, true).await
+        } else {
+            Ok(metadata.clone())
+        }
+    };
+    let load_changes = async {
+        if scope == GitWorkspaceScope::Details {
+            Ok((vec![], vec![], vec![], vec![]))
+        } else {
+            working_changes(&root, &metadata, scope == GitWorkspaceScope::Full).await
+        }
+    };
+    let (loaded, (staged, unstaged, untracked, mut warnings)) = tokio::try_join!(
+        load_details,
+        load_changes,
+    )?;
+    metadata = loaded;
+    metadata.changes_loaded = scope != GitWorkspaceScope::Details;
+    metadata.staged = staged;
+    metadata.unstaged = unstaged;
+    metadata.untracked = untracked;
+    if scope == GitWorkspaceScope::Changes {
+        metadata.warnings.extend(warnings);
+        return Ok(metadata);
+    }
+    if metadata.merge_base.is_some() {
+        let ((raw, raw_warnings), (stats, stat_warnings)) = tokio::try_join!(
+            diff_listing_result(&root, &metadata, GitView::Compare, "--raw"),
+            diff_listing_result(&root, &metadata, GitView::Compare, "--numstat"),
+        )?;
+        metadata.compare = parse_raw(&raw)?;
         apply_numstat(&mut metadata.compare, &stats)?;
+        warnings.extend(raw_warnings);
+        warnings.extend(stat_warnings);
     }
     metadata.warnings.extend(warnings);
     let mut seen = std::collections::HashSet::new();
@@ -903,28 +1083,23 @@ async fn reject_linked_parents(root: &str, path: &str) -> Result<(), String> {
 /// Return only a currently changed, explicitly selected file.
 pub async fn diff(cwd: &str, request: GitDiffRequest) -> Result<GitDiff, String> {
     validate_path(&request.path)?;
-    let mut metadata = metadata(cwd, request.base.as_deref()).await?;
+    let metadata = identity(cwd).await?;
     let root = metadata
         .repo_root
         .clone()
         .ok_or("The session is not in a Git working tree.")?;
+    // Ref and merge metadata are needed only for committed comparisons.
+    let mut metadata = if request.view == GitView::Compare {
+        details(metadata, request.base.as_deref(), false).await?
+    } else {
+        metadata
+    };
     let mut warnings = vec![];
     let mut files = if request.view == GitView::Compare {
         parse_raw(&diff_listing(&root, &metadata, request.view, "--raw", &mut warnings).await?)?
     } else {
-        let status = listing(
-            &root,
-            &[
-                "status",
-                "--porcelain=v2",
-                "-z",
-                "--untracked-files=all",
-                "--ignore-submodules=dirty",
-            ],
-            &mut warnings,
-        )
-        .await?;
-        let (staged, unstaged, untracked) = parse_status(&status)?;
+        let (staged, unstaged, untracked, status_warnings) = status_files(&root).await?;
+        warnings.extend(status_warnings);
         match request.view {
             GitView::Staged => staged,
             GitView::Unstaged => unstaged,
@@ -1005,14 +1180,20 @@ pub async fn diff(cwd: &str, request: GitDiffRequest) -> Result<GitDiff, String>
             args.push(original.clone());
         }
         args.push(file.path.clone());
-        let output = checked(
-            git(
-                &root,
-                &args.iter().map(String::as_str).collect::<Vec<_>>(),
-                PATCH_LIMIT,
-            )
-            .await?,
+        let mut stat_args = diff_args(request.view, &metadata)?;
+        stat_args.extend(["--numstat".into(), "-z".into(), "--".into()]);
+        if let Some(original) = &file.original_path {
+            stat_args.push(original.clone());
+        }
+        stat_args.push(file.path.clone());
+        let patch_args = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let stat_args = stat_args.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut stat_warnings = vec![];
+        let (output, stats) = tokio::try_join!(
+            git(&root, &patch_args, PATCH_LIMIT),
+            listing(&root, &stat_args, &mut stat_warnings),
         )?;
+        let output = checked(output)?;
         if !output.stderr.is_empty() {
             warnings.push(output.stderr);
         }
@@ -1056,18 +1237,7 @@ pub async fn diff(cwd: &str, request: GitDiffRequest) -> Result<GitDiff, String>
         if result.truncated {
             warnings.push("Diff preview truncated at 192 KiB or 2500 lines. The rest is not loaded or sent to the model.".into());
         }
-        let mut stat_args = diff_args(request.view, &metadata)?;
-        stat_args.extend(["--numstat".into(), "-z".into(), "--".into()]);
-        if let Some(original) = &file.original_path {
-            stat_args.push(original.clone());
-        }
-        stat_args.push(file.path.clone());
-        let stats = listing(
-            &root,
-            &stat_args.iter().map(String::as_str).collect::<Vec<_>>(),
-            &mut warnings,
-        )
-        .await?;
+        warnings.extend(stat_warnings);
         apply_numstat(std::slice::from_mut(file), &stats)?;
         result.added = file.added;
         result.deleted = file.deleted;

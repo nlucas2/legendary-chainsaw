@@ -1,5 +1,5 @@
 import {
-  diffIdentity, gitContextSnapshot, gitViewLabels, visiblePath,
+  diffIdentity, gitContextSnapshot, gitDirectoryIdentity, gitViewLabels, visiblePath,
   type DiffLine, type GitComment, type GitDiff, type GitView, type GitWorkspace,
 } from "./gitWorkspace.ts";
 import { validateReviewContext, type ReviewChatContext } from "./reviewChat.ts";
@@ -29,9 +29,7 @@ export function savedGitIdentity(comment: GitComment): SavedGitIdentity | null {
 }
 
 export function sameGitRepository(left: string, right: string): boolean {
-  const normalize = (value: string) => /^[a-z]:[\\/]|^\\\\/i.test(value)
-    ? value.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase() : value.replace(/\/+$/, "") || "/";
-  return normalize(left) === normalize(right);
+  return gitDirectoryIdentity(left) === gitDirectoryIdentity(right);
 }
 
 export function repositoryNotes(comments: GitComment[], repository: string) {
@@ -44,10 +42,13 @@ export function repositoryNotes(comments: GitComment[], repository: string) {
 export function noteSnapshotWarnings(identity: SavedGitIdentity, workspace: GitWorkspace): string[] {
   const warnings = ["Saved snapshot; current file contents have not been revalidated."];
   if (identity.head !== workspace.head) warnings.push("HEAD differs from the saved snapshot.");
-  if (identity.view === "compare" && (identity.baseCommit !== workspace.baseCommit || identity.mergeBase !== workspace.mergeBase)) {
+  const comparisonPending = identity.view === "compare" && workspace.detailsLoaded === false;
+  if (comparisonPending) {
+    warnings.push("Comparison metadata is not loaded; this saved comparison has not been revalidated.");
+  } else if (identity.view === "compare" && (identity.baseCommit !== workspace.baseCommit || identity.mergeBase !== workspace.mergeBase)) {
     warnings.push("The comparison target differs from the saved snapshot.");
   }
-  if (![...workspace.staged, ...workspace.unstaged, ...workspace.untracked, ...workspace.compare]
+  if (!comparisonPending && ![...workspace.staged, ...workspace.unstaged, ...workspace.untracked, ...workspace.compare]
     .some((file) => file.path === identity.path)) warnings.push("This file is not listed in the current changes.");
   return warnings;
 }

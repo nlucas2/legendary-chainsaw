@@ -6,6 +6,9 @@ import {
   type GitComment, type GitDiff, type GitReferences, type GitView, type GitWorkspace,
 } from "../lib/gitWorkspace";
 import { createGitDiffLoader } from "../lib/gitDiffLoader";
+import { addGitWorkingPath, GIT_WORKING_PATHS_KEY, loadGitWorkingPaths, saveGitWorkingPaths,
+  validateGitWorkingPath, type GitWorkingPaths } from "../lib/gitWorkingPaths";
+import { applyGitPreviewCounts, cachedGitWorkspace, cacheGitWorkspace, gitWorkspaceCacheKey, mergeGitWorkspaceDetails } from "../lib/gitWorkspaceLoading";
 import { GitFileReview } from "./GitFileReview";
 import { GitDiffFeed, type GitDiffNavigation } from "./GitDiffFeed";
 import { GitReviewNotes } from "./GitReviewNotes";
@@ -21,7 +24,99 @@ export interface GitPanelProps {
 }
 
 export function GitPanel(props: GitPanelProps) {
-  return <WorkspacePanel key={JSON.stringify([props.sessionId, props.cwd])} {...props} />;
+  const opener = useRef(document.activeElement);
+  useEffect(() => () => {
+    const previous = opener.current;
+    if (previous instanceof HTMLElement && previous.isConnected) previous.focus();
+  }, []);
+  return <WorkingPathsPanel key={props.sessionId} {...props} />;
+}
+
+function WorkingPathsPanel(props: GitPanelProps) {
+  const [initial] = useState((): { config: GitWorkingPaths; error: string } => {
+    try { return { config: loadGitWorkingPaths(localStorage, props.sessionId), error: "" }; }
+    catch (cause) { return { config: { paths: [], selectedPath: null }, error: String(cause) }; }
+  });
+  const [config, setConfig] = useState(initial.config);
+  const configRef = useRef(initial.config);
+  const [pathError, setPathError] = useState(initial.error);
+  const [unreadable, setUnreadable] = useState(!!initial.error);
+  const [adding, setAdding] = useState(false);
+  const [draftStore] = useState(() => new Map<string, string>());
+  const check = useRef<AbortController | null>(null);
+  const focusPath = useRef(false);
+  useEffect(() => () => check.current?.abort(), []);
+  useEffect(() => {
+    if (!focusPath.current) return;
+    focusPath.current = false;
+    document.querySelector<HTMLSelectElement>('[role="dialog"][aria-label="Git workspace"] [aria-label="Git working path"]')
+      ?.focus({ preventScroll: true });
+  }, [config.selectedPath]);
+  function reloadPaths() {
+    try {
+      const next = loadGitWorkingPaths(localStorage, props.sessionId);
+      configRef.current = next;
+      setConfig(next);
+      setPathError(""); setUnreadable(false);
+    } catch (cause) { setPathError(String(cause)); setUnreadable(true); }
+  }
+  useEffect(() => {
+    const read = (event: StorageEvent) => {
+      if (event.key === null || event.key === GIT_WORKING_PATHS_KEY + props.sessionId) reloadPaths();
+    };
+    window.addEventListener("storage", read);
+    return () => window.removeEventListener("storage", read);
+  }, [props.sessionId]);
+  function changePaths(next: GitWorkingPaths) {
+    if (unreadable) return;
+    configRef.current = next;
+    setConfig(next);
+    try { saveGitWorkingPaths(localStorage, props.sessionId, next); setPathError(""); }
+    catch (cause) { setPathError(`Working paths changed in this window but could not be saved: ${String(cause)}`); }
+  }
+  async function addPath(value: string): Promise<boolean> {
+    if (check.current || adding || unreadable) return false;
+    const controller = new AbortController();
+    check.current = controller;
+    setAdding(true); setPathError("");
+    try {
+      const path = validateGitWorkingPath(value);
+      addGitWorkingPath(configRef.current, path);
+      const result = await daemonInvoke<{ isRepository: boolean }>("git_repository", {
+        sessionId: props.sessionId, workingPath: path,
+      }, controller.signal);
+      if (typeof result.isRepository !== "boolean") throw new Error("Git discovery returned no repository status.");
+      if (!result.isRepository) throw new Error("This working directory is not in a Git working tree.");
+      if (controller.signal.aborted) return false;
+      const next = addGitWorkingPath(configRef.current, path);
+      focusPath.current = next.selectedPath !== configRef.current.selectedPath;
+      changePaths(next);
+      return true;
+    } catch (cause) {
+      if (!controller.signal.aborted) setPathError(String(cause));
+      return false;
+    } finally {
+      if (check.current === controller) check.current = null;
+      if (!controller.signal.aborted) setAdding(false);
+    }
+  }
+  const effectivePath = config.selectedPath ?? props.cwd;
+  return <WorkspacePanel key={JSON.stringify([props.sessionId, effectivePath])} {...props}
+    draftStore={draftStore}
+    workingPath={config.selectedPath} workingPaths={config.paths} pathsError={pathError}
+    pathsUnreadable={unreadable} addingPath={adding} onReloadPaths={reloadPaths}
+    onWorkingPathChange={(selectedPath) => {
+      if (selectedPath !== null && !configRef.current.paths.includes(selectedPath)) {
+        setPathError("That working path was removed in another window. Choose another directory.");
+        return;
+      }
+      focusPath.current = selectedPath !== configRef.current.selectedPath;
+      changePaths({ ...configRef.current, selectedPath });
+    }}
+    onAddPath={addPath} onRemovePath={() => changePaths({
+      paths: configRef.current.paths.filter((path) => path !== config.selectedPath),
+      selectedPath: configRef.current.selectedPath === config.selectedPath ? null : configRef.current.selectedPath,
+    })} />;
 }
 
 function useCompactGit() {
@@ -46,9 +141,24 @@ function mobileFileLabel(path: string) {
     : `${visiblePath(path.slice(separator + 1))} — ${visiblePath(path.slice(0, separator))}`;
 }
 
-function WorkspacePanel({ sessionId, cwd, onClose, onAsk, onDiscuss }: GitPanelProps) {
+interface WorkspacePanelProps extends GitPanelProps {
+  draftStore: Map<string, string>;
+  workingPath: string | null;
+  workingPaths: string[];
+  pathsError: string;
+  pathsUnreadable: boolean;
+  addingPath: boolean;
+  onReloadPaths: () => void;
+  onWorkingPathChange: (path: string | null) => void;
+  onAddPath: (path: string) => Promise<boolean>;
+  onRemovePath: () => void;
+}
+
+function WorkspacePanel({ sessionId, cwd, onClose, onAsk, onDiscuss, workingPath, workingPaths,
+  pathsError, pathsUnreadable, addingPath, onReloadPaths, onWorkingPathChange, onAddPath, onRemovePath, draftStore }: WorkspacePanelProps) {
   const compact = useCompactGit();
-  const [workspace, setWorkspace] = useState<GitWorkspace | null>(null);
+  const selectedCwd = workingPath ?? cwd;
+  const [workspace, setWorkspace] = useState<GitWorkspace | null>(() => cachedGitWorkspace(gitWorkspaceCacheKey(sessionId, selectedCwd, "")));
   const [base, setBase] = useState("");
   const [refQuery, setRefQuery] = useState("");
   const [refResults, setRefResults] = useState<GitReferences | null>(null);
@@ -60,8 +170,12 @@ function WorkspacePanel({ sessionId, cwd, onClose, onAsk, onDiscuss }: GitPanelP
   const [layout, setLayout] = useState<"file" | "continuous">("file");
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [navigation, setNavigation] = useState<GitDiffNavigation | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [detailsLoading, setDetailsLoading] = useState(false);
+  const [detailsError, setDetailsError] = useState("");
+  const [detailsRevision, setDetailsRevision] = useState(0);
+  const [newWorkingPath, setNewWorkingPath] = useState("");
   const [comments, setComments] = useState<GitComment[]>([]);
   const [commentError, setCommentError] = useState("");
   const [loadDiff] = useState(() => createGitDiffLoader<GitDiff>());
@@ -71,9 +185,7 @@ function WorkspacePanel({ sessionId, cwd, onClose, onAsk, onDiscuss }: GitPanelP
   const options = useRef<HTMLDetailsElement>(null);
 
   useEffect(() => {
-    const previous = document.activeElement;
     panel.current?.focus();
-    return () => { if (previous instanceof HTMLElement && previous.isConnected) previous.focus(); };
   }, []);
   useEffect(() => {
     const element = panel.current;
@@ -98,28 +210,60 @@ function WorkspacePanel({ sessionId, cwd, onClose, onAsk, onDiscuss }: GitPanelP
     const controller = new AbortController();
     setLoading(true);
     setError("");
-    setWorkspace(null);
+    setDetailsError("");
+    const key = gitWorkspaceCacheKey(sessionId, selectedCwd, base);
+    setWorkspace(cachedGitWorkspace(key));
     setSelectedPath(null);
     setNavigation(null);
-    void daemonInvoke<GitWorkspace>("git_workspace", { sessionId, ...(base ? { base } : {}) }, controller.signal)
-      .then((result) => { if (!controller.signal.aborted) setWorkspace(result); })
+    void daemonInvoke<GitWorkspace>("git_workspace", {
+      sessionId, scope: "changes", ...(workingPath ? { workingPath } : {}), ...(base ? { base } : {}),
+    }, controller.signal)
+      .then((result) => {
+        if (!controller.signal.aborted) { cacheGitWorkspace(key, result); setWorkspace(result); }
+      })
       .catch((cause) => { if (!controller.signal.aborted) setError(String(cause)); })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
-  }, [sessionId, cwd, base, revision]);
+  }, [sessionId, selectedCwd, workingPath, base, revision]);
+  useEffect(() => {
+    if (loading || workspace?.state !== "repository" || workspace.detailsLoaded !== false) {
+      setDetailsLoading(false);
+      return;
+    }
+    const changes = workspace;
+    const controller = new AbortController();
+    const key = gitWorkspaceCacheKey(sessionId, selectedCwd, base);
+    setDetailsLoading(true); setDetailsError("");
+    void daemonInvoke<GitWorkspace>("git_workspace", {
+      sessionId, scope: "details", ...(workingPath ? { workingPath } : {}), ...(base ? { base } : {}),
+    }, controller.signal).then((result) => {
+      if (controller.signal.aborted) return;
+      const merged = mergeGitWorkspaceDetails(changes, result);
+      cacheGitWorkspace(key, merged);
+      setWorkspace((current) => {
+        if (!current || current.state !== "repository" || current.repoRoot !== changes.repoRoot
+          || current.head !== changes.head || current.branch !== changes.branch) return current;
+        return mergeGitWorkspaceDetails(current, result);
+      });
+    }).catch((cause) => {
+      if (!controller.signal.aborted) setDetailsError(String(cause));
+    }).finally(() => { if (!controller.signal.aborted) setDetailsLoading(false); });
+    return () => controller.abort();
+  }, [sessionId, selectedCwd, workingPath, base, revision, detailsRevision, loading,
+    workspace?.state, workspace?.detailsLoaded, workspace?.repoRoot, workspace?.head, workspace?.branch]);
   useEffect(() => {
     setRefResults(null); setRefError("");
     if (!refQuery.trim() || !workspace?.refsHasMore) { setRefLoading(false); return; }
     const controller = new AbortController();
     setRefLoading(true);
     const timer = setTimeout(() => {
-      void daemonInvoke<unknown>("git_refs", { sessionId, query: refQuery.trim() }, controller.signal)
+      void daemonInvoke<unknown>("git_refs", { sessionId, query: refQuery.trim(), ...(workingPath ? { workingPath } : {}) }, controller.signal)
         .then((value) => { if (!controller.signal.aborted) setRefResults(normalizeGitReferences(value)); })
         .catch((cause) => { if (!controller.signal.aborted) setRefError(String(cause)); })
         .finally(() => { if (!controller.signal.aborted) setRefLoading(false); });
     }, 250);
     return () => { controller.abort(); clearTimeout(timer); };
-  }, [sessionId, cwd, refQuery, workspace?.refsHasMore, revision, refRevision]);
+  }, [sessionId, selectedCwd, workingPath, refQuery, workspace?.refsHasMore, revision, refRevision]);
 
   const fileViews = useMemo(() => ({
     staged: gitFilesForView(workspace, "staged"),
@@ -129,7 +273,10 @@ function WorkspacePanel({ sessionId, cwd, onClose, onAsk, onDiscuss }: GitPanelP
   }), [workspace]);
   const files = fileViews[view];
   const targets = useMemo(() => {
-    const refs = refQuery.trim() && workspace?.refsHasMore ? refResults?.refs ?? [] : workspace?.refs ?? [];
+    const query = refQuery.trim().toLowerCase();
+    const refs = query
+      ? workspace?.refsHasMore ? refResults?.refs ?? [] : workspace?.refs.filter((reference) => reference.name.toLowerCase().includes(query)) ?? []
+      : workspace?.refs ?? [];
     const chosen = workspace?.refs.find((ref) => ref.name === base);
     return comparisonTargetGroups(chosen && !refs.some((ref) => ref.name === chosen.name) ? [chosen, ...refs] : refs,
       workspace?.upstream ?? null);
@@ -137,6 +284,9 @@ function WorkspacePanel({ sessionId, cwd, onClose, onAsk, onDiscuss }: GitPanelP
   const selectedIndex = files.findIndex((file) => file.path === selectedPath);
   const selectedFile = files[selectedIndex];
   const onActivePathChange = useCallback((path: string) => setSelectedPath(path), []);
+  const onDiffLoaded = useCallback((diff: GitDiff) => {
+    setWorkspace((current) => current ? applyGitPreviewCounts(current, diff) : current);
+  }, []);
   useEffect(() => {
     if (compact || layout !== "continuous" || !fileList.current) return;
     const current = fileList.current.querySelector<HTMLElement>("[aria-current='location']");
@@ -174,29 +324,35 @@ function WorkspacePanel({ sessionId, cwd, onClose, onAsk, onDiscuss }: GitPanelP
       setCommentError("");
     } catch (cause) { setCommentError(String(cause)); }
   }
-  const reviewProps = workspace ? { sessionId, workspace, view, comments, onCommentsChange: setComments, onAsk, onDiscuss, load: loadDiff } : null;
+  const reviewProps = workspace ? { sessionId, workspace, view, comments, draftStore, onCommentsChange: setComments, onAsk, onDiscuss, onDiffLoaded, load: loadDiff } : null;
   const comparisonControls = workspace?.state === "repository" && <>
-    {workspace.refsHasMore && <div className="git-ref-search">
+    <div className="git-ref-search">
       <label>Search comparison refs<input aria-label="Search comparison refs" value={refQuery} maxLength={256}
+        disabled={loading || workspace.detailsLoaded === false}
         onChange={(event) => setRefQuery(event.target.value)} placeholder="Branch or remote name" /></label>
-      <small>{!refQuery.trim() ? "Showing a bounded set of suggestions. Search any locally available branch or remote-tracking ref."
+      <small>{workspace.detailsLoaded === false ? detailsError ? "Comparison refs are unavailable; retry metadata loading." : "Loading local comparison refs. Working changes are already available."
+        : !workspace.refsHasMore ? "Filter the available local branch and remote-tracking refs."
+        : !refQuery.trim() ? "Showing a bounded set of suggestions. Search any locally available branch or remote-tracking ref."
         : refLoading ? "Searching local refs..." : refResults
           ? `${refResults.refs.length} matches${refResults.hasMore ? " shown; narrow the search for more specific results" : ""}.`
-          : "Ref search unavailable."}</small>
+          : refError ? "Ref search unavailable." : "Searching local refs..."}</small>
       {refError && <p role="alert" className="git-panel-error">{refError} <button type="button" onClick={() => setRefRevision((value) => value + 1)}>Retry ref search</button></p>}
       {refResults?.warnings.map((warning, index) => <p className="git-panel-warning" key={index}>{warning}</p>)}
-    </div>}
+    </div>
     <div className="git-panel-metadata">
       <p><strong>{workspace.detached ? "Detached HEAD" : visiblePath(workspace.branch ?? "No branch")}</strong>
         {" · "}{workspace.unborn ? "Unborn branch (no commits)" : `HEAD ${workspace.head?.slice(0, 12) ?? "unavailable"}`}
         <br /><span title={visiblePath(workspace.repoRoot ?? "")}>{visiblePath(workspace.repoRoot ?? "")}</span>
       </p>
       <label>Comparison target
-        <select aria-label="Comparison target" value={base} disabled={refLoading} onChange={(event) => {
+        <select aria-label="Comparison target" value={base} disabled={refLoading || loading || workspace.detailsLoaded === false} onChange={(event) => {
           setBase(event.target.value);
           if (compact && options.current) options.current.open = false;
         }}>
-          <option value="">{workspace.upstream ? `Upstream: ${compact ? shortRef(workspace.upstream) : visiblePath(workspace.upstream)}` : "Choose a local target (no upstream)"}</option>
+          <option value="">{workspace.detailsLoaded === false ? detailsError ? "Comparison targets unavailable" : "Loading comparison targets..."
+            : workspace.upstream ? `Upstream: ${compact ? shortRef(workspace.upstream) : visiblePath(workspace.upstream)}` : "Choose a local target (no upstream)"}</option>
+          {base && workspace.detailsLoaded === false && !workspace.refs.some((reference) => reference.name === base)
+            && <option value={base}>{shortRef(base)} (loading...)</option>}
           {targets.suggested.length > 0 && <optgroup label="Likely PR targets">
             {targets.suggested.map((reference) => <option key={reference.name} value={reference.name}>
               {compact ? shortRef(reference.name) : visiblePath(reference.name)}{reference.name.endsWith("/HEAD") ? " (remote default)" : ""}
@@ -209,6 +365,32 @@ function WorkspacePanel({ sessionId, cwd, onClose, onAsk, onDiscuss }: GitPanelP
       </label>
     </div>
     <p className="git-panel-explanation">Tracking upstream is a default, not necessarily your PR target. Main branches and remote defaults are listed first. Only already-local refs are used; no fetch or GitHub request is made.</p>
+  </>;
+  const workingPathControls = <>
+    <div className="git-working-paths">
+      <label>Working path<select aria-label="Git working path" value={workingPath ?? ""} disabled={addingPath || pathsUnreadable}
+        onChange={(event) => onWorkingPathChange(event.target.value || null)}>
+        <option value="">Session directory — {visiblePath(cwd)}</option>
+        {workingPaths.map((path) => <option key={path} value={path}>{visiblePath(path)}</option>)}
+      </select></label>
+      {workingPath && <button type="button" disabled={addingPath || pathsUnreadable} onClick={onRemovePath}
+        title="Remove this path from the Git list only; no files are deleted." aria-label="Remove Git working path">Remove path</button>}
+      <details className="git-add-working-path">
+        <summary>Add working path</summary>
+        <form onSubmit={(event) => {
+          event.preventDefault();
+          void onAddPath(newWorkingPath).then((added) => { if (added) setNewWorkingPath(""); });
+        }}>
+          <label>Directory on daemon<input aria-label="Working directory to add" value={newWorkingPath} maxLength={4096}
+            disabled={addingPath || pathsUnreadable} placeholder="Q:\another-repo"
+            onChange={(event) => setNewWorkingPath(event.target.value)} /></label>
+          <button type="submit" disabled={addingPath || pathsUnreadable || !newWorkingPath.trim()}>{addingPath ? "Checking path..." : "Add path"}</button>
+          <small>Inspect another repository without changing the session or terminal directory. Saved for this session in this browser.</small>
+        </form>
+      </details>
+    </div>
+    {pathsError && <p role="alert" className="git-panel-error">{pathsError}
+      {pathsUnreadable && <button type="button" onClick={onReloadPaths}>Reload working paths</button>}</p>}
   </>;
   return <>
     <div className="git-panel-backdrop" aria-hidden="true" />
@@ -233,10 +415,13 @@ function WorkspacePanel({ sessionId, cwd, onClose, onAsk, onDiscuss }: GitPanelP
             <button type="button" onClick={onClose} aria-label="Close Git workspace"><X size={18} /></button>
           </div>
         </div>
+        {workingPathControls}
         {compact && workspace?.state === "repository" && <div className="git-mobile-toolbar">
           <div className="git-mobile-view-controls">
             <label>Changes<select aria-label="Git change view" value={view} onChange={(event) => changeView(event.target.value as GitView)}>
-              {(Object.keys(gitViewLabels) as GitView[]).map((tab) => <option key={tab} value={tab}>{gitViewLabels[tab]} ({fileViews[tab].length})</option>)}
+              {(Object.keys(gitViewLabels) as GitView[]).map((tab) => <option key={tab} value={tab}
+                disabled={tab === "compare" && workspace.detailsLoaded === false}>
+                {gitViewLabels[tab]} ({tab === "compare" && workspace.detailsLoaded === false ? "…" : fileViews[tab].length})</option>)}
             </select></label>
             <label>View<select aria-label="Diff layout" value={layout} onChange={(event) => {
               changeLayout(event.target.value as "file" | "continuous");
@@ -260,17 +445,27 @@ function WorkspacePanel({ sessionId, cwd, onClose, onAsk, onDiscuss }: GitPanelP
               {workspace.base ? shortRef(workspace.base) : "No target"}
             </span></summary>
             <div className="git-mobile-options-body">
-              <p className="git-panel-cwd">Session directory: {visiblePath(cwd)}</p>
+              <p className="git-panel-cwd">Working directory: {visiblePath(selectedCwd)}</p>
               {comparisonControls}
             </div>
           </details>
         </div>}
       </header>
       <div className="git-panel-body">
-      {!compact && <p className="git-panel-cwd" title={visiblePath(cwd)}>Session directory: {visiblePath(cwd)}</p>}
-      {loading && <p role="status">Inspecting local Git metadata...</p>}
+      {!compact && <p className="git-panel-cwd" title={visiblePath(selectedCwd)}>
+        {workingPath ? "Working directory" : "Session directory"}: {visiblePath(selectedCwd)}</p>}
+      {workspace?.state === "repository" ? <p className="git-workspace-status" role="status">
+        {error ? "Last snapshot; the local refresh failed."
+          : loading ? "Refreshing local changes; showing the last snapshot..."
+          : detailsError ? "Local changes are ready; comparison metadata is unavailable."
+          : detailsLoading || workspace.detailsLoaded === false ? "Local changes are ready. Loading comparison metadata in the background..."
+          : "Local changes and comparison metadata are ready."}
+      </p> : loading && <p role="status">Inspecting local changes...</p>}
       {error && <p role="alert" className="git-panel-error">{error}</p>}
-      {workspace?.state === "noRepo" && <p className="git-panel-empty">This session is not in a Git working tree.</p>}
+      {detailsError && <p role="alert" className="git-panel-error">Comparison metadata: {detailsError}
+        {" "}<button type="button" onClick={() => setDetailsRevision((value) => value + 1)}>Retry comparison metadata</button>
+        {base && <button type="button" onClick={() => setBase("")}>Use default comparison target</button>}</p>}
+      {workspace?.state === "noRepo" && <p className="git-panel-empty">{workingPath ? "This working path is not in a Git working tree." : "This session is not in a Git working tree."}</p>}
       {workspace?.warnings.map((warning, index) => <p className="git-panel-warning" key={index}>{warning}</p>)}
       {workspace?.state === "repository" && <>
         <GitReviewNotes workspace={workspace} comments={comments} onCommentsChange={setComments}
@@ -279,8 +474,8 @@ function WorkspacePanel({ sessionId, cwd, onClose, onAsk, onDiscuss }: GitPanelP
         {comparisonControls}
         <nav className="git-panel-tabs" aria-label="Git change views">
           {(Object.keys(gitViewLabels) as GitView[]).map((tab) => <button type="button" key={tab} aria-pressed={view === tab}
-            onClick={() => changeView(tab)}>
-            {gitViewLabels[tab]} <span>{fileViews[tab].length}</span>
+            disabled={tab === "compare" && workspace.detailsLoaded === false} onClick={() => changeView(tab)}>
+            {gitViewLabels[tab]} <span>{tab === "compare" && workspace.detailsLoaded === false ? "…" : fileViews[tab].length}</span>
           </button>)}
         </nav>
         <div className="git-layout-switch" role="group" aria-label="Diff layout">
@@ -296,10 +491,13 @@ function WorkspacePanel({ sessionId, cwd, onClose, onAsk, onDiscuss }: GitPanelP
             : view === "unstaged" ? "Working tree changes not yet staged, including new untracked files. Tracked edits compare against the index; untracked text is shown as additions."
               : "New, untracked files only. Regular text files can be previewed as additions; unsafe paths and unsupported contents remain unavailable."}
         </p>
-        {view === "compare" && workspace.compareUnavailableReason && <p className="git-panel-warning">{workspace.compareUnavailableReason}</p>}
+        {view === "compare" && workspace.detailsLoaded !== false && workspace.compareUnavailableReason
+          && <p className="git-panel-warning">{workspace.compareUnavailableReason}</p>}
         <div className={`git-panel-content${layout === "continuous" ? " continuous" : ""}`}>
           <div ref={fileList} className="git-panel-files" hidden={compact && (layout === "continuous" || selectedPath !== null)} aria-label={`${gitViewLabels[view]} files`}>
-            {!files.length && !(view === "compare" && workspace.compareUnavailableReason) && <p className="git-panel-empty">No files in this view.</p>}
+            {!files.length && (view === "compare" && workspace.detailsLoaded === false
+              ? <p className="git-panel-empty" role="status">{detailsError ? "Comparison changes are unavailable until metadata is reloaded." : "Loading committed comparison changes..."}</p>
+              : !(view === "compare" && workspace.compareUnavailableReason) && <p className="git-panel-empty">No files in this view.</p>)}
             {files.map((file) => <button type="button" className={`git-panel-file ${selectedPath === file.path ? "selected" : ""}`}
               key={file.path} title={visiblePath(file.path)} aria-pressed={selectedPath === file.path}
               aria-current={layout === "continuous" && selectedPath === file.path ? "location" : undefined}

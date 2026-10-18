@@ -72,7 +72,16 @@ pub fn project_app_event(
             }
             event.data = Value::Object(projected);
         }
-        "session.usage_checkpoint" | "prompt_cache_break" | "assistant.streaming_delta" => {
+        "session.usage_checkpoint" => {
+            // Durable accounting is useful without diagnostics. Cache restore
+            // state and other checkpoint internals are not part of the display.
+            let mut projected = Map::new();
+            if let Some(total) = event.data.get("totalNanoAiu").filter(|value| value.is_number()) {
+                projected.insert("totalNanoAiu".into(), total.clone());
+            }
+            event.data = Value::Object(projected);
+        }
+        "prompt_cache_break" | "assistant.streaming_delta" => {
             if !diagnostics {
                 return None;
             }
@@ -152,7 +161,6 @@ mod tests {
             "model.message",
             "model.response",
             "system.message",
-            "session.usage_checkpoint",
             "prompt_cache_break",
             "assistant.streaming_delta",
         ] {
@@ -181,6 +189,31 @@ mod tests {
                 expected,
                 "{kind}"
             );
+        }
+    }
+
+    #[test]
+    fn usage_checkpoint_is_minimal_and_available_without_diagnostics() {
+        for diagnostics in [false, true] {
+            let result = project_app_event(
+                envelope(
+                    "session.usage_checkpoint",
+                    json!({
+                        "totalNanoAiu":1_250_000_000,
+                        "totalPremiumRequests":99,
+                        "modelCacheState":[{"private":"cache-state"}],
+                        "promptCacheBreakState":[{"private":"restore-state"}],
+                    }),
+                ),
+                diagnostics,
+            ).unwrap();
+            assert_eq!(result.sequence, 17);
+            assert_eq!(json!(result)["event"]["data"], json!({"totalNanoAiu":1_250_000_000}));
+            let missing = project_app_event(
+                envelope("session.usage_checkpoint", json!({"totalNanoAiu":null})),
+                diagnostics,
+            ).unwrap();
+            assert_eq!(json!(missing)["event"]["data"], json!({}));
         }
     }
 

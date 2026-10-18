@@ -88,6 +88,9 @@ async function setup(page: Page) {
     overrideDiff: {} as Record<string, unknown>,
     refError: "", refDelay: 0,
     refSearch: { refs: [] as { name: string; commit: string }[], hasMore: false, warnings: [] as string[] },
+    workspacesByPath: {} as Record<string, ReturnType<typeof snapshot>>,
+    invalidWorkingPath: "",
+    progressive: false, detailsDelay: 0, detailsError: "", workspaceDelay: 0,
   };
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
@@ -98,19 +101,39 @@ async function setup(page: Page) {
       const args = route.request().postDataJSON() ?? {};
       requests.push({ command, args });
       if (command === "git_workspace") {
+        const chosen = structuredClone(state.workspacesByPath[args.workingPath] ?? state.workspace);
+        if (args.scope === "changes" && state.workspaceDelay) await new Promise((resolve) => setTimeout(resolve, state.workspaceDelay));
+        if (args.scope !== "changes" && state.detailsDelay) await new Promise((resolve) => setTimeout(resolve, state.detailsDelay));
         if (state.statusError) return route.fulfill({ status: 500, body: state.statusError });
-        return route.fulfill({ json: { ...state.workspace, ...(args.base ? { base: args.base } : {}) } });
+        if (args.scope !== "changes" && state.detailsError) return route.fulfill({ status: 500, body: state.detailsError });
+        return route.fulfill({ json: { ...chosen, ...(args.base ? { base: args.base } : {}),
+          ...(state.progressive && args.scope === "changes" ? {
+            detailsLoaded: false, refs: [], compare: [], base: null, baseCommit: null, mergeBase: null,
+            staged: chosen.staged.map((file) => ({ ...file, added: null, deleted: null })),
+            unstaged: chosen.unstaged.map((file) => ({ ...file, added: null, deleted: null })),
+            untracked: chosen.untracked.map((file) => ({ ...file, added: null, deleted: null })),
+          } : state.progressive && args.scope === "details" ? {
+            detailsLoaded: true, changesLoaded: false, staged: [], unstaged: [], untracked: [],
+          } : {}) } });
       }
       if (command === "git_diff") {
         if (args.path === state.delayedPath) await new Promise((resolve) => setTimeout(resolve, state.delay));
         if (state.diffError) return route.fulfill({ status: 500, body: state.diffError });
-        return route.fulfill({ json: preview(args.path, args.view, { context: args.context ?? "changes", ...state.overrideDiff, ...(args.base ? { base: args.base } : {}) }) });
+        const chosen = Object.values(state.workspacesByPath).find((workspace) => workspace.repoRoot === args.workingPath);
+        return route.fulfill({ json: preview(args.path, args.view, {
+          ...(chosen ? { repoRoot: chosen.repoRoot, head: chosen.head } : {}),
+          context: args.context ?? "changes", ...state.overrideDiff, ...(args.base ? { base: args.base } : {}),
+        }) });
       }
       if (command === "git_refs") {
         const result = structuredClone(state.refSearch);
         if (state.refDelay) await new Promise((resolve) => setTimeout(resolve, state.refDelay));
         if (state.refError) return route.fulfill({ status: 503, body: state.refError });
         return route.fulfill({ json: result });
+      }
+      if (command === "git_repository") {
+        if (args.workingPath === state.invalidWorkingPath) return route.fulfill({ status: 400, body: "Working directory does not exist." });
+        return route.fulfill({ json: { isRepository: true } });
       }
       return route.fulfill({ status: 405, body: `Unexpected endpoint: ${command}` });
     }
@@ -130,6 +153,203 @@ async function open(page: Page) {
   await expect(page.getByRole("dialog", { name: "Git workspace" })).toBeVisible();
 }
 
+async function addWorkingPath(page: Page, path: string) {
+  await page.getByText("Add working path", { exact: true }).click();
+  await page.getByLabel("Working directory to add", { exact: true }).fill(path);
+  await page.getByRole("button", { name: "Add path", exact: true }).click();
+}
+
+test("working paths inspect independent repositories and keep notes and session directories isolated", async ({ page }) => {
+  const { state, requests } = await setup(page);
+  state.workspace = snapshot({ unstaged: [change("shared.txt")], untracked: [] });
+  state.workspacesByPath["Q:\\repo-b"] = snapshot({ repoRoot: "Q:/repo-b", unstaged: [change("shared.txt")], untracked: [] });
+  await open(page);
+  await page.getByRole("button", { name: /shared.txt/ }).click();
+  await page.getByRole("option", { name: "Added line new:1", exact: true }).click();
+  await page.getByLabel("Local review comment", { exact: true }).fill("Only repository A");
+  await page.getByRole("button", { name: "Save local comment", exact: true }).click();
+  await addWorkingPath(page, "Q:\\repo-b");
+  await expect(page.getByLabel("Git working path", { exact: true })).toHaveValue("Q:\\repo-b");
+  await expect(page.getByRole("button", { name: "Review notes (0)", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: /shared.txt/ }).click();
+  await expect(page.getByRole("region", { name: "Selected file unified diff" })).toBeVisible();
+  expect(requests.filter((request) => request.command === "git_diff").at(-1)!.args.workingPath).toBe("Q:/repo-b");
+  await page.getByRole("option", { name: "Added line new:1", exact: true }).click();
+  await page.getByLabel("Local review comment", { exact: true }).fill("Only repository B");
+  await page.getByRole("button", { name: "Save local comment", exact: true }).click();
+  await page.getByRole("button", { name: "Bring all notes into chat", exact: true }).click();
+  await expect(page.getByLabel("Review draft")).toHaveValue(/Only repository B/);
+  await expect(page.getByLabel("Review draft")).not.toHaveValue(/Only repository A/);
+  await page.getByLabel("Git working path", { exact: true }).selectOption("");
+  await page.getByRole("button", { name: /shared.txt/ }).click();
+  await expect(page.getByLabel("Local Git review comments")).toContainText("Only repository A");
+  await expect(page.getByLabel("Local Git review comments")).not.toContainText("Only repository B");
+  expect(requests.some((request) => /set_session_cwd|send_message|execute_command/.test(request.command))).toBe(false);
+  await page.getByLabel("Git working path", { exact: true }).selectOption("Q:\\repo-b");
+  await page.getByRole("button", { name: "Close Git workspace" }).click();
+  await open(page);
+  await expect(page.getByLabel("Git working path", { exact: true })).toHaveValue("Q:\\repo-b");
+  await page.evaluate(() => (window as unknown as { setGitScope: (sessionId: string, cwd: string) => void }).setGitScope("b", "Q:\\session-b"));
+  await expect(page.getByLabel("Git working path", { exact: true })).toHaveValue("");
+  await expect(page.getByLabel("Git working path", { exact: true }).locator("option[value='Q:\\\\repo-b']")).toHaveCount(0);
+});
+
+test("working paths can be added from a non-repository and invalid directories do not change the selection", async ({ page }) => {
+  const { state, requests } = await setup(page);
+  state.workspace = snapshot({ state: "noRepo", repoRoot: null, warnings: [] });
+  state.workspacesByPath["Q:\\repo-b"] = snapshot({ repoRoot: "Q:/repo-b" });
+  state.invalidWorkingPath = "Q:\\missing";
+  await open(page);
+  await expect(page.getByText("This session is not in a Git working tree.", { exact: true })).toBeVisible();
+  await addWorkingPath(page, "relative-repo");
+  await expect(page.getByRole("alert")).toContainText("absolute working directory");
+  expect(requests.some((request) => request.command === "git_repository")).toBe(false);
+  await page.getByLabel("Working directory to add").fill("Q:\\missing");
+  await page.getByRole("button", { name: "Add path", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText("does not exist");
+  await expect(page.getByLabel("Git working path", { exact: true })).toHaveValue("");
+  await page.getByLabel("Working directory to add").fill("Q:\\repo-b");
+  await page.getByRole("button", { name: "Add path", exact: true }).click();
+  await expect(page.getByLabel("Git working path", { exact: true })).toHaveValue("Q:\\repo-b");
+  await expect(page.getByRole("button", { name: /working file.txt/ })).toBeVisible();
+  await page.getByRole("button", { name: "Remove Git working path", exact: true }).click();
+  await expect(page.getByLabel("Git working path", { exact: true })).toHaveValue("");
+  await expect(page.getByText("This session is not in a Git working tree.", { exact: true })).toBeVisible();
+});
+
+test("unfinished notes survive repository and file switches without sharing text between repositories", async ({ page }) => {
+  const { state } = await setup(page);
+  state.workspacesByPath["Q:\\repo-b"] = snapshot({ repoRoot: "Q:/repo-b" });
+  await open(page);
+  await page.getByRole("button", { name: /working file.txt/ }).click();
+  await page.getByRole("option", { name: "Added line new:1", exact: true }).click();
+  await page.getByLabel("Local review comment", { exact: true }).fill("Unfinished note in repository A");
+  await addWorkingPath(page, "Q:\\repo-b");
+  await page.getByRole("button", { name: /working file.txt/ }).click();
+  await page.getByRole("option", { name: "Added line new:1", exact: true }).click();
+  await expect(page.getByLabel("Local review comment", { exact: true })).toHaveValue("");
+  await page.getByLabel("Local review comment", { exact: true }).fill("Unfinished note in repository B");
+  await page.getByLabel("Git working path", { exact: true }).selectOption("");
+  await page.getByRole("button", { name: /working file.txt/ }).click();
+  await page.getByRole("option", { name: "Added line new:1", exact: true }).click();
+  await expect(page.getByLabel("Local review comment", { exact: true })).toHaveValue("Unfinished note in repository A");
+  await page.getByRole("button", { name: /line\\nname.txt/ }).click();
+  await page.getByRole("button", { name: /working file.txt/ }).click();
+  await page.getByRole("option", { name: "Added line new:1", exact: true }).click();
+  await expect(page.getByLabel("Local review comment", { exact: true })).toHaveValue("Unfinished note in repository A");
+});
+
+test("local changes and note drafts remain usable while comparison metadata loads or retries", async ({ page }) => {
+  const { state, requests } = await setup(page);
+  state.progressive = true; state.detailsDelay = 1000;
+  await open(page);
+  await expect(page.getByRole("button", { name: /working file.txt/ })).toBeVisible();
+  const comparison = page.getByRole("button", { name: /^PR comparison / });
+  await expect(comparison).toBeDisabled();
+  await page.getByRole("button", { name: /working file.txt/ }).click();
+  await page.getByRole("option", { name: "Added line new:1", exact: true }).click();
+  await page.getByLabel("Local review comment", { exact: true }).fill("Keep this draft while refs load");
+  const selectedBefore = (await page.getByRole("option", { name: "Added line new:1", exact: true }).boundingBox())!.y;
+  await expect(comparison).toBeEnabled();
+  await expect(page.getByLabel("Local review comment", { exact: true })).toHaveValue("Keep this draft while refs load");
+  await expect(page.getByRole("option", { name: "Added line new:1", exact: true })).toHaveAttribute("aria-selected", "true");
+  expect((await page.getByRole("option", { name: "Added line new:1", exact: true }).boundingBox())!.y).toBeCloseTo(selectedBefore, 0);
+  await expect(page.getByRole("button", { name: /working file.txt/ }).locator(".git-added")).toHaveText("+1");
+  expect(requests.some((request) => request.command === "git_workspace" && request.args.scope === "details")).toBe(true);
+  expect(requests.filter((request) => request.command === "git_diff")).toHaveLength(1);
+  await page.getByRole("button", { name: "Close Git workspace" }).click();
+  state.detailsDelay = 0; state.detailsError = "Synthetic comparison metadata failure";
+  await open(page);
+  await expect(page.getByRole("alert")).toContainText("Synthetic comparison metadata failure");
+  await expect(page.getByRole("button", { name: /working file.txt/ })).toBeVisible();
+  const statusReads = requests.filter((request) => request.command === "git_workspace" && request.args.scope === "changes").length;
+  state.detailsError = "";
+  await page.getByRole("button", { name: "Retry comparison metadata", exact: true }).click();
+  await expect(comparison).toBeEnabled();
+  expect(requests.filter((request) => request.command === "git_workspace" && request.args.scope === "changes")).toHaveLength(statusReads);
+});
+
+test("late metadata from another working path cannot replace the selected repository", async ({ page }) => {
+  const { state, requests } = await setup(page);
+  state.workspaceDelay = 700;
+  state.workspacesByPath["Q:\\repo-b"] = snapshot({ repoRoot: "Q:/repo-b", branch: "second-repo" });
+  await open(page);
+  await expect.poll(() => requests.some((request) => request.command === "git_workspace")).toBe(true);
+  state.workspaceDelay = 0;
+  await addWorkingPath(page, "Q:\\repo-b");
+  await expect(page.getByLabel("Git working path", { exact: true })).toHaveValue("Q:\\repo-b");
+  await expect(page.locator(".git-panel-metadata strong")).toHaveText("second-repo");
+  await page.waitForTimeout(800);
+  await expect(page.locator(".git-panel-metadata strong")).toHaveText("second-repo");
+  await expect(page.locator(".git-panel-metadata p span")).toHaveText("Q:/repo-b");
+});
+
+test("working-path storage failures remain visible and phone controls stay bounded", async ({ page }) => {
+  await page.addInitScript(() => {
+    const set = Storage.prototype.setItem;
+    Storage.prototype.setItem = function(key, value) {
+      if (key.startsWith("copilot-sessions.git-working-paths.v1:")) throw new Error("Storage unavailable");
+      return set.call(this, key, value);
+    };
+  });
+  const { state } = await setup(page);
+  const path = "Q:\\repositories\\a-long-repository-directory-name";
+  state.workspacesByPath[path] = snapshot({ repoRoot: "Q:/other" });
+  await page.setViewportSize({ width: 320, height: 844 });
+  await open(page);
+  await addWorkingPath(page, path);
+  await expect(page.getByLabel("Git working path", { exact: true })).toHaveValue(path);
+  await expect(page.getByRole("alert")).toContainText("could not be saved");
+  await expect(page.getByRole("button", { name: /working file.txt/ })).toBeVisible();
+  const selector = page.getByLabel("Git working path", { exact: true });
+  expect((await selector.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+  expect(await page.getByRole("dialog", { name: "Git workspace" }).evaluate((element) =>
+    element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+  expect(await page.evaluate(() => localStorage.getItem("copilot-sessions.git-working-paths.v1:a"))).toBeNull();
+});
+
+test("corrupt saved working paths cannot be silently replaced by adding a directory", async ({ page }) => {
+  await setup(page);
+  await page.evaluate(() => localStorage.setItem("copilot-sessions.git-working-paths.v1:a", "invalid json"));
+  await open(page);
+  await expect(page.getByRole("alert")).toContainText("not overwritten");
+  await expect(page.getByLabel("Git working path", { exact: true })).toBeDisabled();
+  await page.getByText("Add working path", { exact: true }).click();
+  await expect(page.getByLabel("Working directory to add")).toBeDisabled();
+  expect(await page.evaluate(() => localStorage.getItem("copilot-sessions.git-working-paths.v1:a"))).toBe("invalid json");
+  await page.evaluate(() => localStorage.removeItem("copilot-sessions.git-working-paths.v1:a"));
+  await page.getByRole("button", { name: "Reload working paths", exact: true }).click();
+  await expect(page.getByLabel("Git working path", { exact: true })).toBeEnabled();
+});
+
+test("explicitly pinned directories survive session CWD changes and Git restores opener focus", async ({ page }) => {
+  const { requests } = await setup(page);
+  await open(page);
+  await addWorkingPath(page, "Q:\\example");
+  const selector = page.getByLabel("Git working path", { exact: true });
+  await expect(selector).toHaveValue("Q:\\example");
+  await expect(selector).toBeFocused();
+  await expect.poll(() => requests.filter((request) => request.command === "git_workspace").length).toBe(2);
+  await page.evaluate(() => (window as unknown as { setGitScope: (sessionId: string, cwd: string) => void }).setGitScope("a", "Q:\\moved"));
+  await expect(selector.locator("option").first()).toContainText("Q:\\moved");
+  await expect(selector).toHaveValue("Q:\\example");
+  expect(requests.filter((request) => request.command === "git_workspace")).toHaveLength(2);
+  await page.getByRole("button", { name: "Close Git workspace", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Open Git workspace", exact: true })).toBeFocused();
+});
+
+test("small comparison catalogs filter locally without another metadata or ref request", async ({ page }) => {
+  const { requests } = await setup(page);
+  await open(page);
+  await page.getByLabel("Search comparison refs", { exact: true }).fill("main");
+  const options = page.getByLabel("Comparison target", { exact: true }).locator("optgroup option");
+  await expect(options).toHaveCount(2);
+  expect(await options.evaluateAll((items) => items.map((item) => (item as HTMLOptionElement).value)))
+    .toEqual(["refs/remotes/origin/main", "refs/heads/main"]);
+  expect(requests.filter((request) => request.command === "git_refs")).toHaveLength(0);
+  expect(requests.filter((request) => request.command === "git_workspace")).toHaveLength(1);
+});
+
 test("inspection is explicit, status is fetched once, and only selected file patches load", async ({ page }) => {
   const { requests } = await setup(page);
   expect(requests).toEqual([]);
@@ -140,7 +360,7 @@ test("inspection is explicit, status is fetched once, and only selected file pat
   await page.getByRole("button", { name: /working file.txt/ }).click();
   await expect(page.getByRole("region", { name: "Selected file unified diff" })).toContainText("+new unstaged");
   expect(requests.filter((request) => request.command === "git_diff")).toEqual([{
-    command: "git_diff", args: { sessionId: "a", view: "unstaged", path: "working file.txt", base: "refs/remotes/origin/feature" },
+    command: "git_diff", args: { sessionId: "a", workingPath: "Q:/example", view: "unstaged", path: "working file.txt" },
   }]);
   await page.getByRole("button", { name: "Staged 1", exact: true }).click();
   await page.getByRole("button", { name: /staged file.txt/ }).click();

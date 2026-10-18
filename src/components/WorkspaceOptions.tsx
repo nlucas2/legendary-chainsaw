@@ -73,7 +73,7 @@ export function WorkspaceOptions({ actions, diagnostics, diagnosticsDisabled, on
               aria-label="Raw diagnostics" aria-describedby={`${id}-diagnostics`}
               onChange={(event) => onDiagnosticsChange(event.target.checked)} />
             <span><strong>Raw diagnostics <b>{diagnostics ? "On" : "Off"}</b></strong>
-              <small id={`${id}-diagnostics`}>Show the latest 100 live session events as JSON, including extra model, cache, and streaming telemetry. Adds browser traffic; model request/response bodies are omitted. Normal chat streaming and Context usage work with this off.</small>
+              <small id={`${id}-diagnostics`}>Show the latest 100 live session events as JSON, including extra model, cache, and streaming telemetry. Adds browser traffic; model request/response bodies are omitted. Normal chat streaming and Context usage work with this off, including session AI credits.</small>
             </span>
           </label>
         </details>

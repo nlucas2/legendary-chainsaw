@@ -74,6 +74,55 @@ fn new_session(deferred: bool) -> NewSession {
     }
 
     #[tokio::test]
+    async fn session_usage_reads_native_total_without_estimating_or_mutating() {
+        let runtime = mock_runtime();
+        runtime.service.resume_session("a".into()).await.unwrap();
+        runtime.hold("session.usage.getMetrics");
+        for total in [json!(1_250_000_000), json!(0), Value::Null, json!(-1), json!("100")] {
+            let count = runtime.requests("session.usage.getMetrics").len() + 1;
+            let service = runtime.service.clone();
+            let read = tokio::spawn(async move { service.session_usage("a").await });
+            let request = runtime.request("session.usage.getMetrics", count).await;
+            assert_eq!(request["params"], json!({"sessionId":"a"}));
+            runtime.reply(&request, json!({
+                "totalNanoAiu":total,
+                "totalPremiumRequestCost":20,
+                "modelMetrics":{"example":{"totalNanoAiu":10_000_000_000_i64}},
+                "agentMetrics":{"main":{"totalNanoAiu":10_000_000_000_i64}},
+                "codeChanges":{"filesModified":["not-needed.txt"]},
+            })).await;
+            let result = read.await.unwrap().unwrap();
+            let expected = total.as_f64().filter(|value| *value >= 0.0);
+            assert_eq!(result, json!({"totalNanoAiu":expected}));
+            assert_eq!(runtime.requests("session.usage.getMetrics").len(), count);
+        }
+        let service = runtime.service.clone();
+        let count = runtime.requests("session.usage.getMetrics").len() + 1;
+        let read = tokio::spawn(async move { service.session_usage("a").await });
+        let request = runtime.request("session.usage.getMetrics", count).await;
+        runtime.reply(&request, json!({"totalPremiumRequestCost":2})).await;
+        assert_eq!(read.await.unwrap().unwrap(), json!({"totalNanoAiu":null}));
+        assert!(runtime.service.session_usage("not-attached").await.is_err());
+        assert_eq!(runtime.requests("session.usage.getMetrics").len(), count);
+        for method in ["session.send", "session.abort", "session.create", "billing.getQuota"] {
+            assert!(runtime.requests(method).is_empty(), "{method}");
+        }
+    }
+
+    #[tokio::test]
+    async fn session_usage_does_not_hide_native_errors_as_zero() {
+        let runtime = mock_runtime();
+        runtime.service.resume_session("a".into()).await.unwrap();
+        runtime.hold("session.usage.getMetrics");
+        let service = runtime.service.clone();
+        let read = tokio::spawn(async move { service.session_usage("a").await });
+        let request = runtime.request("session.usage.getMetrics", 1).await;
+        runtime.inject(json!({"jsonrpc":"2.0","id":request["id"],
+            "error":{"code":-32601,"message":"Usage unavailable"}})).await;
+        assert!(read.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
     async fn model_switch_does_not_persist_queued_unconfirmed_or_missing_results() {
         for result in [
             json!({"deferred":true,"modelId":"old","message":"Queued"}),

@@ -84,6 +84,67 @@ test("tools default collapsed while explicit global expansion remains supported"
   assert.match(expanded, /tool-details/);
 });
 
+test("Copilot heading precedes tool-first activity instead of appearing below it on the final answer", () => {
+  const events = [
+    event("session.start", { model: "reported-model" }),
+    event("user.message", { content: "Inspect the workspace" }),
+    event("tool.execution_start", { toolCallId: "view", toolName: "view", arguments: { path: "file.txt" } }),
+    event("tool.execution_start", { toolCallId: "shell", toolName: "powershell" }),
+    event("assistant.message", { content: "Inspection done." }),
+  ];
+  const html = render(events);
+  assert.equal((html.match(/<span>Copilot<\/span>/g) ?? []).length, 1);
+  assert.equal((html.match(/<em>\(reported-model\)<\/em>/g) ?? []).length, 1);
+  assert.ok(html.indexOf(">You</span>") < html.indexOf(">Copilot</span>"));
+  assert.ok(html.indexOf(">Copilot</span>") < html.indexOf('class="tool-card'));
+  assert.ok(html.indexOf(">powershell</strong>") < html.indexOf("Inspection done."));
+  assert.ok(html.indexOf("</article>") < html.indexOf('class="assistant-activity-heading"'));
+  const running = render(events.slice(0, 3));
+  assert.match(running, /assistant-activity-heading/);
+  assert.doesNotMatch(running, /class="message assistant"/);
+});
+
+test("later reasoning cannot steal the heading from leading tools and tool-only history is labeled", () => {
+  const html = render([
+    event("user.message", { content: "Prompt" }),
+    event("tool.execution_start", { toolCallId: "first", toolName: "view" }),
+    event("assistant.reasoning", { content: "Actual summary" }),
+    event("assistant.message", { content: "Answer", reasoningText: "Actual summary" }),
+  ]);
+  assert.equal((html.match(/<span>Copilot<\/span>/g) ?? []).length, 1);
+  assert.ok(html.indexOf(">Copilot</span>") < html.indexOf(">view</strong>"));
+  assert.ok(html.indexOf(">view</strong>") < html.indexOf("Actual summary"));
+  const next = render([
+    event("user.message", { content: "First" }),
+    event("tool.execution_start", { toolCallId: "first", toolName: "view" }),
+    event("user.message", { content: "Second" }),
+    event("tool.execution_start", { toolCallId: "second", toolName: "glob" }),
+  ]);
+  assert.equal((next.match(/<span>Copilot<\/span>/g) ?? []).length, 2);
+});
+
+test("nested and focused child tools carry the child label without claiming the parent's model", () => {
+  const html = render([
+    event("session.start", { model: "parent-model" }),
+    event("user.message", { content: "Delegate" }),
+    event("subagent.started", { agentName: "Builder", model: "child-model" }, "child"),
+    event("tool.execution_start", { toolCallId: "child-tool", toolName: "view" }, "child"),
+    event("assistant.message", { content: "Child result" }, "child"),
+    event("assistant.message", { content: "Parent result" }),
+  ]);
+  assert.equal((html.match(/<span>Copilot<\/span>/g) ?? []).length, 1);
+  assert.equal((html.match(/<span>Builder<\/span>/g) ?? []).length, 1);
+  assert.equal((html.match(/<em>\(parent-model\)<\/em>/g) ?? []).length, 1);
+  assert.equal((html.match(/<em>\(child-model\)<\/em>/g) ?? []).length, 1);
+  assert.ok(html.indexOf(">Copilot</span>") < html.indexOf('class="subagent-card'));
+  assert.ok(html.indexOf(">Builder</span>") < html.indexOf('class="tool-card'));
+  const focused = render([
+    event("session.start", { model: "child-model" }),
+    event("tool.execution_start", { toolCallId: "child-tool", toolName: "view" }),
+  ], { assistantLabel: "Builder", subagentConversation: true });
+  assert.match(focused, /<span>Builder<\/span>/);
+  assert.doesNotMatch(focused, /<span>Copilot<\/span>/);
+});
 test("child reasoning uses the subagent label/model and child users are not root anchors", () => {
   const html = render([
     event("user.message", { content: "Root prompt" }),
@@ -214,4 +275,20 @@ test("fenced code has a shared raw-source control without wrapping block element
   assert.match(html, /Show raw source/);
   assert.match(html, /const x = &#x27;&lt;script&gt;&#x27;;/);
   assert.doesNotMatch(html, /<pre[^>]*><div/);
+});
+
+test("apply_patch arguments render as read-only file diffs with raw source and escaped code", () => {
+  const patch = "*** Begin Patch\n*** Update File: src/file.ts\n@@\n-before\n+<script>after</script>\n*** Delete File: old.txt\n*** End Patch";
+  const html = render([
+    event("tool.execution_start", { toolCallId: "patch", toolName: "apply_patch", arguments: patch }),
+    event("tool.execution_complete", { toolCallId: "patch", success: true, result: "Done" }),
+  ], { toolDetailsExpanded: true });
+  assert.match(html, /aria-label="Patch request"/);
+  assert.match(html, /aria-label="Patch for src\/file\.ts"/);
+  assert.match(html, /git-diff-line delete/);
+  assert.match(html, /git-diff-line add/);
+  assert.match(html, /Show raw patch/);
+  assert.match(html, /Delete file; contents are not included/);
+  assert.match(html, /\+&lt;script&gt;after&lt;\/script&gt;/);
+  assert.doesNotMatch(html, /<script>|role="listbox"/);
 });

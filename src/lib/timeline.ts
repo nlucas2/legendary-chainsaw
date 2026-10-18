@@ -41,6 +41,8 @@ export type TimelineItem =
       inputBuffer?: string;
       result?: unknown;
       progress: string[];
+      turnLead?: boolean;
+      model?: string;
     }
   | {
       kind: "command";
@@ -59,10 +61,19 @@ export type TimelineItem =
       error?: string;
       timeline: readonly TimelineItem[];
       preview?: string;
+      turnLead?: boolean;
+      parentModel?: string;
     }
   | { kind: "status"; id: string; label: string };
 
 type SubagentItem = Extract<TimelineItem, { kind: "subagent" }>;
+type AssistantActivity = Extract<TimelineItem, { kind: "message" | "reasoning" | "tool" | "subagent" }>;
+
+function isVisibleAssistantActivity(item: TimelineItem): item is AssistantActivity {
+  return item.kind === "tool" || item.kind === "subagent" ||
+    ((item.kind === "reasoning" || (item.kind === "message" && item.role === "assistant")) &&
+      !item.hidden && !!item.content.trim());
+}
 
 interface Environment {
   seen: boolean;
@@ -276,7 +287,7 @@ class Draft {
         positions.set(items[offset].id, offset);
       }
     }
-    if (item.kind === "reasoning" || (item.kind === "message" && item.role === "assistant")) {
+    if (item.kind === "reasoning" || item.kind === "tool" || (item.kind === "message" && item.role === "assistant")) {
       this.state.cycleItems = [...this.state.cycleItems, item.id];
     }
   }
@@ -329,11 +340,9 @@ class Draft {
       let start = items.length - 1;
       while (start >= 0 && !(items[start].kind === "message" &&
         (items[start] as Extract<TimelineItem, { kind: "message" }>).role === "user")) start -= 1;
-      const first = items.slice(start + 1).find((item) =>
-        (item.kind === "reasoning" || (item.kind === "message" && item.role === "assistant")) &&
-        !item.hidden && item.content.trim());
+      const first = items.slice(start + 1).find(isVisibleAssistantActivity);
       this.state.turnHasLead = !!first;
-      if (first?.kind === "reasoning" || first?.kind === "message") {
+      if (first) {
         this.put({ ...first, turnLead: true });
       }
     }
@@ -474,11 +483,11 @@ class Draft {
         description: stringValue(data, "agentDescription"),
         model: stringValue(data, "model") || item.model, status: "running",
       };
-      this.put(item);
+      this.putSubagent(item);
       return true;
     }
     if (event.type === "subagent.completed" || event.type === "subagent.failed") {
-      this.put({
+      this.putSubagent({
         ...item,
         status: event.type === "subagent.failed" ? "failed" :
           data.cancelled === true ? "cancelled" : "completed",
@@ -495,12 +504,18 @@ class Draft {
     this.map("children").set(id, child.state);
     const finding = event.type === "assistant.message" ? assistantMessageContent(data) : "";
     if (prior.items !== child.state.items) {
-      this.put({
+      this.putSubagent({
         ...item, timeline: child.state.items,
         preview: finding ? finding.replace(/\s+/g, " ").slice(0, 120) : item.preview,
       });
     }
     return true;
+  }
+
+  private putSubagent(item: SubagentItem): void {
+    this.put(this.get(item.id) ? item : {
+      ...item, turnLead: this.lead(), parentModel: this.state.activeModel,
+    });
   }
 
   event(event: SessionEvent, liveModel?: string): void {
@@ -596,7 +611,7 @@ class Draft {
           this.state.activeModel = model;
           for (const id of this.state.cycleItems) {
             const item = this.get(id);
-            if ((item?.kind === "message" || item?.kind === "reasoning") && !item.model) {
+            if ((item?.kind === "message" || item?.kind === "reasoning" || item?.kind === "tool") && !item.model) {
               this.put({ ...item, model });
             }
           }
@@ -634,6 +649,7 @@ class Draft {
         const item: Extract<TimelineItem, { kind: "tool" }> = {
           ...(previous ?? {
             kind: "tool", id: event.id, callId, name: "tool", progress: [],
+            turnLead: this.lead(), model: this.state.activeModel,
           }),
           name: stringValue(data, "toolName", "name") || previous?.name || "tool",
           state: preparing ? previous?.state ?? "preparing" : "running",

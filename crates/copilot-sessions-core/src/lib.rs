@@ -1392,6 +1392,25 @@ impl SessionService {
             .await?)
     }
 
+    pub async fn session_usage(&self, session_id: &str) -> Result<serde_json::Value> {
+        self.attached_session(session_id).await?;
+        // The native total includes every model call and subagent, including
+        // usage from before this attachment. Never reconstruct it from history.
+        let metrics = self
+            .client()
+            .await?
+            .call(
+                "session.usage.getMetrics",
+                Some(serde_json::json!({ "sessionId": session_id })),
+            )
+            .await?;
+        let total = metrics
+            .get("totalNanoAiu")
+            .and_then(serde_json::Value::as_f64)
+            .filter(|total| total.is_finite() && *total >= 0.0);
+        Ok(serde_json::json!({ "totalNanoAiu": total }))
+    }
+
     pub async fn reference_section(
         &self,
         session_id: &str,
@@ -1611,6 +1630,13 @@ impl SessionService {
             .await
             .get(session_id)
             .and_then(|m| m.cwd.clone())
+    }
+
+    pub async fn git_cwd_for(&self, session_id: &str, working_path: Option<&str>) -> Result<String> {
+        let session_cwd = self.cwd_for(session_id).await;
+        git_workspace::working_directory(session_cwd.as_deref(), working_path)
+            .await
+            .map_err(ServiceError::InvalidArgument)
     }
 
     pub async fn set_working_directory(&self, session_id: &str, cwd: String) -> Result<String> {

@@ -2,6 +2,8 @@ import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "rea
 import { MarkdownContent as Markdown } from "./MarkdownContent";
 import { CodeBlock } from "./CodeBlock";
 import { formattedJson, hasMarkdownFormatting, rawOutput, shellLanguage } from "../lib/codeRendering";
+import { isApplyPatchTool } from "../lib/applyPatch";
+import { ApplyPatchPreview } from "./ApplyPatchPreview";
 import {
   Bot,
   Brain,
@@ -208,18 +210,32 @@ const TimelineEntry = memo(function TimelineEntry({
     );
   }
   if (item.kind === "tool") {
-    return <ToolEntry item={item} defaultExpanded={toolDetailsExpanded} />;
+    return <>
+      {item.turnLead && <AssistantActivityHeading label={assistantLabel} model={item.model} />}
+      <ToolEntry item={item} defaultExpanded={toolDetailsExpanded} />
+    </>;
   }
   if (item.kind === "command") {
     return <CommandResult item={item} />;
   }
   if (item.kind === "subagent") {
-    return (
+    return <>
+      {item.turnLead && <AssistantActivityHeading label={assistantLabel} model={item.parentModel} />}
       <SubagentCard item={item} reasoningExpanded={reasoningExpanded}
         toolDetailsExpanded={toolDetailsExpanded} />
-    );
+    </>;
   }
   return <div className="status-row"><CircleDot size={13} />{item.label}</div>;
+});
+
+const AssistantActivityHeading = memo(function AssistantActivityHeading({ label, model }: {
+  label: string;
+  model?: string;
+}) {
+  return <div className="assistant-activity-heading">
+    <div className="message-avatar"><Bot size={17} /></div>
+    <div className="message-role"><span>{label}</span>{model && <em>({model})</em>}</div>
+  </div>;
 });
 
 const MessageEntry = memo(function MessageEntry({
@@ -370,6 +386,8 @@ const ToolEntry = memo(function ToolEntry({
   defaultExpanded: boolean;
 }) {
   const active = item.state === "preparing" || item.state === "running";
+  const patch = isApplyPatchTool(item.name);
+  const args = item.arguments ?? item.inputBuffer;
   const [expanded, setExpanded] = useState(defaultExpanded);
   useEffect(() => setExpanded(defaultExpanded), [defaultExpanded]);
   return (
@@ -389,8 +407,12 @@ const ToolEntry = memo(function ToolEntry({
       {expanded && (
         <div className="tool-details">
           <div className="tool-call-id">call {item.callId}</div>
-          {item.arguments !== undefined && <DetailBlock label="Arguments" value={item.arguments} commandLanguage={shellLanguage(item.name)} />}
-          {item.arguments === undefined && item.inputBuffer && <DetailBlock label="Arguments" value={item.inputBuffer} streaming={active} />}
+          {patch && args !== undefined
+            ? <ApplyPatchPreview value={args} preparing={item.state === "preparing"} failed={item.state === "failed"} />
+            : <>
+              {item.arguments !== undefined && <DetailBlock label="Arguments" value={item.arguments} commandLanguage={shellLanguage(item.name)} />}
+              {item.arguments === undefined && item.inputBuffer && <DetailBlock label="Arguments" value={item.inputBuffer} streaming={active} />}
+            </>}
           {item.progress.length > 0 && <DetailBlock label="Progress" value={item.progress} plainText streaming={active} />}
           {item.result !== undefined && <DetailBlock label="Result" value={item.result} plainText={!!shellLanguage(item.name)} streaming={active} />}
         </div>

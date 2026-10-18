@@ -18,8 +18,8 @@ export function GitWorkspaceButton({ sessionId, cwd, onOpen }: { sessionId: stri
   }, [sessionId, cwd]);
   return <button type="button" className="icon-button workspace-primary-action" aria-label="Open Git workspace"
     title={state.error ? `Git discovery failed: ${state.error}. Open for details or retry.`
-      : state.repo === false ? "This directory is not in a Git working tree. Open to inspect again."
-      : "View local staged, unstaged and PR comparison changes"}
+      : state.repo === false ? "This session directory is not in a Git working tree. Open Git to add another working path."
+      : "Inspect local changes in this session directory or another working path"}
     onClick={onOpen}>
     <GitCompareArrows size={16} />
     <span className="desktop-label">{state.error ? "Git unavailable" : state.repo === false ? "No repo" : "Git"}</span>

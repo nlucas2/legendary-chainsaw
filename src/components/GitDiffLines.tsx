@@ -1,11 +1,14 @@
 import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type MouseEvent, type PointerEvent } from "react";
-import { lineLocation, visibleBidi, type DiffLine } from "../lib/gitWorkspace";
+import { lineLocation, type DiffLine } from "../lib/gitWorkspace";
+import { DiffLineContent } from "./DiffLineContent";
 import "./git-diff-lines.css";
 
 export interface GitDiffLinesProps {
   lines: readonly DiffLine[];
   selected: ReadonlySet<number>;
   onChange: (next: Set<number>) => void;
+  onSelectionStart?: () => void;
+  onSelectionCommit?: (anchor: HTMLElement) => void;
 }
 
 const selectableKinds = new Set<DiffLine["kind"]>(["add", "delete", "context"]);
@@ -19,7 +22,7 @@ function lineElement(target: EventTarget | null): HTMLElement | null {
   return target instanceof Element ? target.closest<HTMLElement>("[data-line-index]") : null;
 }
 
-export function GitDiffLines({ lines, selected, onChange }: GitDiffLinesProps) {
+export function GitDiffLines({ lines, selected, onChange, onSelectionStart, onSelectionCommit }: GitDiffLinesProps) {
   const helpId = useId();
   const optionIdPrefix = useId();
   const root = useRef<HTMLDivElement>(null);
@@ -35,7 +38,11 @@ export function GitDiffLines({ lines, selected, onChange }: GitDiffLinesProps) {
     base: Set<number>;
     additive: boolean;
     moved: boolean;
+    x: number;
+    y: number;
   } | null>(null);
+  const commit = useRef(onSelectionCommit);
+  commit.current = onSelectionCommit;
   const suppressClick = useRef(false);
   const touch = useRef<{ pointerId: number; index: number; x: number; y: number; moved: boolean } | null>(null);
   const touchClick = useRef<number | null>(null);
@@ -71,6 +78,8 @@ export function GitDiffLines({ lines, selected, onChange }: GitDiffLinesProps) {
         anchor.current = drag.current.start;
         suppressClick.current = true;
         window.setTimeout(() => { suppressClick.current = false; }, 0);
+        const row = root.current?.querySelector<HTMLElement>(`[data-line-index="${drag.current.last}"]`);
+        if (row) commit.current?.(row);
       }
       drag.current = null;
     };
@@ -103,13 +112,31 @@ export function GitDiffLines({ lines, selected, onChange }: GitDiffLinesProps) {
     listbox?.focus({ preventScroll: true });
   }
 
+  function commitSelection(index: number) {
+    const row = root.current?.querySelector<HTMLElement>(`[data-line-index="${index}"]`);
+    if (row) commit.current?.(row);
+  }
+
+  function scrollActive(listbox: HTMLElement, index: number) {
+    const row = listbox.querySelector<HTMLElement>(`[data-line-index="${index}"]`);
+    if (!row) return;
+    row.scrollIntoView({ block: "nearest", inline: "nearest" });
+    const panel = listbox.closest<HTMLElement>(".git-panel");
+    const header = panel?.querySelector<HTMLElement>(".git-panel-header");
+    if (panel && header && getComputedStyle(header).position === "sticky") {
+      const top = header.getBoundingClientRect().bottom + 8;
+      const rowTop = row.getBoundingClientRect().top;
+      if (rowTop < top) panel.scrollTop += rowTop - top;
+    }
+  }
+
   function handleClick(event: MouseEvent<HTMLDivElement>) {
     const row = lineElement(event.target);
     const index = Number(row?.dataset.lineIndex);
     if (!Number.isSafeInteger(index) || !selectableSet.has(index)) return;
     if (suppressClick.current) {
       suppressClick.current = false;
-      activate(index);
+      setActive(index);
       return;
     }
 
@@ -129,6 +156,7 @@ export function GitDiffLines({ lines, selected, onChange }: GitDiffLinesProps) {
       onChange(new Set([index]));
       anchor.current = index;
     }
+    commitSelection(index);
   }
 
   function handleMouseDown(event: MouseEvent<HTMLDivElement>) {
@@ -137,21 +165,25 @@ export function GitDiffLines({ lines, selected, onChange }: GitDiffLinesProps) {
     const index = Number(row?.dataset.lineIndex);
     if (!Number.isSafeInteger(index) || !selectableSet.has(index)) return;
     const additive = event.ctrlKey || event.metaKey;
+    onSelectionStart?.();
     drag.current = {
       start: event.shiftKey ? anchor.current ?? index : index,
       last: index,
       base: additive ? normalizedSelection() : new Set(),
       additive,
       moved: false,
+      x: event.clientX,
+      y: event.clientY,
     };
   }
 
   function handleMouseMove(event: MouseEvent<HTMLDivElement>) {
     const state = drag.current;
     if (!state || event.buttons !== 1) return;
+    if (Math.hypot(event.clientX - state.x, event.clientY - state.y) <= 3 && !state.moved) return;
     const row = lineElement(event.target);
     const index = Number(row?.dataset.lineIndex);
-    if (!Number.isSafeInteger(index) || !selectableSet.has(index) || index === state.last) return;
+    if (!Number.isSafeInteger(index) || !selectableSet.has(index) || (state.moved && index === state.last)) return;
     state.last = index;
     state.moved = true;
     setActive(index);
@@ -197,8 +229,8 @@ export function GitDiffLines({ lines, selected, onChange }: GitDiffLinesProps) {
     }
     const listbox = event.currentTarget;
     requestAnimationFrame(() => {
-      listbox.querySelector<HTMLElement>(`[data-line-index="${destination}"]`)
-        ?.scrollIntoView({ block: "nearest", inline: "nearest" });
+      scrollActive(listbox, destination);
+      if (event.shiftKey) commitSelection(destination);
     });
   }
 
@@ -226,6 +258,12 @@ export function GitDiffLines({ lines, selected, onChange }: GitDiffLinesProps) {
         onChange(next);
         anchor.current = active;
       }
+      const listbox = event.currentTarget;
+      const index = active;
+      requestAnimationFrame(() => {
+        scrollActive(listbox, index);
+        commitSelection(index);
+      });
       return;
     }
     if (destination !== null) {
@@ -257,9 +295,7 @@ export function GitDiffLines({ lines, selected, onChange }: GitDiffLinesProps) {
           aria-selected={isSelectable ? isSelected : undefined}
           aria-label={isSelectable ? optionLabel(line) : undefined}
           data-line-index={isSelectable ? line.index : undefined}>
-          <span className="git-diff-number" aria-hidden="true">{line.oldLine ?? ""}</span>
-          <span className="git-diff-number" aria-hidden="true">{line.newLine ?? ""}</span>
-          <code>{visibleBidi(line.text) || " "}</code>
+          <DiffLineContent line={line} />
         </div>;
       })}
     </div>

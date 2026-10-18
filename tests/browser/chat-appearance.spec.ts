@@ -16,7 +16,7 @@ const markdown = `Reviewed changes.
 `;
 const reasoningMarkdown = "Compare the alternatives.\n\n[Source](https://example.com/source) and `inline code`.\n\n```text\ncode sample\n```\n\n| Step | Result |\n| --- | --- |\n| Review | Ready |";
 
-async function setup(page: Page) {
+async function setup(page: Page, extraEvents: { id: string; type: string; timestamp: string; data: Record<string, unknown> }[] = []) {
   const session = { sessionId: "appearance", title: "Appearance preview", cwd: "Q:\\example", model: "model",
     isActive: true, isRemote: false, pinned: false, tags: [], startTime: "", modifiedTime: "" };
   await page.addInitScript(() => {
@@ -45,6 +45,7 @@ async function setup(page: Page) {
           { id: "u", type: "user.message", timestamp: "", data: { content: "Review these changes.\n\nKeep my formatting." } },
           { id: "r", type: "assistant.reasoning", timestamp: "", data: { content: reasoningMarkdown } },
           { id: "a", type: "assistant.message", timestamp: "", data: { content: markdown } },
+          ...extraEvents,
         ], hasMore: false, cursor: "", loadedPages: 1, humanMessages: 1,
       }; break;
       default: return route.fulfill({ status: 404, body: `Unexpected ${command}` });
@@ -261,6 +262,93 @@ test("Markdown tables have padded borders, themed links and bounded overflow in 
   await page.keyboard.press("ArrowRight");
   await expect.poll(() => table.evaluate((element) => element.scrollLeft)).toBeGreaterThan(0);
   expect(await page.locator(".conversation").evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+});
+
+test("theme roles stay distinct with readable metadata, controls and focus in dark and light", async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 1440, height: 1100 });
+  await setup(page, [
+    { id: "t-start", type: "tool.execution_start", timestamp: "", data: { toolCallId: "t", toolName: "read_file", arguments: { path: "example.ts" } } },
+    { id: "t-end", type: "tool.execution_complete", timestamp: "", data: { toolCallId: "t", success: true, result: "File read." } },
+    { id: "f-start", type: "tool.execution_start", timestamp: "", data: { toolCallId: "f", toolName: "run_command", arguments: { command: "example" } } },
+    { id: "f-end", type: "tool.execution_complete", timestamp: "", data: { toolCallId: "f", success: false, error: "Example failure" } },
+    { id: "cmd", type: "command.result", timestamp: "", data: { command: "/fixture", result: "Example command output." } },
+  ]);
+  const snapshots = [];
+  for (const theme of ["Dark", "Light"]) {
+    await page.locator(".daemon-state").click();
+    await page.getByRole("button", { name: new RegExp(`^${theme} `) }).click();
+    await page.getByRole("button", { name: "Close settings" }).click();
+    await page.locator(".new-session-button").evaluate((element) =>
+      Promise.all(element.getAnimations().map((animation) => animation.finished)));
+    const metrics = await page.evaluate(() => {
+      const canvas = document.createElement("canvas");
+      canvas.width = canvas.height = 1;
+      const context = canvas.getContext("2d")!;
+      const rgba = (value: string) => {
+        context.clearRect(0, 0, 1, 1);
+        context.fillStyle = value;
+        context.fillRect(0, 0, 1, 1);
+        return [...context.getImageData(0, 0, 1, 1).data];
+      };
+      const blend = (foreground: number[], background: number[]) => {
+        const alpha = foreground[3] / 255;
+        return foreground.slice(0, 3).map((value, index) => value * alpha + background[index] * (1 - alpha)).concat(255);
+      };
+      const background = (element: Element | null): number[] => {
+        if (!element) return [255, 255, 255, 255];
+        return blend(rgba(getComputedStyle(element).backgroundColor), background(element.parentElement));
+      };
+      const luminance = (channels: number[]) => channels.slice(0, 3).map((value) => {
+        const channel = value / 255;
+        return channel <= .04045 ? channel / 12.92 : ((channel + .055) / 1.055) ** 2.4;
+      }).reduce((sum, value, index) => sum + value * [.2126, .7152, .0722][index], 0);
+      const contrast = (color: string, bg: number[]) => {
+        const a = luminance(blend(rgba(color), bg)), b = luminance(bg);
+        return (Math.max(a, b) + .05) / (Math.min(a, b) + .05);
+      };
+      const textSelectors = [".session-main small", ".session-meta", ".new-session-button span",
+        ".session-context", ".header-actions .icon-button:not(:disabled)", ".message.user .message-role",
+        ".message.user .user-message-text", ".message.assistant .markdown-body p", ".reasoning-card .timeline-disclosure",
+        ".reasoning-content", ".tool-card.done .timeline-disclosure strong", ".tool-card.failed .tool-icon",
+        ".command-result > summary", ".composer textarea", ".composer-footer"];
+      const text = textSelectors.map((selector) => {
+        const element = document.querySelector(selector)!;
+        return { selector, color: getComputedStyle(element).color, background: background(element),
+          contrast: contrast(getComputedStyle(element).color, background(element)) };
+      });
+      const textarea = document.querySelector(".composer textarea")!;
+      text.push({ selector: "Composer placeholder", color: getComputedStyle(textarea, "::placeholder").color,
+        background: background(textarea), contrast: contrast(getComputedStyle(textarea, "::placeholder").color, background(textarea)) });
+      const controls = [".composer", ".session-search", ".session-list-controls select"].map((selector) => {
+        const element = document.querySelector(selector)!;
+        return { selector, contrast: contrast(getComputedStyle(element).borderTopColor, background(element.parentElement)) };
+      });
+      const surfaces = [".message.user .message-content", ".reasoning-card", ".tool-card.done", ".command-result", ".composer"]
+        .map((selector) => background(document.querySelector(selector)));
+      const roles = [".message.user .message-role", ".reasoning-card .timeline-disclosure", ".tool-card.done .tool-icon",
+        ".tool-card.failed .tool-icon", ".command-result > summary"].map((selector) =>
+        getComputedStyle(document.querySelector(selector)!).color);
+      return { text, controls, surfaces, roles, themeColor: document.querySelector('meta[name="theme-color"]')!.getAttribute("content") };
+    });
+    snapshots.push(metrics);
+    expect.soft(metrics.text.filter((sample) => sample.contrast < 4.5), `${theme}: text contrast below 4.5:1`).toEqual([]);
+    for (const sample of metrics.controls) expect(sample.contrast, `${theme}: ${sample.selector} boundary`).toBeGreaterThanOrEqual(3);
+    expect(new Set(metrics.surfaces.map((value) => value.join(","))).size).toBe(metrics.surfaces.length);
+    expect(new Set(metrics.roles).size).toBe(metrics.roles.length);
+    await page.keyboard.press("Tab");
+    await page.locator(".new-session-button").focus();
+    await expect(page.locator(".new-session-button")).toHaveCSS("outline-style", "solid");
+    await expect(page.locator(".new-session-button")).toHaveCSS("outline-width", "2px");
+    await page.locator(".message.user").scrollIntoViewIfNeeded();
+    await page.screenshot({ path: testInfo.outputPath(`theme-${theme.toLowerCase()}.png`) });
+    await page.locator(".tool-card.done").scrollIntoViewIfNeeded();
+    await page.screenshot({ path: testInfo.outputPath(`theme-${theme.toLowerCase()}-tools.png`) });
+    await page.setViewportSize({ width: 320, height: 844 });
+    expect(await page.locator(".conversation").evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+    await page.setViewportSize({ width: 1440, height: 1100 });
+  }
+  expect(snapshots[0].surfaces).not.toEqual(snapshots[1].surfaces);
+  expect(snapshots.map((snapshot) => snapshot.themeColor)).toEqual(["#1e1e2e", "#f4ecd8"]);
 });
 
 test("Ask answers and plan previews share the same Markdown table and link styling", async ({ page }) => {

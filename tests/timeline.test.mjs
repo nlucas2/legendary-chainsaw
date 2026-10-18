@@ -115,6 +115,87 @@ test("summary-only final appears before response and claims the turn avatar", ()
   assert.equal(messages(result)[0].turnLead, false);
 });
 
+test("tool-first responses own the assistant heading during streaming and replay", () => {
+  const events = [
+    event("session.start", { model: "historical-model" }),
+    event("user.message", { content: "Inspect this" }),
+    event("assistant.turn_start"),
+    event("assistant.tool_call_delta", { toolCallId: "view", toolName: "view", inputDelta: '{"path":' }),
+    event("tool.execution_start", { toolCallId: "view", toolName: "view", arguments: { path: "file.txt" } }),
+    event("tool.execution_complete", { toolCallId: "view", success: true, result: "Read" }),
+    event("tool.execution_start", { toolCallId: "shell", toolName: "powershell" }),
+    event("assistant.turn_end"),
+    event("assistant.turn_start"),
+    event("assistant.reasoning", { content: "Summary after inspecting." }),
+    event("assistant.message", { content: "Done", model: "historical-model" }),
+  ];
+  const result = replay(events);
+  assert.deepEqual(project(events, { assistantModel: "different-current-picker" }).items, result.items);
+  assert.deepEqual(visible(result).filter((item) => item.turnLead).map((item) => [item.kind, item.model]),
+    [["tool", "historical-model"]]);
+  assert.equal(messages(result)[0].turnLead, false);
+  assert.equal(reasoning(result)[0].turnLead, false);
+  const toolOnly = replay([
+    event("user.message", { content: "Do it" }),
+    event("tool.execution_start", { toolCallId: "t", toolName: "view" }),
+  ]);
+  assert.equal(toolOnly.items[1].turnLead, true);
+  assert.equal(toolOnly.items[1].model, undefined);
+  assert.equal(messages(toolOnly).length, 0);
+  const live = append(project([], { assistantModel: "live-model" }),
+    event("user.message", { content: "Live prompt" }),
+    event("tool.execution_start", { toolCallId: "live", toolName: "view" }));
+  assert.equal(live.items[1].model, "live-model");
+});
+
+test("tool heading model provenance uses explicit response data without backfilling older turns", () => {
+  const result = replay([
+    event("user.message", { content: "Old" }),
+    event("tool.execution_start", { toolCallId: "old", toolName: "view" }),
+    event("assistant.message", { content: "Old answer" }),
+    event("user.message", { content: "New" }),
+    event("assistant.turn_start"),
+    event("tool.execution_start", { toolCallId: "new", toolName: "view" }),
+    event("assistant.message", { content: "New answer", model: "reported-model" }),
+  ]);
+  const tools = result.items.filter((item) => item.kind === "tool");
+  assert.equal(tools[0].model, undefined);
+  assert.equal(tools[1].model, "reported-model");
+  assert.ok(tools.every((item) => item.turnLead));
+});
+
+test("discarded leading text transfers its heading to the earlier tool instead of the later answer", () => {
+  const result = replay([
+    event("assistant.message_delta", { messageId: "draft", content: "Discard" }),
+    event("tool.execution_start", { toolCallId: "view", toolName: "view" }),
+    event("assistant.message_delta", { messageId: "draft", content: "More discarded text" }),
+    event("assistant.message", { messageId: "draft", content: "Replacement" }),
+  ]);
+  assert.deepEqual(visible(result).filter((item) => item.turnLead).map((item) => item.kind), ["tool"]);
+  assert.equal(messages(result)[0].content, "Replacement");
+  assert.equal(messages(result)[0].turnLead, false);
+});
+
+test("subagent-first activity starts the parent response and child tools use their own model", () => {
+  const result = replay([
+    event("session.start", { model: "parent-model" }),
+    event("user.message", { content: "Delegate this" }),
+    event("subagent.started", { agentName: "Builder", model: "child-model" }, { agentId: "child" }),
+    event("user.message", { content: "Child instructions" }, { agentId: "child" }),
+    event("tool.execution_start", { toolCallId: "child-view", toolName: "view" }, { agentId: "child" }),
+    event("assistant.message", { content: "Child answer" }, { agentId: "child" }),
+    event("assistant.message", { content: "Parent answer" }),
+  ]);
+  const child = result.items.find((item) => item.kind === "subagent");
+  assert.equal(child.turnLead, true);
+  assert.equal(child.parentModel, "parent-model");
+  assert.equal(child.model, "child-model");
+  assert.equal(child.timeline[1].turnLead, true);
+  assert.equal(child.timeline[1].model, "child-model");
+  assert.equal(child.timeline[2].turnLead, false);
+  assert.equal(messages(result)[0].turnLead, false);
+});
+
 test("actual summary without answer creates reasoning, never a phantom answer", () => {
   const result = replay([
     event("assistant.message", { messageId: "a", content: "", reasoningText: "Visible summary." }),

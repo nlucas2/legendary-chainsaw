@@ -82,6 +82,7 @@ import { useModelCatalog } from "./lib/useModelCatalog";
 import { ModelSelection } from "./components/ModelSelection";
 import type { MessageDelivery } from "./lib/deliveryPreference";
 import { adjacentSession } from "./lib/shortcuts";
+import { isSessionUsageEvent } from "./lib/sessionUsage";
 import { atComposerEdge, PromptHistoryNavigation, recentPrompts } from "./lib/promptHistory";
 import { actionBindings, ariaBindings, formatBinding, matchesAction, type ShortcutAction } from "./lib/keybindings";
 import { useKeybindings } from "./lib/useKeybindings";
@@ -723,6 +724,7 @@ function App() {
           (!event.sessionId || event.sessionId === activeIdRef.current)
         ) {
           const sessionId = activeIdRef.current;
+          setContextRevision((current) => current + 1);
           setStreamStatus({
             state: "recovering",
             message: `Recovering ${event.skipped.toLocaleString()} skipped live events…`,
@@ -779,7 +781,7 @@ function App() {
           if ([
             "session.idle", "session.tools_updated", "session.mcp_servers_loaded",
             "session.mcp_server_status_changed", "session.mode_changed", "session.skills_loaded",
-          ].includes(event.event.type)) {
+          ].includes(event.event.type) || isSessionUsageEvent(event.event)) {
             setContextRevision((current) => current + 1);
           }
           if (event.event.type === "session.idle" && !event.event.agentId) {
@@ -808,7 +810,10 @@ function App() {
         if (isConnected) previouslyConnected = true;
         sseConnectedRef.current = isConnected;
         setConnected(isConnected);
-        if (isConnected && activeIdRef.current) void loadInteractions(activeIdRef.current);
+        if (isConnected && activeIdRef.current) {
+          void loadInteractions(activeIdRef.current);
+          setContextRevision((current) => current + 1);
+        }
       },
       showRawEvents,
     );
@@ -1073,7 +1078,7 @@ function App() {
       document.documentElement.dataset.theme = dark ? "dark" : "light";
       document
         .querySelector('meta[name="theme-color"]')
-        ?.setAttribute("content", dark ? "#0b0f14" : "#f4ecd8");
+        ?.setAttribute("content", dark ? "#1e1e2e" : "#f4ecd8");
       window.dispatchEvent(new CustomEvent("copilot-sessions-theme"));
     };
     try {

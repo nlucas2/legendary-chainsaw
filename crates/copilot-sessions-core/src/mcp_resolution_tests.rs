@@ -185,6 +185,132 @@ fn workspace_candidates_are_bounded_and_linked_profiles_establish_precedence() {
     assert!(resolution.disabled.is_empty());
 }
 
+#[test]
+fn workspace_url_without_transport_does_not_block_unrelated_plugin_exclusions() {
+    let fixture = Fixture::new();
+    let repo = fixture.root.join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::create_dir_all(repo.join("child")).unwrap();
+    let file = repo.join(".mcp.json");
+    let bytes = br#"{"mcpServers":{"repository-service":{"url":"https://example.invalid/mcp","headers":{"x-api-key":"fixture-secret"}}}}"#;
+    std::fs::write(&file, bytes).unwrap();
+    let workspace = workspace_candidates(&repo.join("child")).unwrap();
+    assert_eq!(
+        workspace["repository-service"],
+        [std::fs::canonicalize(&file).unwrap().to_string_lossy().into_owned()]
+    );
+    let source: Vec<Source> = serde_json::from_value(json!([
+        {"name":"only-plugin","source":"plugin","sourcePlugin":"excluded-fixture","enabled":true},
+        {"name":"repository-service","source":"workspace","enabled":true}
+    ])).unwrap();
+    let resolution = resolve_sources(
+        &fixture.profile,
+        &source,
+        &Default::default(),
+        &workspace,
+        &[],
+    )
+    .unwrap();
+    resolution.require_resolved().unwrap();
+    assert_eq!(resolution.disabled, ["only-plugin"]);
+    assert!(resolution.overrides.is_empty());
+    assert_eq!(std::fs::read(&file).unwrap(), bytes);
+    let preview = serde_json::to_string(&resolution.decisions).unwrap();
+    assert!(!preview.contains("fixture-secret"));
+    assert!(!preview.contains("example.invalid"));
+    let error = crate::profiles::parse_mcp(bytes, &file).unwrap_err().to_string();
+    assert!(error.contains("must explicitly specify type http or sse"));
+}
+
+#[test]
+fn workspace_name_discovery_keeps_shadowed_repository_definitions_blocked() {
+    let mut fixture = Fixture::new();
+    let repo = fixture.root.join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::create_dir_all(repo.join(".github")).unwrap();
+    for file in [repo.join(".mcp.json"), repo.join(".github").join("mcp.json")] {
+        std::fs::write(
+            &file,
+            br#"{"mcpServers":{"only-plugin":{"url":"https://example.invalid/mcp"}}}"#,
+        )
+        .unwrap();
+    }
+    let workspace = workspace_candidates(&repo).unwrap();
+    assert_eq!(workspace["only-plugin"].len(), 2);
+    let source: Vec<Source> = serde_json::from_value(json!([
+        {"name":"only-plugin","source":"plugin","sourcePlugin":"excluded-fixture","enabled":true}
+    ])).unwrap();
+    let resolution = resolve_sources(
+        &fixture.profile,
+        &source,
+        &Default::default(),
+        &workspace,
+        &[],
+    )
+    .unwrap();
+    assert!(resolution.require_resolved().is_err());
+    assert_eq!(resolution.decisions[0].action, "unresolved");
+    assert!(resolution.decisions[0].reason.contains("Repository also defines"));
+    assert!(resolution.disabled.is_empty());
+    assert!(resolution.overrides.is_empty());
+    fixture.profile.mcp_servers =
+        serde_json::from_value(json!({"only-plugin":{"type":"http","url":"https://example.invalid/chosen"}}))
+            .unwrap();
+    let explicit = resolve_sources(
+        &fixture.profile,
+        &source,
+        &Default::default(),
+        &workspace,
+        &[],
+    )
+    .unwrap();
+    explicit.require_resolved().unwrap();
+    assert!(explicit.disabled.is_empty());
+}
+
+#[test]
+fn workspace_name_discovery_ignores_transport_fields_but_retains_document_bounds() {
+    let path = Path::new("repository.json");
+    let bytes = b"\xef\xbb\xbf{\"$schema\":\"fixture\",\"mcpServers\":{\"remote\":{\"url\":\"https://example.invalid/mcp\",\"futureOption\":true},\"local\":{\"command\":\"__HOME__\\\\tool\",\"env\":{\"TOKEN\":123}}}}";
+    let mut names = crate::profiles::parse_mcp_server_names(bytes, path).unwrap();
+    names.sort();
+    assert_eq!(names, ["local", "remote"]);
+    assert!(crate::profiles::parse_mcp(bytes, path).is_err());
+    for bytes in [
+        b"not json".as_slice(),
+        br#"[]"#,
+        br#"{"servers":{}}"#,
+        br#"{"mcpServers":[]}"#,
+        br#"{"mcpServers":{"remote":null}}"#,
+        br#"{"mcpServers":{"remote":"fixture-secret"}}"#,
+        br#"{"mcpServers":{" bad ":{}}}"#,
+        br#"{"mcpServers":{"bad\nname":{}}}"#,
+    ] {
+        let error = crate::profiles::parse_mcp_server_names(bytes, path).unwrap_err().to_string();
+        assert!(!error.contains("fixture-secret"));
+    }
+    let oversized = vec![b' '; 2 * 1024 * 1024 + 1];
+    assert!(crate::profiles::parse_mcp_server_names(&oversized, path)
+        .unwrap_err().to_string().contains("exceeds 2 MiB"));
+    let servers: serde_json::Map<String, Value> =
+        (0..513).map(|index| (format!("server-{index}"), json!({}))).collect();
+    let too_many = serde_json::to_vec(&json!({"mcpServers":servers})).unwrap();
+    assert!(crate::profiles::parse_mcp_server_names(&too_many, path)
+        .unwrap_err().to_string().contains("exceeds 512 servers"));
+}
+
+#[test]
+fn workspace_name_discovery_does_not_silently_skip_malformed_files() {
+    let fixture = Fixture::new();
+    let repo = fixture.root.join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let file = repo.join(".mcp.json");
+    std::fs::write(&file, b"{ invalid").unwrap();
+    let error = workspace_candidates(&repo).unwrap_err().to_string();
+    assert!(error.contains("Malformed MCP JSON"));
+    assert!(error.contains(".mcp.json"));
+}
+
 /// Explicit opt-in: starts the installed CLI with an isolated home, no account,
 /// synthetic local plugins/MCPs only, and no inference or live daemon access.
 #[tokio::test]
@@ -198,6 +324,9 @@ async fn native_source_resolution_excludes_plugin_only_and_preserves_independent
         std::fs::create_dir_all(root.join(directory)).unwrap();
     }
     std::fs::create_dir(root.join("repo").join(".git")).unwrap();
+    let repository_mcp = root.join("repo").join(".mcp.json");
+    let repository_bytes = br#"{"mcpServers":{"repository-service":{"url":"http://127.0.0.1:1/mcp","headers":{"x-api-key":"fixture-secret"}}}}"#;
+    std::fs::write(&repository_mcp, repository_bytes).unwrap();
     let script = root.join("mcp.cjs");
     std::fs::write(&script, include_str!("fixtures/profile-mcp.cjs")).unwrap();
     let definition = |marker: &str| json!({"type":"stdio","command":"node","args":[script,marker],"tools":["*"]});
@@ -352,6 +481,7 @@ async fn native_source_resolution_excludes_plugin_only_and_preserves_independent
             .await
             .unwrap();
         has_marker(&client, control.id().as_str(), "control", "control").await;
+        assert_eq!(std::fs::read(&repository_mcp).unwrap(), repository_bytes);
         assert_eq!(base_before, std::fs::read(base).unwrap());
         assert_eq!(
             home_before,

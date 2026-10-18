@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createGitComment, diffIdentity, parseUnifiedDiff, loadGitComments, saveGitComments } from "../src/lib/gitWorkspace.ts";
-import { gitReviewContext, gitNotesContext, savedGitIdentity, sameGitRepository } from "../src/lib/gitReview.ts";
+import { gitReviewContext, gitNotesContext, noteSnapshotWarnings, savedGitIdentity, sameGitRepository } from "../src/lib/gitReview.ts";
 import { reviewAttachment, withReviewAttachment, quickAskQuestion, continueReviewConversation, MAX_REVIEW_CONTEXT_BYTES } from "../src/lib/reviewChat.ts";
 import { chatDraftReducer } from "../src/lib/chatDrafts.ts";
 import { attachmentPayload } from "../src/lib/attachments.ts";
@@ -63,6 +63,18 @@ test("single-note discussion contains exact snapshot and unsaved note text is no
   assert.match(quickAskQuestion("Explain?", context), /Explain\?/);
   assert.match(quickAskQuestion("Explain?", context), /snapshot/);
   assert.equal(quickAskQuestion("Ordinary ask"), "Ordinary ask");
+});
+
+test("pending comparison metadata does not claim a saved target or file disappeared", () => {
+  const compare = { ...note(), identity: diffIdentity({ ...diff, view: "compare" }) };
+  const identity = savedGitIdentity(compare);
+  const partial = { ...workspace, detailsLoaded: false, baseCommit: null, mergeBase: null, unstaged: [] };
+  const pending = noteSnapshotWarnings(identity, partial).join(" ");
+  assert.match(pending, /Comparison metadata is not loaded/);
+  assert.doesNotMatch(pending, /target differs|not listed/);
+  const complete = noteSnapshotWarnings(identity, { ...partial, detailsLoaded: true }).join(" ");
+  assert.match(complete, /target differs/);
+  assert.match(complete, /not listed/);
 });
 
 test("review chips use native UTF-8 text blobs, with safe names and no extra API attachment fields", () => {

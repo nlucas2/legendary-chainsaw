@@ -49,19 +49,19 @@ const schemes: {
     id: "auto",
     name: "Auto",
     description: "Follow the operating system",
-    colors: ["#1e1e2e", "#f4ecd8", "#3b6ea5"],
+    colors: ["#1e1e2e", "#f4ecd8", "#305f9a"],
   },
   {
     id: "light",
     name: "Light",
     description: "Warm paper, easy on the eyes",
-    colors: ["#f4ecd8", "#ece2c8", "#3b6ea5"],
+    colors: ["#f4ecd8", "#6d3da5", "#176b61"],
   },
   {
     id: "dark",
     name: "Dark",
-    description: "Deep navy, cool blue accent",
-    colors: ["#0b0f14", "#192432", "#38bdf8"],
+    description: "Mocha surfaces, blue and lavender accents",
+    colors: ["#1e1e2e", "#89b4fa", "#cbb1fa"],
   },
 ];
 

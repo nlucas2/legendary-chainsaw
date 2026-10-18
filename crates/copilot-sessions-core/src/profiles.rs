@@ -790,11 +790,11 @@ fn compile(directory: &Path, store: &Store, profile_id: Option<&str>) -> Result<
     Ok(resolved)
 }
 
-pub(crate) fn parse_mcp(bytes: &[u8], path: &Path) -> Result<(IndexMap<String, Value>, bool)> {
+fn parse_mcp_servers(bytes: &[u8], path: &Path) -> Result<serde_json::Map<String, Value>> {
     if bytes.len() as u64 > MAX_SOURCE_BYTES {
         return Err(ProfileError::Invalid("MCP source exceeds 2 MiB.".into()));
     }
-    let value: Value = serde_json::from_slice(strip_bom(bytes)).map_err(|error| {
+    let mut value: Value = serde_json::from_slice(strip_bom(bytes)).map_err(|error| {
         ProfileError::Invalid(format!(
             "Malformed MCP JSON in '{}' at line {}, column {}.",
             display_path(path),
@@ -802,7 +802,7 @@ pub(crate) fn parse_mcp(bytes: &[u8], path: &Path) -> Result<(IndexMap<String, V
             error.column()
         ))
     })?;
-    let root = value.as_object().ok_or_else(|| {
+    let root = value.as_object_mut().ok_or_else(|| {
         ProfileError::Invalid("MCP source must be a CLI JSON object with mcpServers.".into())
     })?;
     if root
@@ -816,8 +816,11 @@ pub(crate) fn parse_mcp(bytes: &[u8], path: &Path) -> Result<(IndexMap<String, V
         )));
     }
     let servers = root
-        .get("mcpServers")
-        .and_then(Value::as_object)
+        .remove("mcpServers")
+        .and_then(|value| match value {
+            Value::Object(servers) => Some(servers),
+            _ => None,
+        })
         .ok_or_else(|| {
             ProfileError::Invalid(format!(
                 "MCP source '{}' requires a CLI-shaped mcpServers object.",
@@ -829,10 +832,30 @@ pub(crate) fn parse_mcp(bytes: &[u8], path: &Path) -> Result<(IndexMap<String, V
             "MCP source exceeds 512 servers.".into(),
         ));
     }
+    for (name, raw) in &servers {
+        validate_name(name)?;
+        if !raw.is_object() {
+            return Err(ProfileError::Invalid(format!(
+                "MCP server '{name}' must be a JSON object."
+            )));
+        }
+    }
+    Ok(servers)
+}
+
+/// Repository overlap discovery reads names, not definitions to apply through the SDK.
+pub(crate) fn parse_mcp_server_names(bytes: &[u8], path: &Path) -> Result<Vec<String>> {
+    Ok(parse_mcp_servers(bytes, path)?
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect())
+}
+
+pub(crate) fn parse_mcp(bytes: &[u8], path: &Path) -> Result<(IndexMap<String, Value>, bool)> {
+    let servers = parse_mcp_servers(bytes, path)?;
     let mut normalized = IndexMap::new();
     let mut placeholders = false;
-    for (name, raw) in servers {
-        validate_name(name)?;
+    for (name, raw) in &servers {
         if let Some(marker) = unresolved_template_marker(raw) {
             return Err(ProfileError::Invalid(format!(
                 "Unresolved {marker} template in '{}'. Link the generated MCP config file, \

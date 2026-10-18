@@ -32,10 +32,13 @@ test.beforeAll(async () => {
         function Harness() {
           const [first, setFirst] = useState(new Set());
           const [second, setSecond] = useState(new Set());
+          const [commits, setCommits] = useState(0);
           window.clearFirst = () => setFirst(new Set());
           return React.createElement(React.Fragment, null,
-            React.createElement(GitDiffLines, { lines: a, selected: first, onChange: setFirst }),
+            React.createElement(GitDiffLines, { lines: a, selected: first, onChange: setFirst,
+              onSelectionCommit: () => setCommits(count => count + 1) }),
             React.createElement("output", { "aria-label": "First selected" }, [...first].sort((x,y) => x-y).join(",")),
+            React.createElement("output", { "aria-label": "Selection commits" }, commits),
             React.createElement(GitDiffLines, { lines: b, selected: second, onChange: setSecond }),
             React.createElement("output", { "aria-label": "Second selected" }, [...second].sort((x,y) => x-y).join(",")),
             React.createElement("p", { id: "outside-text" }, "Outside selectable text")
@@ -110,11 +113,29 @@ test("mouse text drag preserves native selection while selecting crossed lines",
   await page.mouse.move(startBox!.x + 8, startBox!.y + startBox!.height / 2);
   await page.mouse.down();
   await page.mouse.move(endBox!.x + endBox!.width - 4, endBox!.y + endBox!.height / 2, { steps: 12 });
+  await expect(page.getByLabel("Selection commits")).toHaveText("0");
   await page.mouse.up();
+  await expect(page.getByLabel("Selection commits")).toHaveText("1");
   await expect(page.getByLabel("First selected")).toHaveText("2,3,4");
   expect(await page.evaluate(() => getSelection()?.toString().length ?? 0)).toBeGreaterThan(0);
   await first.getByRole("option", { name: "Context line old:3 new:3" }).click({ modifiers: ["Shift"] });
   await expect(page.getByLabel("First selected")).toHaveText("2,3,4,5");
+});
+
+test("same-line mouse highlighting commits once without stealing native selection focus", async ({ page }) => {
+  await setup(page);
+  const row = page.getByRole("option", { name: "Added line new:2", exact: true });
+  const code = (await row.locator("code").boundingBox())!;
+  await page.mouse.move(code.x + 3, code.y + code.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(code.x + code.width - 18, code.y + code.height / 2, { steps: 10 });
+  await expect(page.getByLabel("Selection commits")).toHaveText("0");
+  const focusBeforeRelease = await page.evaluate(() => document.activeElement?.id);
+  await page.mouse.up();
+  await expect(page.getByLabel("Selection commits")).toHaveText("1");
+  await expect(page.getByLabel("First selected")).toHaveText("4");
+  expect(await page.evaluate(() => getSelection()?.toString().length ?? 0)).toBeGreaterThan(0);
+  expect(await page.evaluate(() => document.activeElement?.id)).toBe(focusBeforeRelease);
 });
 
 test("keyboard navigation and selection skip non-source rows", async ({ page }) => {

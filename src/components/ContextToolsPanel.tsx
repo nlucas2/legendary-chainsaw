@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { daemonInvoke } from "../lib/daemon";
+import { normalizeSessionUsage, type SessionUsage } from "../lib/sessionUsage";
+import { SessionUsageSummary } from "./SessionUsageSummary";
 import {
   contextBudget,
   contextCategoryLabel,
@@ -44,6 +46,7 @@ interface ResourceState<T> {
 
 const contextSnapshots = new Map<string, ContextAttribution>();
 const toolSnapshots = new Map<string, ToolControlsSnapshot>();
+const usageSnapshots = new Map<string, SessionUsage>();
 
 function useSessionResource<T>(
   sessionId: string | undefined,
@@ -125,6 +128,7 @@ export function ContextToolsPanel({
 }: ContextToolsPanelProps) {
   const context = useSessionResource(sessionId, "context_attribution", normalizeContext, true, revision, refreshToken, contextSnapshots);
   const tools = useSessionResource(sessionId, "tool_controls", normalizeToolControls, tab === "tools", revision, refreshToken, toolSnapshots);
+  const usage = useSessionResource(sessionId, "session_usage", normalizeSessionUsage, tab === "context", revision, refreshToken, usageSnapshots);
   const [source, setSource] = useState<ToolSource | "all">("all");
   const [limit, setLimit] = useState(30);
   const [serverLimit, setServerLimit] = useState(12);
@@ -177,6 +181,8 @@ export function ContextToolsPanel({
 
   if (tab === "context") {
     return <div className="context-tools-panel">
+      <ReadStatus name="session AI credits" loading={usage.loading} error={usage.error} hasData={usage.data !== null} retry={usage.refresh} />
+      {usage.data && <SessionUsageSummary usage={usage.data} />}
       <ReadStatus name="context attribution" loading={context.loading} error={context.error} hasData={context.data !== null} retry={context.refresh} />
       {context.data?.status === "unavailable" && <div className="ct-status" role="status">{context.data.reason} Send a message or refresh after the runtime reports usage.</div>}
       {context.data?.status === "available" && <ContextSummary context={context.data} query={query} limit={limit} onLoadMore={() => setLimit((current) => current + 30)} />}

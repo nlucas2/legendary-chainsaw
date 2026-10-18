@@ -277,10 +277,10 @@ function terminalTheme() {
   const style = getComputedStyle(document.documentElement);
   const light = document.documentElement.dataset.theme === "light";
   return {
-    background: style.getPropertyValue("--bg").trim() || "#0b0f14",
+    background: style.getPropertyValue("--bg").trim() || "#1e1e2e",
     foreground: style.getPropertyValue("--text").trim() || "#d8dee9",
     cursor: style.getPropertyValue("--accent-bright").trim() || "#7dd3fc",
-    selectionBackground: light ? "#d9cba9" : "#334155",
+    selectionBackground: style.getPropertyValue("--selection").trim() || (light ? "#ccdcf3" : "#354766"),
     black: light ? "#4c4636" : "#111827",
     brightBlack: light ? "#857a5f" : "#64748b",
     blue: light ? "#1e66f5" : "#60a5fa",
